@@ -25,7 +25,7 @@ tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 
 # Local dependencies
-floresta-chain = { workspace = true, features = ["bitcoinkernel"] }
+floresta-chain = { workspace = true }
 floresta-compact-filters = { workspace = true }
 floresta-common = { workspace = true }
 floresta-watch-only = { workspace = true }
