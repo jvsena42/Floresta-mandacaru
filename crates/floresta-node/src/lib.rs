@@ -12,6 +12,7 @@ mod error;
 mod florestad;
 #[cfg(feature = "json-rpc")]
 mod json_rpc;
+mod logging;
 mod slip132;
 mod wallet_input;
 #[cfg(feature = "zmq-server")]
@@ -21,3 +22,5 @@ pub use florestad::AssumeUtreexoValue;
 pub use florestad::AssumeValidArg;
 pub use florestad::Config;
 pub use florestad::Florestad;
+pub use logging::init_logging;
+pub use tracing_appender::non_blocking::WorkerGuard;
