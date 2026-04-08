@@ -22,8 +22,6 @@ mod daemonize;
 
 use std::env;
 use std::fs;
-use std::io;
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
@@ -32,19 +30,14 @@ use std::time::Duration;
 use bitcoin::Network;
 use clap::Parser;
 use cli::Cli;
+use floresta_node::init_logging;
 use floresta_node::Config;
 use floresta_node::Florestad;
+use floresta_node::WorkerGuard;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio::time::timeout;
 use tracing::info;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::fmt;
-use tracing_subscriber::fmt::time::ChronoLocal;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Layer;
 
 #[cfg(unix)]
 use crate::daemonize::Daemon;
@@ -192,84 +185,6 @@ fn data_dir_path(dir: Option<String>, network: Network) -> String {
     base.to_string_lossy().into_owned()
 }
 
-/// Set up the logger for `florestad`.
-///
-/// This logger will subscribe to `tracing` events, filter them according to the defined log
-/// level, and format them based on the output destination. Logs can be directed to `stdout`, a
-/// file, both, or neither.
-pub fn init_logging(
-    data_dir: &str,
-    log_to_file: bool,
-    log_to_stdout: bool,
-    debug: bool,
-) -> Result<Option<WorkerGuard>, io::Error> {
-    // Get the log level from `--debug`.
-    let log_level = if debug { "debug" } else { "info" };
-
-    // Try to build an `EnvFilter` from the `RUST_LOG` env variable, or fallback to `log_level`.
-    let log_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
-
-    // For the registry, also enable very verbose runtime traces so `tokio-console` works, but keep
-    // human outputs quiet via per-layer filters below.
-    #[cfg(feature = "tokio-console")]
-    let base_filter = EnvFilter::new(format!("{log_filter},tokio=trace,runtime=trace"));
-
-    #[cfg(not(feature = "tokio-console"))]
-    let base_filter = log_filter.clone();
-
-    // Validate the log file path.
-    if log_to_file {
-        let file_path = format!("{data_dir}/debug.log");
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file_path)?;
-    }
-
-    // Timer for log events.
-    let log_timer = ChronoLocal::new("%Y-%m-%d %H:%M:%S".to_string());
-
-    // Standard Output layer: human-friendly formatting and level; ANSI only on a real TTY.
-    let fmt_layer_stdout = log_to_stdout.then(|| {
-        fmt::layer()
-            .with_writer(io::stdout)
-            .with_ansi(IsTerminal::is_terminal(&io::stdout()))
-            .with_timer(log_timer.clone())
-            .with_target(true)
-            .with_level(true)
-            .with_filter(log_filter.clone())
-    });
-
-    // File layer: non-blocking writer. Keep the `WorkerGuard` so logs flush on drop.
-    let mut guard = None;
-    let fmt_layer_logfile = log_to_file.then(|| {
-        let file_appender = tracing_appender::rolling::never(data_dir, "debug.log");
-        let (non_blocking, file_guard) = tracing_appender::non_blocking(file_appender);
-        guard = Some(file_guard);
-
-        fmt::layer()
-            .with_writer(non_blocking)
-            .with_ansi(false)
-            .with_timer(log_timer)
-            .with_target(true)
-            .with_level(true)
-            .with_filter(log_filter.clone())
-    });
-
-    // Build the registry with its (possibly more permissive) base filter, then attach layers to it.
-    let registry = tracing_subscriber::registry().with(base_filter);
-
-    #[cfg(feature = "tokio-console")]
-    let registry = registry.with(console_subscriber::spawn());
-
-    registry
-        .with(fmt_layer_stdout)
-        .with(fmt_layer_logfile)
-        .init();
-
-    Ok(guard)
-}
 
 #[cfg(test)]
 mod tests {
