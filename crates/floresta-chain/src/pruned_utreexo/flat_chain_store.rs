@@ -180,8 +180,8 @@ impl FlatChainStoreConfig {
             file_permission: Some(0o666),
             fork_file_size: Some(10_000),
             path,
-            headers_file_size: Some(10_000_000),
-            block_index_size: Some(10_000_000),
+            headers_file_size: Some(2_000_000),
+            block_index_size: Some(2_000_000),
             cache_size: Some(10_000),
         }
     }
