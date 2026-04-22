@@ -686,16 +686,12 @@ where
             }
 
             InflightRequests::GetFilters => {
-                if !self.has_compact_filters_peer() {
-                    return Ok(());
-                }
-                let peer = self.send_to_fast_peer(
-                    NodeRequest::GetFilter((self.chain.get_block_hash(0).unwrap(), 0)),
-                    ServiceFlags::COMPACT_FILTERS,
-                )?;
-
-                self.inflight
-                    .insert(InflightRequests::GetFilters, (peer, Instant::now()));
+                // Do not re-issue here: we don't have access to the current
+                // filter-store height or stop hash from this context, so any
+                // request we build would start from genesis and never complete
+                // against the peer's view. Leaving `inflight` empty lets the
+                // next `download_filters()` tick rebuild the request correctly
+                // from the current filter height.
             }
 
             InflightRequests::Connect(_) | InflightRequests::GetAddresses => {

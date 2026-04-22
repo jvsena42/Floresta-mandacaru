@@ -481,6 +481,14 @@ where
             return Ok(());
         }
 
+        // If a previous batch was aborted (peer disconnected or request timed
+        // out) while some out-of-order filters sat in the buffer, those
+        // entries belong to a height range the next request may not cover or
+        // complete. Drop them so the fresh batch starts from a clean state.
+        if !self.context.inflight_filters.is_empty() {
+            self.context.inflight_filters.clear();
+        }
+
         let Some(ref filters) = self.block_filters else {
             return Ok(());
         };
