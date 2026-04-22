@@ -156,7 +156,17 @@ where
                 return Ok(());
             }
 
-            if self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
+            // Only churn an existing slot if the address manager actually has a
+            // compact-filters candidate to dial. Otherwise we'd disconnect a healthy
+            // regular peer and fill the slot with another non-CF peer, making no
+            // progress and thrashing connections while filters stay stalled.
+            let has_cf_candidate = self
+                .address_man
+                .has_address_for_service(ServiceFlags::COMPACT_FILTERS);
+
+            if has_cf_candidate
+                && self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS
+            {
                 self.peers
                     .values()
                     .filter(|peer| peer.is_regular_peer())

@@ -604,7 +604,22 @@ where
     ) -> Result<(), WireError> {
         // try to connect with manually added peers
         self.maybe_open_connection_with_added_peers()?;
-        if self.connected_peers() >= T::MAX_OUTGOING_PEERS {
+
+        // If the caller requires a specific service flag and we currently have zero
+        // connected peers advertising it, we must open a new connection even when
+        // already at MAX_OUTGOING_PEERS. Otherwise, a peer rotation initiated by the
+        // caller (e.g. kicking a regular peer to make room for a compact-filters
+        // peer) races with the async shutdown and this early-return silently skips
+        // the replacement dial, leaving the service unfulfilled until another
+        // disconnect happens organically.
+        let lacks_required_service = required_service != ServiceFlags::NONE
+            && self
+                .peer_by_service
+                .get(&required_service)
+                .map(|peers| peers.is_empty())
+                .unwrap_or(true);
+
+        if self.connected_peers() >= T::MAX_OUTGOING_PEERS && !lacks_required_service {
             return Ok(());
         }
 

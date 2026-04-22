@@ -486,6 +486,23 @@ impl AddressMan {
             .unwrap_or_default()
     }
 
+    /// Whether the address manager knows at least one address advertising the
+    /// given service (good peers or merely known peers).
+    ///
+    /// Used by peer-rotation logic that should avoid churning an outgoing slot
+    /// unless we actually have a replacement candidate to dial.
+    pub fn has_address_for_service(&self, service: ServiceFlags) -> bool {
+        let good = self
+            .good_peers_by_service
+            .get(&service)
+            .is_some_and(|v| !v.is_empty());
+        let known = self
+            .peers_by_service
+            .get(&service)
+            .is_some_and(|v| !v.is_empty());
+        good || known
+    }
+
     /// Check if we have enough addresses on the address manager.
     #[rustfmt::skip]
     pub fn enough_addresses(&self) -> bool {
@@ -859,7 +876,18 @@ impl AddressMan {
             return Some(address);
         }
 
-        // if we can't find a peer that advertises the required service, get any peer
+        // If a specific service was required and we couldn't find any known peer
+        // advertising it, fail cleanly instead of returning a non-matching peer.
+        // Returning a non-matching peer would burn an outgoing slot on something
+        // that cannot fulfil the required service, starving callers that need it
+        // (e.g. compact-filter downloads livelock when the only CF peer leaves).
+        // A clean `None` lets the caller re-load hardcoded seeds (see
+        // `add_fixed_addresses`) and retry on the next tick with fresh candidates.
+        if service != ServiceFlags::NONE {
+            return None;
+        }
+
+        // No service requirement: any peer will do.
         let idx = rand::random::<usize>() % self.addresses.len();
         let peer = self.addresses.keys().nth(idx)?;
 
@@ -1690,5 +1718,70 @@ mod test {
         let mut address_man = AddressMan::new(None, SUPPORTED_NETWORKS);
         address_man.add_fixed_addresses(Network::Signet);
         assert!(!address_man.addresses.is_empty());
+    }
+
+    #[test]
+    fn test_get_random_address_required_service_returns_none_when_unknown() {
+        let mut address_man = AddressMan::new(None, &[ReachableNetworks::IPv4]);
+
+        let non_cf_peer = LocalAddress {
+            address: AddrV2::Ipv4("12.146.182.45".parse().unwrap()),
+            last_connected: 0,
+            state: AddressState::NeverTried,
+            services: ServiceFlags::NETWORK | ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+            port: 8333,
+            id: 0,
+        };
+
+        address_man.push_addresses(&[non_cf_peer]);
+
+        assert!(!address_man.addresses.is_empty());
+        assert!(!address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS));
+
+        // With no CF-advertising peer known, requiring COMPACT_FILTERS must fail
+        // cleanly instead of returning the unrelated NETWORK|WITNESS peer.
+        assert!(address_man
+            .get_random_address(ServiceFlags::COMPACT_FILTERS)
+            .is_none());
+        assert!(address_man
+            .get_address_to_connect(ServiceFlags::COMPACT_FILTERS, false)
+            .is_none());
+
+        // Without a service requirement, we still return the one peer we have.
+        assert!(address_man.get_random_address(ServiceFlags::NONE).is_some());
+    }
+
+    #[test]
+    fn test_get_random_address_returns_cf_peer_when_known() {
+        let mut address_man = AddressMan::new(None, &[ReachableNetworks::IPv4]);
+
+        let cf_peer = LocalAddress {
+            address: AddrV2::Ipv4("12.146.182.45".parse().unwrap()),
+            last_connected: 0,
+            state: AddressState::NeverTried,
+            services: ServiceFlags::NETWORK
+                | ServiceFlags::NETWORK_LIMITED
+                | ServiceFlags::WITNESS
+                | ServiceFlags::COMPACT_FILTERS,
+            port: 8333,
+            id: 0,
+        };
+        let non_cf_peer = LocalAddress {
+            address: AddrV2::Ipv4("45.77.242.77".parse().unwrap()),
+            last_connected: 0,
+            state: AddressState::NeverTried,
+            services: ServiceFlags::NETWORK | ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+            port: 8333,
+            id: 1,
+        };
+
+        address_man.push_addresses(&[cf_peer.clone(), non_cf_peer]);
+
+        assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS));
+
+        let picked = address_man
+            .get_random_address(ServiceFlags::COMPACT_FILTERS)
+            .expect("should find the CF-advertising peer");
+        assert!(picked.1.services.has(ServiceFlags::COMPACT_FILTERS));
     }
 }
