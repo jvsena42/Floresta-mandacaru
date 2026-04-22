@@ -105,22 +105,29 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
     fn load_descriptor(&self, descriptor: String) -> Result<bool> {
         let desc = slice::from_ref(&descriptor);
-        let mut parsed = parse_descriptors(desc)?;
+        let parsed = parse_descriptors(desc)?;
 
-        // It's ok to unwrap because we know there is at least one element in the vector
-        let addresses = parsed.pop().unwrap();
-        let addresses = (0..100)
-            .map(|index| {
-                let address = addresses
+        // `parse_descriptors` expands multipath descriptors (e.g. `.../<0;1>/*`)
+        // into one single-path descriptor per chain via miniscript's
+        // `into_single_descriptors()`. We must cache addresses from every
+        // expansion, otherwise subscribers to any chain other than the last
+        // one popped (historically, receive addresses when change comes last)
+        // see empty history over the Electrum protocol because their
+        // scriptPubKeys were never registered with the wallet.
+        for descriptor in &parsed {
+            for index in 0..100 {
+                let script_pubkey = descriptor
                     .at_derivation_index(index)
                     .unwrap()
                     .script_pubkey();
-                self.wallet.cache_address(address.clone());
-                address
-            })
-            .collect::<Vec<_>>();
+                self.wallet.cache_address(script_pubkey);
+            }
+        }
 
-        debug!("Rescanning with block filters for addresses: {addresses:?}");
+        debug!(
+            "Caching complete for {} derived descriptor(s); rescanning with block filters",
+            parsed.len()
+        );
 
         let addresses = self.wallet.get_cached_addresses();
         let wallet = self.wallet.clone();
