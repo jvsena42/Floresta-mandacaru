@@ -496,10 +496,10 @@ where
         }
 
         info!("Downloading filters from height {}", filters.get_height()?);
-        let stop = if height + 500 > best_height {
+        let stop = if height + 1000 > best_height {
             best_height
         } else {
-            height + 500
+            height + 1000
         };
 
         let stop_hash = self.chain.get_block_hash(stop)?;
