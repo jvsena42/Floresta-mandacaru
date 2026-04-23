@@ -5,16 +5,15 @@ use core::net::IpAddr;
 #[cfg(feature = "metrics")]
 use core::net::Ipv4Addr;
 use core::net::SocketAddr;
+use core::fmt;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-#[cfg(feature = "json-rpc")]
 use std::sync::OnceLock;
 
 pub use bitcoin::Network;
-#[cfg(feature = "zmq-server")]
 use floresta_chain::pruned_utreexo::BlockchainInterface;
 pub use floresta_chain::AssumeUtreexoValue;
 pub use floresta_chain::AssumeValidArg;
@@ -23,6 +22,8 @@ use floresta_chain::ChainParams;
 use floresta_chain::ChainState;
 use floresta_chain::FlatChainStore as ChainStore;
 use floresta_chain::FlatChainStoreConfig;
+pub use floresta_chain::SnapshotError;
+pub use floresta_chain::UtreexoSnapshot;
 #[cfg(feature = "compact-filters")]
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 #[cfg(feature = "compact-filters")]
@@ -267,10 +268,44 @@ pub struct Florestad {
     /// A channel that notifies we are done, and it's safe to die now
     stop_notify: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 
+    /// Handle to the running chain state. Populated once `start()` has created
+    /// it, used by [`Florestad::dump_utreexo_state`] to read the accumulator
+    /// at the current tip without taking any other lock. Only reads from the
+    /// `ChainState`; it must never touch wallet data (see data-hygiene notes
+    /// on [`UtreexoSnapshot`]).
+    blockchain_state: OnceLock<Arc<ChainState<ChainStore>>>,
+
     #[cfg(feature = "json-rpc")]
     /// A handle to our json-rpc server
     json_rpc: OnceLock<tokio::task::JoinHandle<()>>,
 }
+
+/// Why a [`Florestad::dump_utreexo_state`] call could not produce a snapshot.
+#[derive(Debug)]
+pub enum DumpError {
+    /// `dump_utreexo_state` was called before `start()` — there is no live
+    /// chain state to read from.
+    NotStarted,
+    /// The node is still doing initial block download. Dumping now would
+    /// produce a stale / wrong snapshot, so we refuse.
+    NotSynced,
+    /// Underlying chain error while reading tip or accumulator.
+    Chain(BlockchainError),
+}
+
+impl fmt::Display for DumpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DumpError::NotStarted => write!(f, "daemon has not been started yet"),
+            DumpError::NotSynced => {
+                write!(f, "initial block download not finished; dump not yet available")
+            }
+            DumpError::Chain(e) => write!(f, "chain error while dumping accumulator: {e:?}"),
+        }
+    }
+}
+
+impl core::error::Error for DumpError {}
 
 impl Florestad {
     /// Kills a running florestad, this will return as soon as the main node stops.
@@ -291,6 +326,30 @@ impl Florestad {
 
     pub fn get_stop_signal(&self) -> Arc<RwLock<bool>> {
         self.stop_signal.clone()
+    }
+
+    /// Dump the current Utreexo accumulator as a portable [`UtreexoSnapshot`].
+    ///
+    /// Only reads from the running `ChainState` — wallet data, descriptors and
+    /// xpubs are never touched. Returns [`DumpError::NotStarted`] before
+    /// `start()` has published the chain handle, and [`DumpError::NotSynced`]
+    /// while the node is still in IBD.
+    ///
+    /// The snapshot is a point-in-time read: callers that need a stable tip
+    /// should serialize externally (e.g. stop the daemon before dumping).
+    pub fn dump_utreexo_state(&self) -> Result<UtreexoSnapshot, DumpError> {
+        let chain = self.blockchain_state.get().ok_or(DumpError::NotStarted)?;
+        if chain.is_in_ibd() {
+            return Err(DumpError::NotSynced);
+        }
+        let (height, block_hash) = chain.get_best_block().map_err(DumpError::Chain)?;
+        let stump = chain.acc();
+        Ok(UtreexoSnapshot {
+            block_hash,
+            height,
+            leaves: stump.leaves,
+            roots: stump.roots,
+        })
     }
 
     pub async fn wait_shutdown(&self) {
@@ -379,6 +438,10 @@ impl Florestad {
             self.config.assume_valid,
         )?);
 
+        // Publish the chain handle for `dump_utreexo_state`. Safe to ignore a
+        // second `start()` call — OnceLock guarantees the first winner sticks.
+        let _ = self.blockchain_state.set(blockchain_state.clone());
+
         #[cfg(feature = "compact-filters")]
         let cfilters = if self.config.cfilters {
             // Block Filters
@@ -405,6 +468,21 @@ impl Florestad {
             _ => None,
         };
 
+        let picked = self.config.assumeutreexo_value.clone().or(assume_utreexo);
+        info!(
+            "assume_utreexo precedence: user={}, hardcoded={}, picked={}",
+            self.config.assumeutreexo_value.as_ref().map_or("None".to_string(), |v| format!(
+                "Some(height={} roots={})", v.height, v.roots.len()
+            )),
+            match self.config.assume_utreexo {
+                true => "Some(hardcoded_for_network)",
+                false => "None",
+            },
+            picked.as_ref().map_or("None".to_string(), |v| format!(
+                "Some(height={} roots={})", v.height, v.roots.len()
+            )),
+        );
+
         let proxy = self
             .config
             .proxy
@@ -420,7 +498,7 @@ impl Florestad {
             datadir: data_dir.clone(),
             fixed_peer: self.config.connect.clone(),
             compact_filters: self.config.cfilters,
-            assume_utreexo: self.config.assumeutreexo_value.clone().or(assume_utreexo),
+            assume_utreexo: picked,
             backfill: self.config.backfill,
             filter_start_height: self.config.filters_start_height,
             user_agent: self.config.user_agent.clone(),
@@ -879,6 +957,7 @@ impl From<Config> for Florestad {
             config,
             stop_signal: Arc::new(RwLock::new(false)),
             stop_notify: Arc::new(Mutex::new(None)),
+            blockchain_state: OnceLock::new(),
             #[cfg(feature = "json-rpc")]
             json_rpc: OnceLock::new(),
         }
