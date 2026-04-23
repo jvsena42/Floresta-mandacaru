@@ -31,6 +31,10 @@ pub use pruned_utreexo::chainstore::*;
 pub use pruned_utreexo::error::*;
 #[cfg(feature = "flat-chainstore")]
 pub use pruned_utreexo::flat_chain_store::*;
+pub use pruned_utreexo::snapshot::validate_for_network;
+pub use pruned_utreexo::snapshot::SnapshotError;
+pub use pruned_utreexo::snapshot::UtreexoSnapshot;
+pub use pruned_utreexo::snapshot::SNAPSHOT_VERSION;
 pub use pruned_utreexo::udata::*;
 pub use pruned_utreexo::utxo_data::*;
 pub use pruned_utreexo::BlockchainInterface;
