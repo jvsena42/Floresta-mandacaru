@@ -307,6 +307,30 @@ impl fmt::Display for DumpError {
 
 impl core::error::Error for DumpError {}
 
+/// Reads the `filters_start_height` value that was applied when the on-disk
+/// compact-filter store was last initialized. Returns `None` when the sidecar
+/// file is absent or unreadable, which we treat as "no value previously applied".
+#[cfg(feature = "compact-filters")]
+fn read_applied_filter_start_height(path: &Path) -> Option<i32> {
+    let bytes = fs::read(path).ok()?;
+    bytes.try_into().ok().map(i32::from_le_bytes)
+}
+
+/// Persists the `filters_start_height` value that was applied to the on-disk
+/// compact-filter store, so a future startup can detect a config change and
+/// reset the store. Removes the sidecar when `value` is `None`.
+#[cfg(feature = "compact-filters")]
+fn write_applied_filter_start_height(path: &Path, value: Option<i32>) -> std::io::Result<()> {
+    match value {
+        Some(v) => fs::write(path, v.to_le_bytes()),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        },
+    }
+}
+
 impl Florestad {
     /// Kills a running florestad, this will return as soon as the main node stops.
     ///
@@ -445,7 +469,40 @@ impl Florestad {
         #[cfg(feature = "compact-filters")]
         let cfilters = if self.config.cfilters {
             // Block Filters
-            let filter_store = FlatFiltersStore::new((data_dir.clone() + "/cfilters").into());
+            let cfilters_path: PathBuf = (data_dir.clone() + "/cfilters").into();
+            let cfilters_index_path: PathBuf = (data_dir.clone() + "/cfilters-index").into();
+            let cfilters_start_path: PathBuf =
+                (data_dir.clone() + "/cfilters-start-height").into();
+
+            // `filters_start_height` is only consumed once, when the on-disk
+            // store is empty. When the user changes the value (e.g. moves their
+            // wallet birthday), the store must be wiped so the new value takes
+            // effect; otherwise the daemon silently keeps using the old saved
+            // height. Track the value last applied to the store in a sidecar
+            // file and reset on mismatch.
+            let configured = self.config.filters_start_height;
+            let previously_applied = if cfilters_path.exists() && !cfilters_start_path.exists() {
+                // Migration: pre-existing store from an older daemon that
+                // didn't track the applied value. Adopt the current config as
+                // the baseline so we don't wipe a synced store on upgrade.
+                write_applied_filter_start_height(&cfilters_start_path, configured)
+                    .map_err(|e| FlorestadError::CouldNotLoadCompactFiltersStore(e.into()))?;
+                configured
+            } else {
+                read_applied_filter_start_height(&cfilters_start_path)
+            };
+
+            if configured != previously_applied {
+                info!(
+                    "filters_start_height changed (was {previously_applied:?}, now {configured:?}); resetting compact filter store"
+                );
+                let _ = fs::remove_file(&cfilters_path);
+                let _ = fs::remove_file(&cfilters_index_path);
+                write_applied_filter_start_height(&cfilters_start_path, configured)
+                    .map_err(|e| FlorestadError::CouldNotLoadCompactFiltersStore(e.into()))?;
+            }
+
+            let filter_store = FlatFiltersStore::new(cfilters_path);
             let cfilters = Arc::new(NetworkFilters::new(filter_store));
 
             let height = cfilters
@@ -961,5 +1018,46 @@ impl From<Config> for Florestad {
             #[cfg(feature = "json-rpc")]
             json_rpc: OnceLock::new(),
         }
+    }
+}
+
+#[cfg(all(test, feature = "compact-filters"))]
+mod filter_start_height_sidecar_tests {
+    use std::env;
+
+    use super::read_applied_filter_start_height;
+    use super::write_applied_filter_start_height;
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let mut p = env::temp_dir();
+        p.push(format!("floresta-filter-start-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn missing_file_reads_as_none() {
+        let p = tmp_path("missing");
+        assert_eq!(read_applied_filter_start_height(&p), None);
+    }
+
+    #[test]
+    fn write_then_read_roundtrips() {
+        let p = tmp_path("roundtrip");
+        write_applied_filter_start_height(&p, Some(800_000)).unwrap();
+        assert_eq!(read_applied_filter_start_height(&p), Some(800_000));
+        write_applied_filter_start_height(&p, Some(-100)).unwrap();
+        assert_eq!(read_applied_filter_start_height(&p), Some(-100));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn writing_none_removes_file() {
+        let p = tmp_path("clears");
+        write_applied_filter_start_height(&p, Some(123)).unwrap();
+        write_applied_filter_start_height(&p, None).unwrap();
+        assert_eq!(read_applied_filter_start_height(&p), None);
+        // Removing again must be idempotent.
+        write_applied_filter_start_height(&p, None).unwrap();
     }
 }
