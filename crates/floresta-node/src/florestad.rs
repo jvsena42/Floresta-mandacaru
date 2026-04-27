@@ -331,6 +331,37 @@ fn write_applied_filter_start_height(path: &Path, value: Option<i32>) -> std::io
     }
 }
 
+/// Returns `true` when the existing compact-filter store, populated for
+/// `previously_applied`, already covers the range required by `configured` —
+/// i.e. no wipe is needed. A store populated for an *earlier* (lower) start
+/// height contains every filter the new (higher) start height could need;
+/// only the inverse, going to an earlier start, requires re-downloading.
+///
+/// `None` and negative offset-from-tip values are treated conservatively
+/// (they trigger a wipe on mismatch) because their effective absolute height
+/// depends on context this function does not have.
+#[cfg(feature = "compact-filters")]
+fn store_covers_configured_range(
+    configured: Option<i32>,
+    previously_applied: Option<i32>,
+) -> bool {
+    if configured == previously_applied {
+        return true;
+    }
+    // Only optimize the unambiguous case where both sides are absolute,
+    // non-negative heights and the new lower bound is at or above the old.
+    let absolute = |v: Option<i32>| -> Option<u32> {
+        match v {
+            Some(h) if h >= 0 => Some(h as u32),
+            _ => None,
+        }
+    };
+    match (absolute(configured), absolute(previously_applied)) {
+        (Some(c), Some(p)) => c >= p,
+        _ => false,
+    }
+}
+
 impl Florestad {
     /// Kills a running florestad, this will return as soon as the main node stops.
     ///
@@ -475,11 +506,13 @@ impl Florestad {
                 (data_dir.clone() + "/cfilters-start-height").into();
 
             // `filters_start_height` is only consumed once, when the on-disk
-            // store is empty. When the user changes the value (e.g. moves their
-            // wallet birthday), the store must be wiped so the new value takes
-            // effect; otherwise the daemon silently keeps using the old saved
-            // height. Track the value last applied to the store in a sidecar
-            // file and reset on mismatch.
+            // store is empty. When the user moves to an *earlier* start height
+            // (e.g. an older wallet birthday), the store must be wiped so the
+            // new range gets downloaded; the saved height alone would skip
+            // those earlier filters. When the new start height is at or after
+            // the previously applied one, the existing store already contains
+            // every filter the new range needs and we keep it — a wipe in that
+            // direction silently discards already-matched wallet history.
             let configured = self.config.filters_start_height;
             let previously_applied = if cfilters_path.exists() && !cfilters_start_path.exists() {
                 // Migration: pre-existing store from an older daemon that
@@ -492,12 +525,18 @@ impl Florestad {
                 read_applied_filter_start_height(&cfilters_start_path)
             };
 
-            if configured != previously_applied {
+            if !store_covers_configured_range(configured, previously_applied) {
                 info!(
-                    "filters_start_height changed (was {previously_applied:?}, now {configured:?}); resetting compact filter store"
+                    "filters_start_height moved earlier (was {previously_applied:?}, now {configured:?}); resetting compact filter store to fetch the broader range"
                 );
                 let _ = fs::remove_file(&cfilters_path);
                 let _ = fs::remove_file(&cfilters_index_path);
+                write_applied_filter_start_height(&cfilters_start_path, configured)
+                    .map_err(|e| FlorestadError::CouldNotLoadCompactFiltersStore(e.into()))?;
+            } else if configured != previously_applied {
+                info!(
+                    "filters_start_height moved later (was {previously_applied:?}, now {configured:?}); keeping existing filter store and updating sidecar"
+                );
                 write_applied_filter_start_height(&cfilters_start_path, configured)
                     .map_err(|e| FlorestadError::CouldNotLoadCompactFiltersStore(e.into()))?;
             }
@@ -1026,6 +1065,7 @@ mod filter_start_height_sidecar_tests {
     use std::env;
 
     use super::read_applied_filter_start_height;
+    use super::store_covers_configured_range;
     use super::write_applied_filter_start_height;
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
@@ -1059,5 +1099,37 @@ mod filter_start_height_sidecar_tests {
         assert_eq!(read_applied_filter_start_height(&p), None);
         // Removing again must be idempotent.
         write_applied_filter_start_height(&p, None).unwrap();
+    }
+
+    #[test]
+    fn covers_when_configured_at_or_after_previously_applied() {
+        // Identical → trivially covered, no wipe.
+        assert!(store_covers_configured_range(Some(800_000), Some(800_000)));
+        // Moving start later — store has more than we need, keep it.
+        assert!(store_covers_configured_range(Some(929_690), Some(822_375)));
+        // Same boundary on both ends → covered.
+        assert!(store_covers_configured_range(Some(0), Some(0)));
+    }
+
+    #[test]
+    fn does_not_cover_when_configured_moves_earlier() {
+        // User moves wallet birthday earlier → need filters we don't have.
+        assert!(!store_covers_configured_range(Some(822_375), Some(929_690)));
+        assert!(!store_covers_configured_range(Some(0), Some(800_000)));
+    }
+
+    #[test]
+    fn conservatively_wipes_on_none_or_negative_transitions() {
+        // Negative offsets-from-tip can't be compared without the current
+        // tip; behave like the original wipe-on-mismatch logic.
+        assert!(!store_covers_configured_range(Some(-100), Some(800_000)));
+        assert!(!store_covers_configured_range(Some(800_000), Some(-100)));
+        assert!(!store_covers_configured_range(Some(-50), Some(-100)));
+        // None ↔ Some transitions are also ambiguous (None defaults to "from
+        // genesis-ish" but the store may have been started elsewhere); wipe.
+        assert!(!store_covers_configured_range(Some(800_000), None));
+        assert!(!store_covers_configured_range(None, Some(800_000)));
+        // Both None: nothing changed, treat as covered.
+        assert!(store_covers_configured_range(None, None));
     }
 }
