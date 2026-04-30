@@ -46,6 +46,15 @@ use crate::node_context::PeerId;
 use crate::p2p_wire::error::WireError;
 use crate::p2p_wire::peer::PeerMessages;
 
+/// How long do we keep the last invs to compute peer scores
+const MAX_INV_RETENTION_TIME: Duration = Duration::from_secs(60 * 60); // One hour
+
+/// Don't hold more than this many invs in `last_invs`
+const MAX_LAST_INVS: usize = 144; // Around one day worth of blocks
+
+/// To prevent disk filling attacks, we forbid reorgs that are over two days deep.
+const MAX_REORG_DEPTH: u32 = 288; // The expected amount of blocks mined in two days
+
 #[derive(Debug, Clone)]
 pub struct RunningNode {
     pub(crate) last_address_rearrange: Instant,
@@ -651,12 +660,16 @@ where
 
                     PeerMessages::NewBlock(block) => {
                         debug!("We got an inv with block {block} requesting it");
-                        self.context
-                            .last_invs
-                            .entry(block)
-                            .and_modify(|(when, peers)| {
+                        // This shouldn't happen under normal operation, but prevents worse-case
+                        // scenarios.
+                        if self.context.last_invs.len() >= MAX_LAST_INVS {
+                            self.context.last_invs.drain();
+                        }
+
+                        match self.context.last_invs.get_mut(&block) {
+                            Some((when, peers)) => {
                                 if peers.contains(&peer) {
-                                    return;
+                                    return Ok(());
                                 }
 
                                 // if it's been less than 5 seconds since we got the first inv message
@@ -664,28 +677,25 @@ where
                                 if when.elapsed() < Duration::from_secs(5) {
                                     peers.push(peer);
                                 }
-                            })
-                            .or_insert_with(|| (Instant::now(), Vec::new()));
+                            }
+
+                            None => {
+                                self.context.last_invs.retain(|_, (when, _)| when.elapsed() <= MAX_INV_RETENTION_TIME);
+                                self.context.last_invs.insert(block, (Instant::now(), vec![peer]));
+                            }
+                        }
+
+                        // Don't request a block twice
+                        let already_requested = self.inflight.contains_key(&InflightRequests::Blocks(block)) || self.blocks.contains_key(&block);
+                        if already_requested {
+                            return Ok(());
+                        }
 
                         if self.chain.get_block_header(&block).is_ok() {
                             return Ok(());
                         }
 
-                        if self.inflight.contains_key(&InflightRequests::Blocks(block)) {
-                            return Ok(());
-                        }
-
-                        let p = self
-                            .peers
-                            .get(&peer)
-                            .cloned()
-                            .ok_or(WireError::PeerNotFound)?;
-
-                        // if this is a utreexo peer, we should ask for the block if we don't
-                        // have it
-                        if p.services.has(service_flags::UTREEXO.into()) {
-                            self.handle_new_block(block, peer)?;
-                        }
+                        self.handle_new_block(block, peer)?;
                     }
 
                     PeerMessages::Block(block) => {
@@ -731,6 +741,32 @@ where
                         }
 
                         for header in headers.iter() {
+                            let block_hash = header.block_hash();
+
+                            // Don't request a block twice
+                            let already_requested = self.inflight.contains_key(&InflightRequests::Blocks(block_hash)) || self.blocks.contains_key(&block_hash);
+                            if already_requested {
+                                continue;
+                            }
+
+                            if self.chain.get_block_header(&block_hash).is_ok() {
+                                continue;
+                            }
+
+                            let Some(previous_height) = self.chain.get_block_height(&header.prev_blockhash)? else {
+                                // Orphan chain
+                                self.disconnect_and_ban(peer)?;
+                                return Ok(());
+                            };
+
+                            let current_height = self.chain.get_best_block()?.0;
+                            if current_height.saturating_sub(MAX_REORG_DEPTH) > previous_height {
+                                // peer has a super deep reorg, this could be a disk fill attack
+                                warn!("Peer {peer} is trying to reorg a very deep block, might be a disk fill attack. Banning it");
+                                self.disconnect_and_ban(peer)?;
+                                return Ok(());
+                            }
+
                             self.chain.accept_header(*header)?;
 
                             self.send_to_peer(
