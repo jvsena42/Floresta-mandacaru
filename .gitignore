@@ -10,6 +10,7 @@ doc/rpc_man/*.gz
 tmp/
 tmp-db/
 data/
+testdata/
 debug.log
 
 # Performance data and generated performance graphs
@@ -29,6 +30,7 @@ config.toml
 # IDE configurations
 .idea/
 .vscode/
+.claude/
 
 # uv python management
 .venv
