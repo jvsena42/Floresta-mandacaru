@@ -29,6 +29,7 @@ config.toml
 # IDE configurations
 .idea/
 .vscode/
+.claude/
 
 # uv python management
 .venv
