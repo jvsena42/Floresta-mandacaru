@@ -669,9 +669,13 @@ where
 
         if let Some(assume_utreexo) = self.common.config.assume_utreexo.as_ref() {
             self.context.state = ChainSelectorState::Done;
+            let validation_index = self.chain.get_validation_index().unwrap();
             // already assumed the chain
-            if self.chain.get_validation_index().unwrap() >= assume_utreexo.height {
-                self.chain.toggle_ibd(false);
+            if validation_index >= assume_utreexo.height {
+                let tip_height = self.chain.get_best_block()?.0;
+                if validation_index >= tip_height {
+                    self.chain.toggle_ibd(false);
+                }
                 return Ok(());
             }
             info!(
@@ -684,7 +688,6 @@ where
             };
             self.chain
                 .mark_chain_as_assumed(acc, assume_utreexo.block_hash)?;
-            self.chain.toggle_ibd(false);
             return Ok(());
         }
 
@@ -773,7 +776,6 @@ where
 
                 self.context.state = ChainSelectorState::Done;
                 self.chain.mark_chain_as_assumed(acc, tips[0]).unwrap();
-                self.chain.toggle_ibd(false);
             }
             // if we have more than one tip, we need to check if our best chain has an invalid block
             tips.remove(0); // no need to check our best one
