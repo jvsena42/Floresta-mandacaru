@@ -138,7 +138,7 @@ pub enum PeerCheck {
 }
 
 impl NodeContext for ChainSelector {
-    const REQUEST_TIMEOUT: u64 = 60; // Ban peers stalling our IBD
+    const REQUEST_TIMEOUT: u64 = 10; // Detect stalled IBD peers quickly so we re-issue to a fresh fast peer
 
     // Since we don't have any peers when chain selection starts, we use a more aggressive batch
     // size to make sure we get to our `MAX_OUTGOING_CONNECTIONS` ASAP
@@ -867,6 +867,10 @@ where
                 && !self.inflight.contains_key(&InflightRequests::Headers);
 
             if should_request {
+                let (height, _) = self.chain.get_best_block()?;
+                info!(
+                    "Header IBD stalled for {elapsed}s at height={height}; re-requesting from a fresh peer"
+                );
                 self.request_headers(self.chain.get_best_block()?.1)?;
             }
         }
