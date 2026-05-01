@@ -886,6 +886,8 @@ where
         // We downloaded all headers in the most-pow chain, and all our peers agree
         // this is the most-pow chain, we're done!
         if self.context.state == ChainSelectorState::Done {
+            let (height, hash) = self.chain.get_best_block()?;
+            info!("ChainSelector done: tip height={height} hash={hash}");
             try_and_log!(self.chain.flush());
             return Ok(LoopControl::Break);
         }
