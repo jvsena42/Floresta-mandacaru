@@ -100,6 +100,12 @@ pub struct ChainSelector {
 
     /// Keep track each peer's tip
     tip_cache: HashMap<PeerId, BlockHash>,
+
+    /// First time we entered `LookingForForks` (preserved across the per-poke timer
+    /// resets in `LookingForForks(Instant)`). Used as a watchdog: if some peer never
+    /// responds to any of our pokes, force-close the all-done gate so an unresponsive
+    /// peer cannot strand IBD indefinitely.
+    looking_for_forks_first_entered: Option<Instant>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -137,6 +143,16 @@ pub enum PeerCheck {
     BothUnresponsivePeers,
 }
 
+impl ChainSelector {
+    /// Watchdog: max seconds we'll wait in `LookingForForks` before treating any
+    /// silent peer as done. `poke_peers` is fire-and-forget (no inflight tracking),
+    /// so a peer with a half-open connection will never time out via the normal
+    /// `check_for_timeout` path; without this fallback, one such peer can strand IBD.
+    /// Three poke rounds at `REQUEST_TIMEOUT` (10s) is plenty for a healthy peer to
+    /// respond, so 30s is safe.
+    const LOOKING_FOR_FORKS_MAX_WAIT: u64 = 30;
+}
+
 impl NodeContext for ChainSelector {
     const REQUEST_TIMEOUT: u64 = 10; // Detect stalled IBD peers quickly so we re-issue to a fresh fast peer
 
@@ -172,9 +188,11 @@ where
             return Ok(());
         }
 
+        let tip_before = self.chain.get_best_block()?;
+
         info!(
             "Downloading headers from peer={peer} at height={} hash={}",
-            self.chain.get_best_block()?.0 + 1,
+            tip_before.0 + 1,
             headers[0].block_hash()
         );
 
@@ -200,6 +218,20 @@ where
             .or_insert(last);
 
         self.last_tip_update = Instant::now();
+
+        // In LookingForForks, if these headers didn't extend our tip the peer is on a
+        // sibling fork at our height (or sent us a header we already had). Mark them
+        // done and skip the recursive request_headers — otherwise competing-tip churn
+        // produces a cascading getheaders fan-out that prevents the all-done gate from
+        // ever closing.
+        if matches!(self.context.state, ChainSelectorState::LookingForForks(_))
+            && self.chain.get_best_block()? == tip_before
+        {
+            self.context.done_peers.insert(peer);
+            self.maybe_finish_looking_for_forks().await?;
+            return Ok(());
+        }
+
         self.request_headers(last)
     }
 
@@ -610,51 +642,61 @@ where
                 info!("Finished downloading headers from peer={peer}, checking if our peers agree");
                 self.poke_peers()?;
                 self.context.state = ChainSelectorState::LookingForForks(Instant::now());
+                self.context.looking_for_forks_first_entered = Some(Instant::now());
                 self.context.done_peers.insert(peer);
             }
             ChainSelectorState::LookingForForks(_) => {
                 self.context.done_peers.insert(peer);
-                for peer in self.common.peer_ids.iter() {
-                    // at least one peer haven't finished
-                    if !self.context.done_peers.contains(peer) {
-                        return Ok(());
-                    }
-                }
-
-                if let Some(assume_utreexo) = self.common.config.assume_utreexo.as_ref() {
-                    self.context.state = ChainSelectorState::Done;
-                    // already assumed the chain
-                    if self.chain.get_validation_index().unwrap() >= assume_utreexo.height {
-                        self.chain.toggle_ibd(false);
-                        return Ok(());
-                    }
-                    info!(
-                        "Assuming chain with height={} tip={}",
-                        assume_utreexo.height, assume_utreexo.block_hash
-                    );
-                    let acc = Stump {
-                        leaves: assume_utreexo.leaves,
-                        roots: assume_utreexo.roots.clone(),
-                    };
-                    self.chain
-                        .mark_chain_as_assumed(acc, assume_utreexo.block_hash)?;
-                    self.chain.toggle_ibd(false);
-                    return Ok(());
-                }
-
-                let has_peers = self
-                    .peer_by_service
-                    .contains_key(&service_flags::UTREEXO_ARCHIVE.into());
-
-                if self.config.pow_fraud_proofs && has_peers {
-                    self.check_tips().await?;
-                }
-
-                self.context.state = ChainSelectorState::Done;
+                self.maybe_finish_looking_for_forks().await?;
             }
             _ => {}
         }
 
+        Ok(())
+    }
+
+    /// Checks the all-peers-done gate while in `LookingForForks`. If every connected peer
+    /// has reported (either via empty headers or by responding with non-extending headers
+    /// that were absorbed without advancing our tip), transitions to `Done`, taking the
+    /// assume-utreexo or pow-fraud-proofs path as configured.
+    async fn maybe_finish_looking_for_forks(&mut self) -> Result<(), WireError> {
+        for peer in self.common.peer_ids.iter() {
+            // at least one peer haven't finished
+            if !self.context.done_peers.contains(peer) {
+                return Ok(());
+            }
+        }
+
+        if let Some(assume_utreexo) = self.common.config.assume_utreexo.as_ref() {
+            self.context.state = ChainSelectorState::Done;
+            // already assumed the chain
+            if self.chain.get_validation_index().unwrap() >= assume_utreexo.height {
+                self.chain.toggle_ibd(false);
+                return Ok(());
+            }
+            info!(
+                "Assuming chain with height={} tip={}",
+                assume_utreexo.height, assume_utreexo.block_hash
+            );
+            let acc = Stump {
+                leaves: assume_utreexo.leaves,
+                roots: assume_utreexo.roots.clone(),
+            };
+            self.chain
+                .mark_chain_as_assumed(acc, assume_utreexo.block_hash)?;
+            self.chain.toggle_ibd(false);
+            return Ok(());
+        }
+
+        let has_peers = self
+            .peer_by_service
+            .contains_key(&service_flags::UTREEXO_ARCHIVE.into());
+
+        if self.config.pow_fraud_proofs && has_peers {
+            self.check_tips().await?;
+        }
+
+        self.context.state = ChainSelectorState::Done;
         Ok(())
     }
 
@@ -861,6 +903,34 @@ where
                 self.context.state = ChainSelectorState::LookingForForks(Instant::now());
                 self.poke_peers()?;
             }
+
+            // Watchdog: poke_peers is fire-and-forget (no inflight tracking), so a peer
+            // with a half-open connection or one that ignores our locator never trips
+            // check_for_timeout and is never added to done_peers. After enough poke
+            // rounds, treat any silent peer as done so the gate can close.
+            if let Some(first) = self.context.looking_for_forks_first_entered {
+                let elapsed = first.elapsed().as_secs();
+                if elapsed > ChainSelector::LOOKING_FOR_FORKS_MAX_WAIT {
+                    let pending: Vec<PeerId> = self
+                        .common
+                        .peer_ids
+                        .iter()
+                        .filter(|p| !self.context.done_peers.contains(p))
+                        .copied()
+                        .collect();
+                    if !pending.is_empty() {
+                        warn!(
+                            "ChainSelector: {} peers silent for {elapsed}s in LookingForForks; forcing done: {:?}",
+                            pending.len(),
+                            pending,
+                        );
+                        for p in pending {
+                            self.context.done_peers.insert(p);
+                        }
+                        self.maybe_finish_looking_for_forks().await?;
+                    }
+                }
+            }
         }
 
         if let ChainSelectorState::DownloadingHeaders = self.context.state {
@@ -1024,6 +1094,10 @@ where
                 if self.peers.is_empty() {
                     self.context.state = ChainSelectorState::CreatingConnections;
                 }
+                // PeerId is reusable across reconnections, so drop any per-peer ChainSelector
+                // state to keep a fresh peer from inheriting a stale "done" mark or alt-tip.
+                self.context.done_peers.remove(&peer);
+                self.context.tip_cache.remove(&peer);
                 self.handle_disconnection(peer, idx)?;
             }
 
