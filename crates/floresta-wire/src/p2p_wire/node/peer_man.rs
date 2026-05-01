@@ -596,6 +596,12 @@ where
             }
 
             debug!("Request timed out: {req:?}");
+            if matches!(req, InflightRequests::Headers) {
+                let stalled_for = now.duration_since(time).as_secs();
+                info!(
+                    "Header request to peer={peer} timed out after {stalled_for}s; re-issuing to a fresh peer"
+                );
+            }
             // Increase the banscore and try banning the peer if needed, then re-request
             try_and_log!(self.increase_banscore(peer, 1));
 
