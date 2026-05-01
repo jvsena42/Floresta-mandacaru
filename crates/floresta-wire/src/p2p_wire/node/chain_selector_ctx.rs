@@ -100,6 +100,12 @@ pub struct ChainSelector {
 
     /// Keep track each peer's tip
     tip_cache: HashMap<PeerId, BlockHash>,
+
+    /// First time we entered `LookingForForks` (preserved across the per-poke timer
+    /// resets in `LookingForForks(Instant)`). Used as a watchdog: if some peer never
+    /// responds to any of our pokes, force-close the all-done gate so an unresponsive
+    /// peer cannot strand IBD indefinitely.
+    looking_for_forks_first_entered: Option<Instant>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -135,6 +141,16 @@ pub enum PeerCheck {
 
     /// Both peers are unresponsive
     BothUnresponsivePeers,
+}
+
+impl ChainSelector {
+    /// Watchdog: max seconds we'll wait in `LookingForForks` before treating any
+    /// silent peer as done. `poke_peers` is fire-and-forget (no inflight tracking),
+    /// so a peer with a half-open connection will never time out via the normal
+    /// `check_for_timeout` path; without this fallback, one such peer can strand IBD.
+    /// Three poke rounds at `REQUEST_TIMEOUT` (10s) is plenty for a healthy peer to
+    /// respond, so 30s is safe.
+    const LOOKING_FOR_FORKS_MAX_WAIT: u64 = 30;
 }
 
 impl NodeContext for ChainSelector {
@@ -626,6 +642,7 @@ where
                 info!("Finished downloading headers from peer={peer}, checking if our peers agree");
                 self.poke_peers()?;
                 self.context.state = ChainSelectorState::LookingForForks(Instant::now());
+                self.context.looking_for_forks_first_entered = Some(Instant::now());
                 self.context.done_peers.insert(peer);
             }
             ChainSelectorState::LookingForForks(_) => {
@@ -885,6 +902,34 @@ where
             if start.elapsed().as_secs() > ChainSelector::REQUEST_TIMEOUT {
                 self.context.state = ChainSelectorState::LookingForForks(Instant::now());
                 self.poke_peers()?;
+            }
+
+            // Watchdog: poke_peers is fire-and-forget (no inflight tracking), so a peer
+            // with a half-open connection or one that ignores our locator never trips
+            // check_for_timeout and is never added to done_peers. After enough poke
+            // rounds, treat any silent peer as done so the gate can close.
+            if let Some(first) = self.context.looking_for_forks_first_entered {
+                let elapsed = first.elapsed().as_secs();
+                if elapsed > ChainSelector::LOOKING_FOR_FORKS_MAX_WAIT {
+                    let pending: Vec<PeerId> = self
+                        .common
+                        .peer_ids
+                        .iter()
+                        .filter(|p| !self.context.done_peers.contains(p))
+                        .copied()
+                        .collect();
+                    if !pending.is_empty() {
+                        warn!(
+                            "ChainSelector: {} peers silent for {elapsed}s in LookingForForks; forcing done: {:?}",
+                            pending.len(),
+                            pending,
+                        );
+                        for p in pending {
+                            self.context.done_peers.insert(p);
+                        }
+                        self.maybe_finish_looking_for_forks().await?;
+                    }
+                }
             }
         }
 
