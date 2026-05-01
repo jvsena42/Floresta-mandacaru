@@ -625,6 +625,7 @@ where
                     self.context.state = ChainSelectorState::Done;
                     // already assumed the chain
                     if self.chain.get_validation_index().unwrap() >= assume_utreexo.height {
+                        self.chain.toggle_ibd(false);
                         return Ok(());
                     }
                     info!(
@@ -637,6 +638,7 @@ where
                     };
                     self.chain
                         .mark_chain_as_assumed(acc, assume_utreexo.block_hash)?;
+                    self.chain.toggle_ibd(false);
                     return Ok(());
                 }
 
