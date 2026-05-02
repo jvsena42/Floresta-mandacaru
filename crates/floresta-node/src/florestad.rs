@@ -331,6 +331,19 @@ fn write_applied_filter_start_height(path: &Path, value: Option<i32>) -> std::io
     }
 }
 
+/// Resolves a user-supplied `filters_start_height` value to an absolute chain
+/// height. Negative values are interpreted as "tip minus N" offsets, anchored
+/// to `chain_tip` at the moment of resolution. `None` is returned for `None`
+/// inputs (filters from genesis).
+#[cfg(feature = "compact-filters")]
+fn resolve_filter_start_height(value: Option<i32>, chain_tip: u32) -> Option<u32> {
+    match value {
+        None => None,
+        Some(v) if v >= 0 => Some(v as u32),
+        Some(v) => Some(chain_tip.saturating_sub((-v) as u32)),
+    }
+}
+
 /// Returns `true` when the existing compact-filter store, populated for
 /// `previously_applied`, already covers the range required by `configured` —
 /// i.e. no wipe is needed. A store populated for an *earlier* (lower) start
@@ -557,6 +570,17 @@ impl Florestad {
         #[cfg(not(feature = "compact-filters"))]
         let cfilters = None;
 
+        #[cfg(feature = "compact-filters")]
+        let cfilters_start_resolved: Option<u32> = if self.config.cfilters {
+            let chain_tip = blockchain_state.get_height().unwrap_or(0);
+            resolve_filter_start_height(self.config.filters_start_height, chain_tip)
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "compact-filters"))]
+        let cfilters_start_resolved: Option<u32> = None;
+
         // If this network already allows pow fraud proofs, we should use it instead of assumeutreexo
         let assume_utreexo = match self.config.assume_utreexo {
             true => Some(ChainParams::get_assume_utreexo(self.config.network)),
@@ -647,6 +671,7 @@ impl Florestad {
                 self.stop_signal.clone(),
                 self.config.network,
                 cfilters.clone(),
+                cfilters_start_resolved,
                 self.config
                     .json_rpc_address
                     .as_ref()

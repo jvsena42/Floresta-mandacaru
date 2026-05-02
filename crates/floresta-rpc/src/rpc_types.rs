@@ -55,6 +55,20 @@ pub struct GetBlockchainInfoRes {
     /// On average, miners needs to make `difficulty` hashes before finding one that
     /// solves a block's PoW
     pub difficulty: u64,
+    /// Height up to which compact block filters have been downloaded.
+    ///
+    /// Absent when the node was started without compact-filter support.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub filters: Option<u32>,
+    /// Resolved absolute height at which compact filter download started for
+    /// the current on-disk store.
+    ///
+    /// Use this together with `filters` and `height` to compute filter sync
+    /// progress: `(filters - filters_start) / (height - filters_start)`.
+    /// Absent when filters were started from genesis (no birthday set) or
+    /// when compact filters are disabled.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub filters_start: Option<u32>,
 }
 
 /// The information returned by a get_raw_tx
