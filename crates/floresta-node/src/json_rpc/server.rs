@@ -75,6 +75,11 @@ impl<T> RpcChain for T where T: ThreadSafeChain + Clone {}
 
 pub struct RpcImpl<Blockchain: RpcChain> {
     pub(super) block_filter_storage: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
+    /// Resolved absolute height at which compact filter download started for
+    /// the on-disk store. Surfaced via `getblockchaininfo.filters_start` so
+    /// clients can compute filter sync progress against the actual download
+    /// window rather than the chain tip.
+    pub(super) block_filter_start: Option<u32>,
     pub(super) network: Network,
     pub(super) chain: Blockchain,
     pub(super) wallet: Arc<AddressCache<KvDatabase>>,
@@ -749,6 +754,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         kill_signal: Arc<RwLock<bool>>,
         network: Network,
         block_filter_storage: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
+        block_filter_start: Option<u32>,
         address: Option<SocketAddr>,
         log_path: String,
     ) {
@@ -788,6 +794,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 kill_signal,
                 network,
                 block_filter_storage,
+                block_filter_start,
                 inflight: Arc::new(RwLock::new(HashMap::new())),
                 log_path,
                 start_time: Instant::now(),
