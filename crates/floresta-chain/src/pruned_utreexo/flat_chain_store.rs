@@ -1062,6 +1062,11 @@ impl FlatChainStore {
         self.block_index.flush()?;
         self.fork_headers.flush()?;
 
+        // Persist accumulator file data before recording the checksum, so the
+        // metadata checksum cannot claim "consistent" while the headers mmap's
+        // acc_pos entries point past the durable end of accumulators.bin.
+        self.accumulator_file.sync_data()?;
+
         let checksum = self.compute_checksum();
         let metadata = self.get_metadata_mut()?;
 
