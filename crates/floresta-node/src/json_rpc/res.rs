@@ -41,6 +41,21 @@ pub struct GetBlockchainInfoRes {
     /// disabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub filters_start: Option<u32>,
+    /// Whether a wallet rescan is currently running.
+    ///
+    /// Filter download reaching the tip does not mean the wallet is fully
+    /// scanned; while this is `true` the wallet history may still be
+    /// incomplete, so clients should not report "fully synced" yet.
+    #[serde(default)]
+    pub rescan_in_progress: bool,
+    /// Matched blocks processed so far by the in-progress rescan. Absent when no
+    /// rescan is running.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rescan_blocks_processed: Option<u32>,
+    /// Total matched blocks the in-progress rescan has to process. Absent when
+    /// no rescan is running.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rescan_blocks_total: Option<u32>,
 }
 
 /// A confidence enum to auxiliate rescan timestamp values.
@@ -239,6 +254,9 @@ pub enum JsonRpcError {
 
     /// Something went wrong when attempting to publish a transaction to mempool
     MempoolAccept(AcceptToMempoolError),
+
+    /// A wallet rescan is already running; a second one was requested before it finished.
+    RescanInProgress,
 }
 
 impl_error_from!(JsonRpcError, AcceptToMempoolError, MempoolAccept);
@@ -273,6 +291,7 @@ impl Display for JsonRpcError {
             JsonRpcError::InvalidDisconnectNodeCommand => write!(f, "Invalid disconnectnode command"),
             JsonRpcError::PeerNotFound => write!(f, "Peer not found in the peer list"),
             JsonRpcError::MempoolAccept(e) => write!(f, "Could not send transaction to mempool due to {e}"),
+            JsonRpcError::RescanInProgress => write!(f, "A rescan is already in progress, please wait for it to finish"),
         }
     }
 }

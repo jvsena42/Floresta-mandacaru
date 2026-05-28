@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::sync::atomic::Ordering;
+
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::consensus::Encodable;
@@ -276,6 +278,16 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             .and_then(|f| f.get_height().ok());
         let filters_start = self.block_filter_start;
 
+        let rescan_in_progress = self.rescan_in_progress.load(Ordering::SeqCst);
+        let (rescan_blocks_processed, rescan_blocks_total) = if rescan_in_progress {
+            (
+                Some(self.rescan_blocks_processed.load(Ordering::SeqCst)),
+                Some(self.rescan_blocks_total.load(Ordering::SeqCst)),
+            )
+        } else {
+            (None, None)
+        };
+
         Ok(GetBlockchainInfoRes {
             best_block: hash.to_string(),
             height,
@@ -291,6 +303,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             progress: validated_percentage,
             filters,
             filters_start,
+            rescan_in_progress,
+            rescan_blocks_processed,
+            rescan_blocks_total,
         })
     }
 

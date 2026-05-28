@@ -69,6 +69,21 @@ pub struct GetBlockchainInfoRes {
     /// when compact filters are disabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub filters_start: Option<u32>,
+    /// Whether a wallet rescan is currently running.
+    ///
+    /// Filter download reaching the tip does not mean the wallet is fully
+    /// scanned; while this is `true` the wallet history may still be
+    /// incomplete, so clients should not report "fully synced" yet.
+    #[serde(default)]
+    pub rescan_in_progress: bool,
+    /// Matched blocks processed so far by the in-progress rescan. Absent when no
+    /// rescan is running.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rescan_blocks_processed: Option<u32>,
+    /// Total matched blocks the in-progress rescan has to process. Absent when
+    /// no rescan is running.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rescan_blocks_total: Option<u32>,
 }
 
 /// The information returned by a get_raw_tx
