@@ -2,8 +2,10 @@
 
 use core::net::SocketAddr;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::slice;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -43,6 +45,7 @@ use tower_http::cors::CorsLayer;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 
 use super::res::JsonRpcError;
 use super::res::RawTxJson;
@@ -593,6 +596,11 @@ async fn cannot_get(_state: State<Arc<RpcImpl<impl RpcChain>>>) -> Json<serde_js
 }
 
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
+    /// How many times to retry fetching a single matched block before giving up
+    /// on it for this rescan pass. Bounds the work-queue so an unreachable block
+    /// (no peer has it) can't loop forever.
+    const MAX_BLOCK_FETCH_ATTEMPTS: u8 = 5;
+
     async fn rescan_with_block_filters(
         addresses: Vec<ScriptBuf>,
         chain: Blockchain,
@@ -613,15 +621,48 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
         info!("rescan filter hits: {blocks:?}");
 
-        for block in blocks {
-            if let Ok(Some(block)) = node.get_block(block).await {
-                let height = chain
-                    .get_block_height(&block.block_hash())
-                    .unwrap()
-                    .unwrap();
+        // A matched block whose download fails must be retried, not dropped.
+        // `get_block` returns `Ok(None)` when a peer replies NOTFOUND and `Err`
+        // when the responder is dropped (inflight cap reached or peer
+        // disconnected) — both are transient on a phone with few, flaky peers.
+        // The old code's `if let Ok(Some(block))` swallowed both, silently
+        // losing the wallet transactions those blocks carried, which is why a
+        // single rescan was never enough and users had to retry repeatedly.
+        let mut queue: VecDeque<BlockHash> = blocks.into_iter().collect();
+        let mut attempts: HashMap<BlockHash, u8> = HashMap::new();
+        let mut processed: u32 = 0;
+        let mut failed: u32 = 0;
 
-                wallet.block_process(&block, height);
+        while let Some(hash) = queue.pop_front() {
+            match node.get_block(hash).await {
+                Ok(Some(block)) => {
+                    let height = chain
+                        .get_block_height(&block.block_hash())
+                        .unwrap()
+                        .unwrap();
+                    wallet.block_process(&block, height);
+                    processed += 1;
+                }
+                _ => {
+                    let attempt = attempts.entry(hash).or_insert(0);
+                    *attempt += 1;
+                    if *attempt >= Self::MAX_BLOCK_FETCH_ATTEMPTS {
+                        warn!("rescan: giving up on block {hash} after {attempt} attempts");
+                        failed += 1;
+                        continue;
+                    }
+                    let backoff = Duration::from_millis(500 * u64::from(*attempt))
+                        .min(Duration::from_secs(5));
+                    tokio::time::sleep(backoff).await;
+                    queue.push_back(hash);
+                }
             }
+        }
+
+        if failed > 0 {
+            warn!("rescan complete: processed {processed} block(s), {failed} unreachable");
+        } else {
+            info!("rescan complete: processed {processed} block(s)");
         }
 
         Ok(())
