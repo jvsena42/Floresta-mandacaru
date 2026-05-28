@@ -685,14 +685,21 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         // return) so a stuck flag can never permanently block future rescans.
         let _guard = RescanInProgressGuard(in_progress);
 
-        let blocks = cfilters
-            .match_any(
-                addresses.iter().map(|a| a.as_bytes()).collect(),
-                start_height,
-                stop_height,
-                chain.clone(),
-            )
-            .unwrap();
+        let blocks = match cfilters.match_any(
+            addresses.iter().map(|a| a.as_bytes()).collect(),
+            start_height,
+            stop_height,
+            chain.clone(),
+        ) {
+            Ok(blocks) => blocks,
+            Err(e) => {
+                // A filter-store read error (e.g. I/O on the on-disk store) can't
+                // be recovered here; log and abort the rescan instead of panicking
+                // the spawned task. The in-progress guard still clears on return.
+                warn!("rescan aborted: could not read compact filters: {e:?}");
+                return Ok(());
+            }
+        };
 
         info!("rescan filter hits: {blocks:?}");
 
@@ -714,13 +721,25 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         while let Some(hash) = queue.pop_front() {
             match node.get_block(hash).await {
                 Ok(Some(block)) => {
-                    let height = chain
-                        .get_block_height(&block.block_hash())
-                        .unwrap()
-                        .unwrap();
-                    wallet.block_process(&block, height);
-                    processed += 1;
-                    blocks_processed.fetch_add(1, Ordering::SeqCst);
+                    match chain.get_block_height(&block.block_hash()) {
+                        Ok(Some(height)) => {
+                            wallet.block_process(&block, height);
+                            processed += 1;
+                            blocks_processed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        // The block matched our request, so the chain should know
+                        // its height; a miss means a chain-store error or a deep
+                        // reorg evicted it. Retrying the fetch won't help, so count
+                        // it and move on instead of panicking.
+                        Ok(None) => {
+                            warn!("rescan: fetched block {hash} has no height (reorged out?); skipping");
+                            failed += 1;
+                        }
+                        Err(e) => {
+                            warn!("rescan: height lookup failed for block {hash}: {e:?}; skipping");
+                            failed += 1;
+                        }
+                    }
                 }
                 _ => {
                     let attempt = attempts.entry(hash).or_insert(0);
