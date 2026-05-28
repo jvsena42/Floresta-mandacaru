@@ -41,6 +41,7 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
+use tracing::warn;
 
 use crate::get_arg;
 use crate::json_rpc_res;
@@ -104,7 +105,12 @@ impl<S: AsyncStream> TcpActor<S> {
                             break;
                         }
                         Err(e) => {
-                            error!("Error reading from client: {e:?}");
+                            // A non-UTF-8 read is almost always a client speaking
+                            // a non-line-protocol (most commonly a TLS handshake
+                            // on the plaintext port). It's a client-side
+                            // misconfiguration, not a server fault, so don't log
+                            // it at ERROR — just drop the connection.
+                            warn!("Dropping client {}: non-text input ({e:?}). If this was a wallet, it likely tried TLS on the plaintext Electrum port — disable TLS for this server.", self.client_id);
                             self.message_transmitter
                                 .send(Message::Disconnect(self.client_id))
                                 .expect("Main loop is broken");
@@ -858,11 +864,29 @@ pub async fn client_accept_loop(
                     }
                 }
             } else {
-                let client = Arc::new(Client::new(id_count, stream, message_transmitter.clone()));
-                message_transmitter
-                    .send(Message::NewClient((client.client_id, client)))
-                    .expect("Main loop is broken");
+                // Peek the first byte in a spawned task (so a slow/idle client
+                // can't stall the accept loop). A client that tried TLS against
+                // the plaintext port sends a ClientHello whose first byte is
+                // 0x16 ("handshake" content type); reading it as a line would
+                // later fail UTF-8 decoding, so reject it here with an
+                // actionable message. `peek` does not consume bytes, so genuine
+                // plaintext clients are unaffected.
+                let transmitter = message_transmitter.clone();
+                let client_id = id_count;
                 id_count += 1;
+                tokio::spawn(async move {
+                    let mut first = [0u8; 1];
+                    if let Ok(n) = stream.peek(&mut first).await {
+                        if n > 0 && first[0] == 0x16 {
+                            warn!("Client attempted a TLS handshake on the plaintext Electrum port; disable TLS for this server (use the non-SSL / ':t' option).");
+                            return;
+                        }
+                    }
+                    let client = Arc::new(Client::new(client_id, stream, transmitter.clone()));
+                    transmitter
+                        .send(Message::NewClient((client.client_id, client)))
+                        .expect("Main loop is broken");
+                });
             }
         }
     }
