@@ -4,6 +4,9 @@ use core::net::SocketAddr;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::slice;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -91,6 +94,15 @@ pub struct RpcImpl<Blockchain: RpcChain> {
     pub(super) inflight: Arc<RwLock<HashMap<Value, InflightRpc>>>,
     pub(super) log_path: String,
     pub(super) start_time: Instant,
+    /// Whether a wallet rescan (`rescanblockchain` or the rescan kicked off by
+    /// `loaddescriptor`) is currently running. Used to dedup concurrent rescans
+    /// and to let clients tell, via `getblockchaininfo`, that the wallet is
+    /// still being scanned even though filter download already reached the tip.
+    pub(super) rescan_in_progress: Arc<AtomicBool>,
+    /// Matched blocks processed so far by the in-progress rescan.
+    pub(super) rescan_blocks_processed: Arc<AtomicU32>,
+    /// Total matched blocks the in-progress rescan has to process.
+    pub(super) rescan_blocks_total: Arc<AtomicU32>,
 }
 
 type Result<T> = std::result::Result<T, JsonRpcError>;
@@ -147,9 +159,34 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let node = self.node.clone();
         let chain = self.chain.clone();
 
-        tokio::task::spawn(Self::rescan_with_block_filters(
-            addresses, chain, wallet, cfilters, node, None, None,
-        ));
+        // Always persist the descriptor; only kick off a rescan if one isn't
+        // already running. If a rescan is in progress we skip spawning a
+        // duplicate — the freshly cached addresses are picked up by the next
+        // rescan (the client triggers one once filters reach the tip).
+        if self
+            .rescan_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.rescan_blocks_processed.store(0, Ordering::SeqCst);
+            self.rescan_blocks_total.store(0, Ordering::SeqCst);
+            tokio::task::spawn(Self::rescan_with_block_filters(
+                addresses,
+                chain,
+                wallet,
+                cfilters,
+                node,
+                None,
+                None,
+                self.rescan_in_progress.clone(),
+                self.rescan_blocks_processed.clone(),
+                self.rescan_blocks_total.clone(),
+            ));
+        } else {
+            debug!(
+                "rescan already in progress; descriptor cached, will be covered by the next rescan"
+            );
+        }
 
         self.wallet.push_descriptor(&descriptor)?;
         debug!("Descriptor pushed: {descriptor}");
@@ -195,6 +232,20 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
         let chain = self.chain.clone();
 
+        // Refuse to spawn a duplicate rescan if one is already running. This
+        // backstops the UI: rapid taps on the Rescan button no longer launch
+        // overlapping tasks that re-fetch the same blocks.
+        if self
+            .rescan_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(JsonRpcError::RescanInProgress);
+        }
+
+        self.rescan_blocks_processed.store(0, Ordering::SeqCst);
+        self.rescan_blocks_total.store(0, Ordering::SeqCst);
+
         tokio::task::spawn(Self::rescan_with_block_filters(
             addresses,
             chain,
@@ -203,6 +254,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             node,
             (start_height != 0).then_some(start_height), // Its ugly but to maintain the API here its necessary to recast to a Option.
             (stop_height != 0).then_some(stop_height),
+            self.rescan_in_progress.clone(),
+            self.rescan_blocks_processed.clone(),
+            self.rescan_blocks_total.clone(),
         ));
         Ok(true)
     }
@@ -479,6 +533,7 @@ fn get_http_error_code(err: &JsonRpcError) -> u16 {
 
         // we messed up, sowwy
         JsonRpcError::InInitialBlockDownload
+        | JsonRpcError::RescanInProgress
         | JsonRpcError::Node(_)
         | JsonRpcError::Chain
         | JsonRpcError::Filters(_) => 503,
@@ -514,6 +569,7 @@ fn get_json_rpc_error_code(err: &JsonRpcError) -> i32 {
 
         // server error
         JsonRpcError::InInitialBlockDownload
+        | JsonRpcError::RescanInProgress
         | JsonRpcError::Node(_)
         | JsonRpcError::Chain
         | JsonRpcError::NoBlockFilters
@@ -595,12 +651,24 @@ async fn cannot_get(_state: State<Arc<RpcImpl<impl RpcChain>>>) -> Json<serde_js
     }))
 }
 
+/// Resets the rescan-in-progress flag on drop, so the flag is cleared on every
+/// exit path of the spawned rescan task — normal completion, early return, or
+/// panic — and a future rescan is never permanently blocked.
+struct RescanInProgressGuard(Arc<AtomicBool>);
+
+impl Drop for RescanInProgressGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     /// How many times to retry fetching a single matched block before giving up
     /// on it for this rescan pass. Bounds the work-queue so an unreachable block
     /// (no peer has it) can't loop forever.
     const MAX_BLOCK_FETCH_ATTEMPTS: u8 = 5;
 
+    #[allow(clippy::too_many_arguments)]
     async fn rescan_with_block_filters(
         addresses: Vec<ScriptBuf>,
         chain: Blockchain,
@@ -609,7 +677,14 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         node: NodeInterface,
         start_height: Option<u32>,
         stop_height: Option<u32>,
+        in_progress: Arc<AtomicBool>,
+        blocks_processed: Arc<AtomicU32>,
+        blocks_total: Arc<AtomicU32>,
     ) -> Result<()> {
+        // Clears `in_progress` on every exit path (including panic / early
+        // return) so a stuck flag can never permanently block future rescans.
+        let _guard = RescanInProgressGuard(in_progress);
+
         let blocks = cfilters
             .match_any(
                 addresses.iter().map(|a| a.as_bytes()).collect(),
@@ -620,6 +695,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             .unwrap();
 
         info!("rescan filter hits: {blocks:?}");
+
+        blocks_total.store(blocks.len() as u32, Ordering::SeqCst);
+        blocks_processed.store(0, Ordering::SeqCst);
 
         // A matched block whose download fails must be retried, not dropped.
         // `get_block` returns `Ok(None)` when a peer replies NOTFOUND and `Err`
@@ -642,6 +720,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                         .unwrap();
                     wallet.block_process(&block, height);
                     processed += 1;
+                    blocks_processed.fetch_add(1, Ordering::SeqCst);
                 }
                 _ => {
                     let attempt = attempts.entry(hash).or_insert(0);
@@ -839,6 +918,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 inflight: Arc::new(RwLock::new(HashMap::new())),
                 log_path,
                 start_time: Instant::now(),
+                rescan_in_progress: Arc::new(AtomicBool::new(false)),
+                rescan_blocks_processed: Arc::new(AtomicU32::new(0)),
+                rescan_blocks_total: Arc::new(AtomicU32::new(0)),
             }));
 
         axum::serve(listener, router)
