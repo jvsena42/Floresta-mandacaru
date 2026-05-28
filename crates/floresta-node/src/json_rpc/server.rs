@@ -668,6 +668,12 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     /// (no peer has it) can't loop forever.
     const MAX_BLOCK_FETCH_ATTEMPTS: u8 = 5;
 
+    /// Per-attempt cap on a single block download. `get_block` can otherwise hang
+    /// forever: a peer that accepts the request but never replies leaves the
+    /// node-side responder uncompleted (user requests are not timed out), so the
+    /// await never resolves. Bounding it turns a silent stall into the retry path.
+    const BLOCK_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
     #[allow(clippy::too_many_arguments)]
     async fn rescan_with_block_filters(
         addresses: Vec<ScriptBuf>,
@@ -707,20 +713,24 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         blocks_processed.store(0, Ordering::SeqCst);
 
         // A matched block whose download fails must be retried, not dropped.
-        // `get_block` returns `Ok(None)` when a peer replies NOTFOUND and `Err`
-        // when the responder is dropped (inflight cap reached or peer
-        // disconnected) — both are transient on a phone with few, flaky peers.
-        // The old code's `if let Ok(Some(block))` swallowed both, silently
-        // losing the wallet transactions those blocks carried, which is why a
-        // single rescan was never enough and users had to retry repeatedly.
+        // `get_block` yields `Ok(None)` on a peer NOTFOUND, `Err` when the
+        // responder is dropped (inflight cap / peer disconnect), or our `timeout`
+        // elapses when a peer accepts the request but never replies — all
+        // transient on a phone with few, flaky peers. The old code's
+        // `if let Ok(Some(block))` swallowed the first two and could hang forever
+        // on the third, silently losing the wallet transactions those blocks
+        // carried, which is why a single rescan was never enough.
         let mut queue: VecDeque<BlockHash> = blocks.into_iter().collect();
         let mut attempts: HashMap<BlockHash, u8> = HashMap::new();
         let mut processed: u32 = 0;
         let mut failed: u32 = 0;
 
         while let Some(hash) = queue.pop_front() {
-            match node.get_block(hash).await {
-                Ok(Some(block)) => {
+            // `timeout` guards against a peer that never replies (see
+            // BLOCK_FETCH_TIMEOUT): on elapse we drop the request and fall into
+            // the retry path below, which re-requests (likely from another peer).
+            match tokio::time::timeout(Self::BLOCK_FETCH_TIMEOUT, node.get_block(hash)).await {
+                Ok(Ok(Some(block))) => {
                     match chain.get_block_height(&block.block_hash()) {
                         Ok(Some(height)) => {
                             wallet.block_process(&block, height);
