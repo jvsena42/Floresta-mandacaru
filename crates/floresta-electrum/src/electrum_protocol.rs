@@ -490,12 +490,58 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             }
             "blockchain.transaction.get" => {
                 let tx_id = get_arg!(request, Txid, 0);
-                let tx = self.address_cache.get_cached_transaction(&tx_id);
-                if let Some(tx) = tx {
-                    return json_rpc_res!(request, tx);
+                // Optional second arg: when `true`, return a decoded object
+                // (bitcoind/Electrum style) instead of raw hex. Defaults false.
+                let verbose = request
+                    .params
+                    .get(1)
+                    .and_then(|v| serde_json::from_value::<bool>(v.clone()).ok())
+                    .unwrap_or(false);
+
+                if !verbose {
+                    let tx = self.address_cache.get_cached_transaction(&tx_id);
+                    if let Some(tx) = tx {
+                        return json_rpc_res!(request, tx);
+                    }
+                    return Err(super::error::Error::InvalidParams);
                 }
 
-                Err(super::error::Error::InvalidParams)
+                let cached = self
+                    .address_cache
+                    .get_transaction(&tx_id)
+                    .ok_or(super::error::Error::InvalidParams)?;
+                let network = self.chain.get_params().network;
+                let tip = self
+                    .chain
+                    .get_height()
+                    .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
+                // height 0 means unconfirmed / unknown in the cache: report 0
+                // confirmations and omit the block fields.
+                let (confirmations, blockhash, blocktime) = if cached.height == 0 {
+                    (0, None, None)
+                } else {
+                    let confs = tip.saturating_sub(cached.height) + 1;
+                    let hash = self
+                        .chain
+                        .get_block_hash(cached.height)
+                        .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
+                    let time = self
+                        .chain
+                        .get_block_header(&hash)
+                        .map(|h| h.time)
+                        .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
+                    (confs, Some(hash.to_string()), Some(time))
+                };
+                let verbose_tx = crate::verbose_tx::make_verbose_transaction(
+                    &cached.tx,
+                    network,
+                    confirmations,
+                    blockhash,
+                    blocktime,
+                );
+                let value = serde_json::to_value(&verbose_tx)
+                    .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
+                json_rpc_res!(request, value)
             }
             "blockchain.transaction.get_merkle" => {
                 let tx_id = get_arg!(request, Txid, 0);
