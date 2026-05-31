@@ -28,10 +28,6 @@ use core::cell::UnsafeCell;
 use core::cmp::min;
 use core::ops::Add;
 
-use bitcoin::block::Header as BlockHeader;
-use bitcoin::blockdata::constants::genesis_block;
-use bitcoin::hashes::sha256;
-use bitcoin::hashes::Hash;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Network;
@@ -40,6 +36,10 @@ use bitcoin::Target;
 use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::Work;
+use bitcoin::block::Header as BlockHeader;
+use bitcoin::blockdata::constants::genesis_block;
+use bitcoin::hashes::Hash;
+use bitcoin::hashes::sha256;
 use floresta_common::Channel;
 #[cfg(feature = "metrics")]
 use metrics;
@@ -51,6 +51,8 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use super::BlockchainInterface;
+use super::UpdatableChainstate;
 use super::chain_state_builder::BlockchainBuilderError;
 use super::chain_state_builder::ChainStateBuilder;
 use super::chainparams::ChainParams;
@@ -60,15 +62,13 @@ use super::error::BlockValidationErrors;
 use super::error::BlockchainError;
 use super::partial_chain::PartialChainState;
 use super::partial_chain::PartialChainStateInner;
-use super::BlockchainInterface;
-use super::UpdatableChainstate;
+use crate::BestChain;
+use crate::ChainStore;
 use crate::extensions::WorkExt;
 use crate::prelude::*;
 use crate::pruned_utreexo::utxo_data::UtxoData;
 use crate::read_lock;
 use crate::write_lock;
-use crate::BestChain;
-use crate::ChainStore;
 
 /// Trait for components that need to receive notifications about new blocks.
 pub trait BlockConsumer: Sync + Send + 'static {
@@ -173,7 +173,9 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             let best_height = self.get_best_block()?.0;
 
             if *height > best_height {
-                warn!("Found block with height {height}, while the current best chain is at {best_height}. Reindexing.");
+                warn!(
+                    "Found block with height {height}, while the current best chain is at {best_height}. Reindexing."
+                );
                 self.reindex_chain()?;
             }
         }
@@ -228,7 +230,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
         let actual_target = block_header.target();
         if actual_target > expected_target {
-            return Err(BlockValidationErrors::NotEnoughPow)?;
+            Err(BlockValidationErrors::NotEnoughPow)?;
         }
 
         self.check_bip94_block(block_header, height)?;
@@ -472,20 +474,20 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
             match _header {
                 DiskBlockHeader::FullyValid(_, _) | DiskBlockHeader::AssumedValid(_, _) => {
-                    return Ok(_header.block_hash())
+                    return Ok(_header.block_hash());
                 }
                 DiskBlockHeader::Orphan(_) => {
                     return Err(BlockchainError::InvalidTip(format(format_args!(
                         "Block {} doesn't have a known ancestor (i.e an orphan block)",
                         _header.block_hash()
-                    ))))
+                    ))));
                 }
                 DiskBlockHeader::HeadersOnly(_, _) | DiskBlockHeader::InFork(_, _) => {}
                 DiskBlockHeader::InvalidChain(_) => {
                     return Err(BlockchainError::InvalidTip(format(format_args!(
                         "Block {} is in an invalid chain",
                         _header.block_hash()
-                    ))))
+                    ))));
                 }
             }
 
@@ -573,7 +575,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         }
     }
 
-    pub fn new(
+    fn new(
         mut chainstore: PersistedState,
         network: Network,
         assume_valid: AssumeValidArg,
@@ -740,7 +742,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         }
     }
 
-    pub fn load_chain_state(
+    fn load_chain_state(
         mut chainstore: PersistedState,
         network: Network,
         assume_valid: AssumeValidArg,
@@ -784,6 +786,26 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         // Check the integrity of our chain
         chainstate.check_chain_integrity()?;
         Ok(chainstate)
+    }
+
+    /// Opens an existing chain state or creates one from genesis if the store is uninitialized.
+    ///
+    /// This is the main entry point for instantiating a [`ChainState`]. If the store already
+    /// has data, the state is loaded from it. Otherwise, the chain is initialized from the
+    /// genesis block for the given network.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be read or if the persisted state is corrupted.
+    pub fn open(
+        chainstore: PersistedState,
+        network: Network,
+        assume_valid: AssumeValidArg,
+    ) -> Result<Self, BlockchainError> {
+        if chainstore.load_height()?.is_some() {
+            return Self::load_chain_state(chainstore, network, assume_valid);
+        }
+        Ok(Self::new(chainstore, network, assume_valid))
     }
 
     /// Checks whether our database got a file-level corruption, and if so, reindex.
@@ -832,7 +854,9 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         let last_valid_header = self.get_disk_block_header(&last_valid_block)?;
 
         if !matches!(last_valid_header, DiskBlockHeader::FullyValid(_, _)) {
-            warn!("The validation index header is not `FullyValid`: {last_valid_header:?}, fetched with validation index {validation_index}. Reindexing.");
+            warn!(
+                "The validation index header is not `FullyValid`: {last_valid_header:?}, fetched with validation index {validation_index}. Reindexing."
+            );
             self.reindex_chain()?;
             return Ok(());
         }
@@ -865,7 +889,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         };
 
         let mut acc = acc.as_slice();
-        Stump::deserialize(&mut acc).map_err(BlockchainError::UtreexoError)
+        Stump::deserialize(&mut acc).map_err(BlockchainError::AccumulatorError)
     }
 
     fn update_view(
@@ -1063,7 +1087,7 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
             .collect();
 
         if !acc.verify(&proof, &del_hashes)? {
-            return Err(BlockValidationErrors::InvalidProof)?;
+            Err(BlockValidationErrors::InvalidUtreexoProof)?;
         }
 
         let height = self
@@ -1296,7 +1320,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
                 // invalid proof. They don't mean the block is invalid, just that we are using the
                 // wrong accumulator, since we are not processing the right block.
                 if height != validation_index {
-                    return Err(BlockValidationErrors::BlockDoesntExtendTip)?;
+                    Err(BlockValidationErrors::BlockDoesntExtendTip)?;
                 }
 
                 // If this block is our validation index, but it's fully valid, this clearly means
@@ -1324,7 +1348,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
                 // connect a block where our accumulator isn't the right one. So the proof will
                 // always be invalid.
                 if height != validation_index + 1 {
-                    return Err(BlockValidationErrors::BlockDoesntExtendTip)?;
+                    Err(BlockValidationErrors::BlockDoesntExtendTip)?;
                 }
 
                 height
@@ -1501,16 +1525,16 @@ mod test {
     use std::io::Cursor;
     use std::vec::Vec;
 
-    use bitcoin::block::Header as BlockHeader;
-    use bitcoin::consensus::deserialize;
-    use bitcoin::consensus::encode::deserialize_hex;
-    use bitcoin::consensus::Decodable;
-    use bitcoin::constants::genesis_block;
     use bitcoin::Block;
     use bitcoin::BlockHash;
     use bitcoin::Network;
     use bitcoin::OutPoint;
     use bitcoin::Work;
+    use bitcoin::block::Header as BlockHeader;
+    use bitcoin::consensus::Decodable;
+    use bitcoin::consensus::deserialize;
+    use bitcoin::consensus::encode::deserialize_hex;
+    use bitcoin::constants::genesis_block;
     use floresta_common::assert_ok;
     use floresta_common::bhash;
     use rand::Rng;
@@ -1522,15 +1546,15 @@ mod test {
     use super::ChainState;
     use super::DiskBlockHeader;
     use super::UpdatableChainstate;
-    use crate::extensions::WorkExt;
-    use crate::prelude::HashMap;
-    use crate::pruned_utreexo::consensus::Consensus;
-    use crate::pruned_utreexo::utxo_data::UtxoData;
     use crate::AssumeValidArg;
     use crate::BlockchainError;
     use crate::ChainStore;
     use crate::FlatChainStore;
     use crate::FlatChainStoreConfig;
+    use crate::extensions::WorkExt;
+    use crate::prelude::HashMap;
+    use crate::pruned_utreexo::consensus::Consensus;
+    use crate::pruned_utreexo::utxo_data::UtxoData;
 
     fn setup_test_chain(
         network: Network,
@@ -1543,11 +1567,11 @@ mod test {
             fork_file_size: Some(10_000), // Will be rounded up to 16,384
             cache_size: Some(10),
             file_permission: Some(0o660),
-            path: format!("./tmp-db/{test_id}/"),
+            path: format!("./tmp-db/{test_id}/").into(),
         };
 
         let chainstore = FlatChainStore::new(config).unwrap();
-        ChainState::new(chainstore, network, assume_valid_arg)
+        ChainState::open(chainstore, network, assume_valid_arg).unwrap()
     }
 
     fn decode_block_and_inputs(
@@ -1794,6 +1818,63 @@ mod test {
     }
 
     #[test]
+    fn open_resumes_existing_chain_state() {
+        let file = include_bytes!("../../testdata/signet_headers.zst");
+        let uncompressed: Vec<u8> = zstd::decode_all(Cursor::new(file)).unwrap();
+        let mut buffer = uncompressed.as_slice();
+
+        let test_id = rand::random::<u64>();
+        let path = format!("./tmp-db/{test_id}/");
+
+        let config = crate::FlatChainStoreConfig {
+            block_index_size: Some(32_768),
+            headers_file_size: Some(32_768),
+            fork_file_size: Some(10_000),
+            cache_size: Some(10),
+            file_permission: Some(0o660),
+            path: path.clone().into(),
+        };
+        let chain = ChainState::open(
+            crate::FlatChainStore::new(config).unwrap(),
+            Network::Signet,
+            AssumeValidArg::Hardcoded,
+        )
+        .unwrap();
+
+        // Accept 10 headers; accept_header updates inner.best_block
+        let mut count = 0;
+        while let Ok(header) = BlockHeader::consensus_decode(&mut buffer) {
+            chain.accept_header(header).unwrap();
+            count += 1;
+            if count == 10 {
+                break;
+            }
+        }
+
+        let height = chain.get_height().unwrap();
+        assert!(height > 0, "chain did not advance past genesis");
+        chain.flush().unwrap();
+        drop(chain);
+
+        // Reopen: must resume at the same height, not reset to genesis
+        let config2 = crate::FlatChainStoreConfig {
+            block_index_size: Some(32_768),
+            headers_file_size: Some(32_768),
+            fork_file_size: Some(10_000),
+            cache_size: Some(10),
+            file_permission: Some(0o660),
+            path: path.into(),
+        };
+        let chain2 = ChainState::open(
+            crate::FlatChainStore::new(config2).unwrap(),
+            Network::Signet,
+            AssumeValidArg::Hardcoded,
+        )
+        .unwrap();
+        assert_eq!(chain2.get_height().unwrap(), height);
+    }
+
+    #[test]
     fn test_chainstate_functions() {
         let file = include_bytes!("../../testdata/signet_headers.zst");
         let uncompressed: Vec<u8> = zstd::decode_all(Cursor::new(file)).unwrap();
@@ -1817,16 +1898,18 @@ mod test {
         assert_eq!(chain.find_best_chain().depth, 2015);
 
         // get_block_locator_for_tip
-        assert!(!chain
-            .get_block_locator_for_tip(read_lock!(chain).best_block.best_block)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !chain
+                .get_block_locator_for_tip(read_lock!(chain).best_block.best_block)
+                .unwrap()
+                .is_empty()
+        );
 
         // get_block_locator
         assert!(!chain.get_block_locator().unwrap().is_empty());
 
         // invalidate_block
-        let random_height = rand::thread_rng().gen_range(1..=2014);
+        let random_height = rand::rng().random_range(1..=2014);
 
         chain
             .invalidate_block(headers[random_height].prev_blockhash)
@@ -1845,7 +1928,7 @@ mod test {
     #[test]
     fn test_calculate_chain_work() {
         let mut chainstore = FlatChainStore::new(FlatChainStoreConfig::new(
-            "../../testdata/signet_headers.zst".to_string(),
+            "../../testdata/signet_headers.zst",
         ))
         .unwrap();
 

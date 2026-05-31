@@ -26,21 +26,21 @@ pub mod udata;
 use alloc::sync::Arc;
 use core::error::Error;
 
-use bitcoin::block::Header as BlockHeader;
-use bitcoin::hashes::sha256;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::OutPoint;
 use bitcoin::Work;
+use bitcoin::block::Header as BlockHeader;
+use bitcoin::hashes::sha256;
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
 use rustreexo::stump::Stump;
 
 use self::partial_chain::PartialChainState;
-use crate::prelude::*;
-use crate::pruned_utreexo::utxo_data::UtxoData;
 use crate::BlockConsumer;
 use crate::BlockchainError;
+use crate::prelude::*;
+use crate::pruned_utreexo::utxo_data::UtxoData;
 
 /// This trait is the main interface between our blockchain backend and other services.
 /// It'll be useful for transitioning from rpc to a p2p based node

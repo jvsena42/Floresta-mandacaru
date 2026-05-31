@@ -6,65 +6,119 @@ floresta_cli_getblockheader.py
 This functional test cli utility to interact with a Floresta node with `getblockheader`
 """
 
-from test_framework import FlorestaTestFramework
-from test_framework.node import NodeType
+import time
+import random
+from typing import Any
+import pytest
+from requests.exceptions import HTTPError
+
+TIMEOUT_SECONDS = 20
 
 
-class GetBlockheaderHeightZeroTest(FlorestaTestFramework):
-    """
-    Test `getblockheader` with a fresh node and expect a result like this:
+class TestGetBlockheader:
+    """Functional tests for the getblockheader RPC, comparing Florestad vs Bitcoin Core."""
 
-    ````bash
-    $> ./target/release floresta_cli --network=regtest getblockheader \
-        0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
-    {
-       "version": 1,
-       "prev_blockhash": "0000000000000000000000000000000000000000000000000000000000000000",
-       "merkle_root": "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
-       "time": 1296688602,
-       "bits": 545259519,
-       "nonce": 2
-    }
-    ```
-    """
+    # define attributes at class level to avoid "defined outside __init__" warnings
+    florestad: Any = None
+    bitcoind: Any = None
+    log: Any = None
+    node_manager: Any = None
 
-    nodes = [-1]
-    version = 1
-    blockhash = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
-    prev_blockhash = "0000000000000000000000000000000000000000000000000000000000000000"
-    merkle_root = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
-    time = 1296688602
-    bits = 545259519
-    nonce = 2
-
-    def set_test_params(self):
+    @pytest.mark.rpc
+    def test_get_blockheader(
+        self, setup_logging, node_manager, florestad_node, bitcoind_node
+    ):
         """
-        Setup a single node
+        Test the getblockheader RPC command. Verifies that Florestad's getblockheader RPC responses
+        are compliant with Bitcoin Core's getblockheader behavior and values.
         """
-        self.florestad = self.add_node_default_args(variant=NodeType.FLORESTAD)
+        self.log = setup_logging
+        self.node_manager = node_manager
+        self.florestad = florestad_node
+        self.bitcoind = bitcoind_node
 
-    def run_test(self):
-        """
-        Run JSONRPC and get the header of the genesis block
-        """
-        # Start node
-        self.run_node(self.florestad)
+        self.log.info("Testing getblockheader with non-existent hash")
 
-        # Test assertions
-        response = self.florestad.rpc.get_blockheader(
-            GetBlockheaderHeightZeroTest.blockhash
+        invalid_hash = (
+            "000000000000000000015abb3038f926d74fcdc171bf6c8aadc20a9a75310ffa"
         )
-        self.assertEqual(response["version"], GetBlockheaderHeightZeroTest.version)
-        self.assertEqual(
-            response["prev_blockhash"], GetBlockheaderHeightZeroTest.prev_blockhash
-        )
-        self.assertEqual(
-            response["merkle_root"], GetBlockheaderHeightZeroTest.merkle_root
-        )
-        self.assertEqual(response["time"], GetBlockheaderHeightZeroTest.time)
-        self.assertEqual(response["bits"], GetBlockheaderHeightZeroTest.bits)
-        self.assertEqual(response["nonce"], GetBlockheaderHeightZeroTest.nonce)
+        with pytest.raises(HTTPError):
+            self.florestad.rpc.get_blockheader(invalid_hash)
 
+        with pytest.raises(HTTPError):
+            self.florestad.rpc.get_blockheader(invalid_hash, False)
 
-if __name__ == "__main__":
-    GetBlockheaderHeightZeroTest().main()
+        with pytest.raises(HTTPError):
+            self.florestad.rpc.get_blockheader(invalid_hash, True)
+
+        self.bitcoind.rpc.generate_block(2017)
+        # Sleep is required to ensure blocks have different timestamps. In regtest, blocks are mined
+        # almost instantaneously, so without this sleep, block timestamps would be nearly identical.
+        # We need different timestamps to cause the median time of recent blocks to be different
+        # from earlier blocks, which is necessary for proper testing.
+        time.sleep(1)
+        self.bitcoind.rpc.generate_block(5)
+
+        self.node_manager.connect_nodes(self.florestad, self.bitcoind)
+
+        block_count = self.bitcoind.rpc.get_block_count()
+        start = time.time()
+        while time.time() - start < TIMEOUT_SECONDS:
+            florestad_count = self.florestad.rpc.get_block_count()
+            if florestad_count == block_count:
+                break
+            time.sleep(0.5)
+
+        assert florestad_count == block_count
+
+        self.log.info("Testing getblockheader RPC in the genesis block")
+        self.validate_block_header(0)
+
+        random_block = random.randint(1, block_count)
+        self.log.info(f"Testing getblockheader RPC in block {random_block}")
+        self.validate_block_header(random_block)
+
+        self.log.info(f"Testing getblockheader RPC in block {block_count}")
+        self.validate_block_header(block_count)
+
+    def validate_block_header(self, height: int):
+        """
+        Compare a block header at given height between Florestad and Bitcoin Core for several
+        verbosity levels.
+        """
+        block_hash = self.bitcoind.rpc.get_blockhash(height)
+        self.log.info(
+            f"Comparing block header {block_hash} between florestad and bitcoind"
+        )
+
+        self.log.info("Fetching request without verbosity")
+        florestad_header = self.florestad.rpc.get_blockheader(block_hash)
+        bitcoind_header = self.bitcoind.rpc.get_blockheader(block_hash)
+        self.validate_headers_match(florestad_header, bitcoind_header)
+
+        verbosity = False
+        self.log.info(f"Fetching request with verbosity {verbosity}")
+        florestad_header = self.florestad.rpc.get_blockheader(block_hash, verbosity)
+        bitcoind_header = self.bitcoind.rpc.get_blockheader(block_hash, verbosity)
+        assert florestad_header == bitcoind_header
+
+        verbosity = True
+        self.log.info(f"Fetching request with verbosity {verbosity}")
+        florestad_header = self.florestad.rpc.get_blockheader(block_hash, verbosity)
+        bitcoind_header = self.bitcoind.rpc.get_blockheader(block_hash, verbosity)
+
+        self.validate_headers_match(florestad_header, bitcoind_header)
+
+    def validate_headers_match(self, florestad_header: dict, bitcoind_header: dict):
+        """
+        Compare two block headers and assert that they match.
+        """
+        for key, bval in bitcoind_header.items():
+            fval = florestad_header[key]
+
+            self.log.info(f"Comparing {key} field: florestad={fval} bitcoind={bval}")
+            if key == "difficulty":
+                # Allow small differences in floating point representation
+                assert round(fval, 3) == round(bval, 3)
+            else:
+                assert fval == bval

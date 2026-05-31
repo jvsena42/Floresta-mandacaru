@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use core::error::Error;
+use core::fmt;
+use core::fmt::Display;
+use core::fmt::Formatter;
 
-use bitcoin::block::Header;
-use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Work;
+use bitcoin::block::Header;
+use bitcoin::consensus::encode::serialize_hex;
+use floresta_common::bhash;
 use floresta_common::prelude::Box;
 use floresta_common::prelude::String;
 use floresta_common::prelude::Vec;
@@ -13,6 +18,26 @@ use floresta_common::prelude::Vec;
 use crate::BlockchainInterface;
 
 const MEDIAN_TIME_PAST_BLOCK_COUNT: usize = 11;
+
+pub trait Bip30UnspendableExt {
+    /// Returns true if the coinbase output in this block is BIP-30 unspendable.
+    fn is_bip30_unspendable(&self, height: u32) -> bool;
+}
+
+impl Bip30UnspendableExt for Block {
+    fn is_bip30_unspendable(&self, height: u32) -> bool {
+        let bhash_91722 =
+            bhash!("00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e");
+        let bhash_91812 =
+            bhash!("00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f");
+
+        match height {
+            91722 => self.block_hash() == bhash_91722,
+            91812 => self.block_hash() == bhash_91812,
+            _ => false,
+        }
+    }
+}
 
 /// Provides additional methods for working with [`Header`] objects,
 pub trait HeaderExt {
@@ -81,6 +106,16 @@ pub enum HeaderExtError {
 
     /// You got an overflow while calculating the chain work.
     ChainWorkOverflow,
+}
+
+impl Display for HeaderExtError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            HeaderExtError::Chain(e) => write!(f, "Chain error: {e}"),
+            HeaderExtError::BlockNotFound => write!(f, "Block not found"),
+            HeaderExtError::ChainWorkOverflow => write!(f, "Chain work overflow"),
+        }
+    }
 }
 
 impl HeaderExt for Header {
@@ -255,15 +290,15 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use bitcoin::block::Header;
-    use bitcoin::consensus::encode::deserialize_hex;
-    use bitcoin::hashes::sha256::Hash as Sha256Hash;
-    use bitcoin::params::Params;
     use bitcoin::Block;
     use bitcoin::BlockHash;
     use bitcoin::OutPoint;
     use bitcoin::Transaction;
     use bitcoin::Txid;
+    use bitcoin::block::Header;
+    use bitcoin::consensus::encode::deserialize_hex;
+    use bitcoin::hashes::sha256::Hash as Sha256Hash;
+    use bitcoin::params::Params;
     use rustreexo::proof::Proof;
     use rustreexo::stump::Stump;
 
@@ -320,7 +355,7 @@ mod tests {
         fn get_block_hash(&self, height: u32) -> Result<BlockHash, Self::Error> {
             self.heights
                 .iter()
-                .find(|(_, &h)| h == height)
+                .find(|(_, h)| **h == height)
                 .map(|(hash, _)| *hash)
                 .ok_or(MockBlockchainError::NotFound)
         }

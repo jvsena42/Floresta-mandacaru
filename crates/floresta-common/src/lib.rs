@@ -12,16 +12,19 @@
 )]
 #![no_std]
 
-use bitcoin::consensus::encode;
-use bitcoin::consensus::Decodable;
-use bitcoin::hashes::sha256;
-use bitcoin::hashes::Hash;
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::string::ToString;
+use alloc::vec::Vec;
+
 use bitcoin::ScriptBuf;
 use bitcoin::VarInt;
-#[cfg(any(feature = "descriptors-std", feature = "descriptors-no-std"))]
-use miniscript::Descriptor;
-#[cfg(any(feature = "descriptors-std", feature = "descriptors-no-std"))]
-use miniscript::DescriptorPublicKey;
+use bitcoin::consensus::Decodable;
+use bitcoin::consensus::encode;
+use bitcoin::hashes::Hash;
+use bitcoin::hashes::sha256;
+use bitcoin::p2p::ServiceFlags;
 use sha2::Digest;
 
 #[cfg(feature = "std")]
@@ -31,8 +34,6 @@ pub mod spsc;
 
 #[cfg(feature = "std")]
 pub use ema::Ema;
-#[cfg(any(feature = "descriptors-std", feature = "descriptors-no-std"))]
-use prelude::*;
 pub use spsc::Channel;
 
 /// Computes the SHA-256 digest of the byte slice data and returns a [Hash] from `bitcoin_hashes`.
@@ -88,26 +89,37 @@ pub mod service_flags {
     pub const UTREEXO_ARCHIVE: u64 = 1 << 13;
 }
 
-#[cfg(any(feature = "descriptors-std", feature = "descriptors-no-std"))]
-/// Takes an array of descriptors as `String`, performs sanity checks on each one
-/// and returns list of parsed descriptors.
-pub fn parse_descriptors(
-    descriptors: &[String],
-) -> Result<Vec<Descriptor<DescriptorPublicKey>>, miniscript::Error> {
-    use core::str::FromStr;
+/// The P2P protocol version Floresta speaks.
+pub const PROTOCOL_VERSION: u32 = 70016;
 
-    let descriptors = descriptors
+/// The services advertised by this node.
+///
+///   - `WITNESS`: SegWit blocks and transactions (BIP-0144).
+///   - `P2P_V2`: Encrypted transport (BIP-0324).
+///   - `UTREEXO`: Utreexo inclusion proofs (BIP-0183).
+pub fn advertised_services() -> ServiceFlags {
+    ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | ServiceFlags::from(service_flags::UTREEXO)
+}
+
+/// Returns string names for all known service flags that are set in `flags`.
+pub fn service_flags_strings(flags: &ServiceFlags) -> Vec<String> {
+    let known_flags = [
+        (ServiceFlags::NETWORK, "NETWORK"),
+        (ServiceFlags::GETUTXO, "GETUTXO"),
+        (ServiceFlags::BLOOM, "BLOOM"),
+        (ServiceFlags::WITNESS, "WITNESS"),
+        (ServiceFlags::COMPACT_FILTERS, "COMPACT_FILTERS"),
+        (ServiceFlags::NETWORK_LIMITED, "NETWORK_LIMITED"),
+        (ServiceFlags::P2P_V2, "P2P_V2"),
+        (service_flags::UTREEXO.into(), "UTREEXO"),
+        (service_flags::UTREEXO_ARCHIVE.into(), "UTREEXO_ARCHIVE"),
+    ];
+
+    known_flags
         .iter()
-        .map(|descriptor| {
-            let descriptor = Descriptor::<DescriptorPublicKey>::from_str(descriptor.as_str())?;
-            descriptor.sanity_check()?;
-            descriptor.into_single_descriptors()
-        })
-        .collect::<Result<Vec<Vec<_>>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    Ok(descriptors)
+        .filter(|(flag, _)| flags.has(*flag))
+        .map(|(_, name)| name.to_string())
+        .collect()
 }
 
 #[cfg(not(feature = "std"))]
@@ -152,9 +164,9 @@ pub mod prelude {
     pub use alloc::string::ToString;
     pub use std::borrow::ToOwned;
     pub use std::boxed::Box;
-    pub use std::collections::hash_map::Entry;
     pub use std::collections::HashMap;
     pub use std::collections::HashSet;
+    pub use std::collections::hash_map::Entry;
     pub use std::io::Error as ioError;
     pub use std::io::Read;
     pub use std::io::Write;
@@ -169,9 +181,9 @@ pub mod prelude {
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::ScriptBuf;
     use bitcoin::hashes::Hash;
     use bitcoin::hex::DisplayHex;
-    use bitcoin::ScriptBuf;
 
     use super::prelude::*;
 

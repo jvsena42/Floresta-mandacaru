@@ -6,31 +6,31 @@ use core::fmt::Display;
 use core::fmt::Formatter;
 use std::io;
 
+use bip324::Role;
 use bip324::futures::Protocol;
 use bip324::futures::ProtocolReader;
 use bip324::futures::ProtocolWriter;
 use bip324::io::Payload;
 use bip324::io::ProtocolError;
 use bip324::io::ProtocolFailureSuggestion;
+use bip324::serde::CommandString;
 use bip324::serde::deserialize as deserialize_v2;
 use bip324::serde::serialize as serialize_v2;
-use bip324::serde::CommandString;
-use bip324::Role;
+use bitcoin::Network;
+use bitcoin::consensus::Decodable;
+use bitcoin::consensus::Encodable;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::deserialize_partial;
 use bitcoin::consensus::encode;
 use bitcoin::consensus::serialize;
-use bitcoin::consensus::Decodable;
-use bitcoin::consensus::Encodable;
-use bitcoin::hashes::sha256d;
 use bitcoin::hashes::Hash;
+use bitcoin::hashes::sha256d;
 use bitcoin::hex::DisplayHex;
+use bitcoin::p2p::Magic;
 use bitcoin::p2p::address::AddrV2;
+use bitcoin::p2p::message::MAX_MSG_SIZE;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message::RawNetworkMessage;
-use bitcoin::p2p::message::MAX_MSG_SIZE;
-use bitcoin::p2p::Magic;
-use bitcoin::Network;
 use floresta_common::impl_error_from;
 use serde::Deserialize;
 use serde::Serialize;
@@ -135,10 +135,22 @@ impl Display for TransportError {
             TransportError::SerdeV2(err) => write!(f, "V2 serde error: {err:?}"),
             TransportError::SerdeV1(err) => write!(f, "V1 serde error: {err:?}"),
             TransportError::Proxy(err) => write!(f, "Proxy error: {err:?}"),
-            TransportError::OversizedMessage { max_size, message_size } => write!(f, "Peer sent us an oversized message: size {message_size} is greater than the max of {max_size}"),
-            TransportError::BadChecksum { expected, provided } => write!(f, "Peer sent us a corrupted message: expected {expected}, got {provided}"),
+            TransportError::OversizedMessage {
+                max_size,
+                message_size,
+            } => write!(
+                f,
+                "Peer sent us an oversized message: size {message_size} is greater than the max of {max_size}"
+            ),
+            TransportError::BadChecksum { expected, provided } => write!(
+                f,
+                "Peer sent us a corrupted message: expected {expected}, got {provided}"
+            ),
             TransportError::BadMagicBits { expected, provided } => {
-                write!(f, "Peer sent us a message with invalid magic bits: expected {expected}, got {provided}")
+                write!(
+                    f,
+                    "Peer sent us a message with invalid magic bits: expected {expected}, got {provided}"
+                )
             }
         }
     }
@@ -355,7 +367,9 @@ async fn try_proxy_connection<A: ToSocketAddrs + Clone + Debug>(
     let reader = BufReader::new(reader);
     match force_v1 {
         true => {
-            debug!("Established a P2PV1 connection over SOCKS5 using proxy={proxy_addr:?} with peer={target_addr:?}");
+            debug!(
+                "Established a P2PV1 connection over SOCKS5 using proxy={proxy_addr:?} with peer={target_addr:?}"
+            );
             Ok((
                 ReadTransport::V1(reader, network),
                 WriteTransport::V1(writer, network),
@@ -364,7 +378,9 @@ async fn try_proxy_connection<A: ToSocketAddrs + Clone + Debug>(
         }
         false => match Protocol::new(network, Role::Initiator, None, None, reader, writer).await {
             Ok(protocol) => {
-                debug!("Established a P2PV2 connection over SOCKS5 using proxy={proxy_addr:?} with peer={target_addr:?}");
+                debug!(
+                    "Established a P2PV2 connection over SOCKS5 using proxy={proxy_addr:?} with peer={target_addr:?}"
+                );
                 let (reader_protocol, writer_protocol) = protocol.into_split();
                 Ok((
                     ReadTransport::V2(reader_protocol),
@@ -373,7 +389,9 @@ async fn try_proxy_connection<A: ToSocketAddrs + Clone + Debug>(
                 ))
             }
             Err(e) => {
-                error!("Failed to establish a P2PV2 connection over SOCKS5 using proxy={proxy_addr:?} with peer={target_addr:?}: {e:?}");
+                error!(
+                    "Failed to establish a P2PV2 connection over SOCKS5 using proxy={proxy_addr:?} with peer={target_addr:?}: {e:?}"
+                );
                 Err(TransportError::Protocol(e))
             }
         },

@@ -13,9 +13,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 use std::time::Instant;
 
-use bitcoin::block::Header;
-use bitcoin::block::Version;
-use bitcoin::hashes::Hash;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::CompactTarget;
@@ -23,8 +20,11 @@ use bitcoin::OutPoint;
 use bitcoin::Transaction;
 use bitcoin::TxMerkleNode;
 use bitcoin::Txid;
-use floresta_chain::pruned_utreexo::consensus::Consensus;
+use bitcoin::block::Header;
+use bitcoin::block::Version;
+use bitcoin::hashes::Hash;
 use floresta_chain::BlockchainError;
+use floresta_chain::pruned_utreexo::consensus::Consensus;
 use tracing::debug;
 
 /// A short transaction id that we use to identify transactions in the mempool.
@@ -71,41 +71,49 @@ pub struct Mempool {
 }
 
 #[derive(Debug)]
-/// An error returned when we try to add a transaction to the mempool.
-pub enum AcceptToMempoolError {
-    /// Memory usage is too high.
-    MemoryUsageTooHigh,
+/// Errors that can occur whilst trying to add a transaction to the [`Mempool`].
+pub enum MempoolError {
+    /// The [`Mempool`] is full and cannot accept more [`Transaction`]s.
+    FullMempool,
 
-    /// The transaction is conflicting with another transaction in the mempool.
+    /// The [`Transaction`] conflicts with another [`Transaction`] in the [`Mempool`].
     ConflictingTransaction,
 
-    /// This transaction has duplicated inputs
+    /// The [`Transaction`] has duplicate inputs.
     DuplicatedInputs,
 
-    /// A validation error happened while consensus checking a transaction
     // TODO(davidson): we might want to make an error type specific for consensus,
     // instead of reusing BlockchainError.
-    Consensus(BlockchainError),
+    /// The [`Transaction`] failed consensus validation.
+    ConsensusValidation(BlockchainError),
 }
 
-impl Display for AcceptToMempoolError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+impl Display for MempoolError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            AcceptToMempoolError::MemoryUsageTooHigh => write!(f, "we are running out of memory"),
-            AcceptToMempoolError::ConflictingTransaction => {
-                write!(f, "we have another transaction that spends the same input")
+            Self::FullMempool => {
+                write!(
+                    f,
+                    "The mempool is full and cannot accept any more transactions"
+                )
             }
-            AcceptToMempoolError::DuplicatedInputs => {
-                write!(f, "this transaction has duplicated inputs")
+            Self::ConflictingTransaction => {
+                write!(
+                    f,
+                    "The transaction conflicts with another transaction in the mempool"
+                )
             }
-            AcceptToMempoolError::Consensus(e) => {
-                write!(f, "the transaction failed consensus validation: {e}")
+            Self::DuplicatedInputs => {
+                write!(f, "The transaction has duplicate inputs")
+            }
+            Self::ConsensusValidation(e) => {
+                write!(f, "The transaction failed consensus validation: {e}")
             }
         }
     }
 }
 
-impl Error for AcceptToMempoolError {}
+impl Error for MempoolError {}
 
 impl Mempool {
     /// Creates a new mempool with a given maximum size
@@ -155,7 +163,7 @@ impl Mempool {
         let mut size = 0;
 
         let mut txs = Vec::new();
-        for (_, tx) in self.transactions.iter() {
+        for tx in self.transactions.values() {
             let tx_size = tx.transaction.weight().to_wu();
             if size + tx_size > max_block_weight {
                 break;
@@ -214,10 +222,18 @@ impl Mempool {
             .iter()
             .map(|tx| {
                 let short_txid = self.hasher.hash_one(tx.compute_txid());
-                self.transactions
-                    .remove(&short_txid)
-                    .map(|tx| tx.transaction);
 
+                // Remove this transaction from the mempool, and also remove it from the depends list of all
+                // its children, since they don't depend on it anymore.
+                if let Some(removed) = self.transactions.remove(&short_txid) {
+                    self.mempool_size -= removed.transaction.total_size();
+
+                    for child in &removed.children {
+                        if let Some(child_tx) = self.transactions.get_mut(child) {
+                            child_tx.depends.retain(|depend| *depend != short_txid);
+                        }
+                    }
+                }
                 tx.compute_txid()
             })
             .collect()
@@ -245,7 +261,7 @@ impl Mempool {
     }
 
     /// Checks if the transaction doesn't have conflicting inputs or spends the same input twice.
-    fn check_for_conflicts(&self, transaction: &Transaction) -> Result<(), AcceptToMempoolError> {
+    fn check_for_conflicts(&self, transaction: &Transaction) -> Result<(), MempoolError> {
         // check for duplicate inputs
         let inputs = transaction
             .input
@@ -254,14 +270,14 @@ impl Mempool {
             .collect::<BTreeSet<_>>();
 
         if inputs.len() != transaction.input.len() {
-            return Err(AcceptToMempoolError::DuplicatedInputs);
+            return Err(MempoolError::DuplicatedInputs);
         }
 
         // Check this transaction doesn't conflict with another transaction in the mempool
         // TODO(davidson): RBF
         for input in transaction.input.iter() {
             if self.is_already_spent(&input.previous_output) {
-                return Err(AcceptToMempoolError::ConflictingTransaction);
+                return Err(MempoolError::ConflictingTransaction);
             }
         }
 
@@ -282,10 +298,7 @@ impl Mempool {
     ///    the theoretical maximum amount of Bitcoins
     ///  - If either vIn or vOut are empty
     ///  - If any script is larger than the maximum allowed size
-    pub fn accept_to_mempool(
-        &mut self,
-        transaction: Transaction,
-    ) -> Result<(), AcceptToMempoolError> {
+    pub fn accept_to_mempool(&mut self, transaction: Transaction) -> Result<(), MempoolError> {
         debug!(
             "Accepting {} to mempool {:?}",
             transaction.compute_txid(),
@@ -295,7 +308,7 @@ impl Mempool {
         // Make sure our mempool has space
         let tx_size = transaction.total_size();
         if self.mempool_size + tx_size > self.max_mempool_size {
-            return Err(AcceptToMempoolError::MemoryUsageTooHigh);
+            return Err(MempoolError::FullMempool);
         }
 
         let short_txid = self.hasher.hash_one(transaction.compute_txid());
@@ -307,7 +320,7 @@ impl Mempool {
 
         // Perform context-free consensus checks
         Consensus::check_transaction_context_free(&transaction)
-            .map_err(AcceptToMempoolError::Consensus)?;
+            .map_err(MempoolError::ConsensusValidation)?;
 
         // Make sure transaction won't conflict with other mempool transaction
         self.check_for_conflicts(&transaction)?;
@@ -370,25 +383,31 @@ impl Mempool {
 mod tests {
     use std::collections::HashSet;
 
-    use bitcoin::absolute;
-    use bitcoin::block;
-    use bitcoin::consensus::encode::deserialize_hex;
-    use bitcoin::hashes::Hash;
-    use bitcoin::transaction::Version;
+    use bitcoin::Amount;
     use bitcoin::Block;
     use bitcoin::BlockHash;
     use bitcoin::OutPoint;
+    use bitcoin::Script;
     use bitcoin::Sequence;
     use bitcoin::Target;
     use bitcoin::Transaction;
+    use bitcoin::TxIn;
+    use bitcoin::TxMerkleNode;
+    use bitcoin::TxOut;
     use bitcoin::Txid;
     use bitcoin::Witness;
+    use bitcoin::absolute;
+    use bitcoin::block::Header;
+    use bitcoin::block::{self};
+    use bitcoin::consensus::encode::deserialize_hex;
+    use bitcoin::hashes::Hash;
+    use bitcoin::transaction::Version;
     use floresta_common::bhash;
     use rand::Rng;
     use rand::SeedableRng;
 
     use super::Mempool;
-    use crate::mempool::AcceptToMempoolError;
+    use crate::mempool::MempoolError;
 
     /// builds a list of transactions in a pseudo-random way
     ///
@@ -397,7 +416,7 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let mut transactions = Vec::new();
 
-        let n = rng.gen_range(1..10);
+        let n = rng.random_range(1..10);
         let mut outputs = Vec::new();
 
         // This output is used as a dummy input for the first transactions, since
@@ -417,13 +436,13 @@ mod tests {
                 output: Vec::new(),
             };
 
-            let inputs = rng.gen_range(1..10);
+            let inputs = rng.random_range(1..10);
             for _ in 0..inputs {
                 if outputs.is_empty() {
                     break;
                 }
 
-                let index = rng.gen_range(0..outputs.len());
+                let index = rng.random_range(0..outputs.len());
                 let previous_output: OutPoint = match conflict {
                     false => outputs.remove(index),
                     true => *outputs.get(index).unwrap(),
@@ -439,12 +458,12 @@ mod tests {
                 tx.input.push(input);
             }
 
-            let n = rng.gen_range(1..10);
+            let n = rng.random_range(1..10);
 
             for _ in 0..n {
-                let script = rng.gen::<[u8; 32]>();
+                let script = rng.random::<[u8; 32]>();
                 let output = bitcoin::TxOut {
-                    value: bitcoin::Amount::from_sat(rng.gen_range(0..100_000_000)),
+                    value: bitcoin::Amount::from_sat(rng.random_range(0..100_000_000)),
                     script_pubkey: bitcoin::Script::from_bytes(&script).into(),
                 };
 
@@ -478,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mepool_accept() {
+    fn test_mempool_accept() {
         let mut mempool = Mempool::new(10_000_000);
 
         let transactions = build_transactions(42, false);
@@ -502,10 +521,9 @@ mod tests {
         for tx in transactions {
             match mempool.accept_to_mempool(tx) {
                 Ok(_) => {}
-                Err(AcceptToMempoolError::DuplicatedInputs) => {
+                Err(MempoolError::ConflictingTransaction) | Err(MempoolError::DuplicatedInputs) => {
                     did_conflict = true;
                 }
-
                 Err(e) => {
                     panic!("unexpected error: {:?}", e);
                 }
@@ -621,5 +639,113 @@ mod tests {
         assert!(block.check_merkle_root());
 
         check_block_transactions(block);
+    }
+
+    #[test]
+    fn test_consume_block_updates_mempool_size() {
+        let mut mempool = Mempool::new(10_000_000);
+
+        let transactions = build_transactions(15, false);
+        for tx in transactions {
+            mempool
+                .accept_to_mempool(tx)
+                .expect("failed to accept to mempool");
+        }
+
+        let size_before_consume = mempool.mempool_size;
+
+        let target = Target::MAX_ATTAINABLE_REGTEST;
+        let block = mempool.get_block_template(
+            block::Version::ONE,
+            BlockHash::all_zeros(),
+            0,
+            target.to_compact_lossy(),
+            4_000_000,
+        );
+
+        mempool.consume_block(&block);
+
+        assert_eq!(
+            mempool.mempool_size, 0,
+            "mempool_size was {} before consume_block and it is {} after but it should be 0",
+            size_before_consume, mempool.mempool_size
+        );
+    }
+
+    #[test]
+    // Tests that when we consume a block, transactions that depended on the transactions
+    // included in the block should no longer reference them, since they are now confirmed.
+    fn test_consume_block_removes_depends() {
+        let mut mempool = Mempool::new(10_000_000);
+
+        let parent = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::from_consensus(0),
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: Script::new().into(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: Script::from_bytes(&[]).into(),
+            }],
+        };
+        let parent_txid = parent.compute_txid();
+
+        let child = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::from_consensus(0),
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                script_sig: Script::new().into(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: Script::from_bytes(&[]).into(),
+            }],
+        };
+        let child_txid = child.compute_txid();
+
+        mempool.accept_to_mempool(parent.clone()).unwrap();
+        mempool.accept_to_mempool(child).unwrap();
+
+        // Sanity check: child currently depends on parent
+        let parent_short_txid = mempool.hasher.hash_one(parent_txid);
+        let child_short_txid = mempool.hasher.hash_one(child_txid);
+        assert!(
+            mempool.transactions[&child_short_txid]
+                .depends
+                .contains(&parent_short_txid)
+        );
+
+        let block = Block {
+            header: Header {
+                version: block::Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
+                nonce: 0,
+            },
+            txdata: vec![parent],
+        };
+        mempool.consume_block(&block);
+
+        assert!(!mempool.transactions.contains_key(&parent_short_txid));
+        assert!(
+            !mempool.transactions[&child_short_txid]
+                .depends
+                .contains(&parent_short_txid)
+        );
     }
 }

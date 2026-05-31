@@ -9,31 +9,32 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bip324::serde::CommandString;
+use bitcoin::Block;
+use bitcoin::BlockHash;
+use bitcoin::Transaction;
 use bitcoin::bip158::BlockFilter;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::encode;
 use bitcoin::consensus::serialize;
 use bitcoin::hashes::Hash;
+use bitcoin::p2p::PROTOCOL_VERSION;
+use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::AddrV2Message;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
-use bitcoin::p2p::ServiceFlags;
-use bitcoin::Block;
-use bitcoin::BlockHash;
-use bitcoin::Transaction;
 use floresta_common::impl_error_from;
 use floresta_mempool::Mempool;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::spawn;
-use tokio::sync::mpsc::error::SendError;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::SendError;
+use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::oneshot;
-use tokio::sync::Mutex;
 use tracing::debug;
 use tracing::error;
 use tracing::warn;
@@ -719,7 +720,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
         self.blocks_only = !version.relay;
         self.current_best_block = version.start_height;
         self.services = version.services;
-        if version.version >= 70016 {
+        if version.version >= PROTOCOL_VERSION {
             self.write(NetworkMessage::SendAddrV2).await?;
         }
         self.state = State::SentVerack;
@@ -741,18 +742,15 @@ pub(super) mod peer_utils {
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
+    use bitcoin::p2p::Address;
     use bitcoin::p2p::message::NetworkMessage;
     use bitcoin::p2p::message_network::VersionMessage;
-    use bitcoin::p2p::Address;
-    use bitcoin::p2p::ServiceFlags;
-    use floresta_common::service_flags;
-    use rand::thread_rng;
+    use floresta_common::PROTOCOL_VERSION;
+    use floresta_common::advertised_services;
     use rand::Rng;
+    use rand::rng;
 
     use crate::address_man::LocalAddress;
-
-    /// The protocol version this implementation speaks.
-    pub const PROTOCOL_VERSION: u32 = 70016;
 
     /// Build the [pong](NetworkMessage::Pong) message, which must be sent whenever a peer sends us a
     /// [ping](NetworkMessage::Ping). Note that the nonce received in the ping must be reused in the pong.
@@ -767,11 +765,8 @@ pub(super) mod peer_utils {
         best_block: u32,
         peer_address: &LocalAddress,
     ) -> NetworkMessage {
-        // Services supported by this node.
-        //   - WITNESS: this implementation supports SegWit blocks and transactions.
-        //   - P2P_V2: this implementation supports P2PV2 (BIP-0324) connections.
-        //   - UTREEXO: this implementation supports Utreexo P2P (BIP-0183) messages.
-        let services = ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | service_flags::UTREEXO.into();
+        // The set of services supported by this node.
+        let services = advertised_services();
 
         // The current UNIX timestamp.
         let timestamp = SystemTime::now()
@@ -791,8 +786,8 @@ pub(super) mod peer_utils {
         );
 
         // Generate a per-message nonce.
-        let mut prng = thread_rng();
-        let nonce: u64 = prng.gen();
+        let mut prng = rng();
+        let nonce: u64 = prng.random();
 
         // Inform the peer of this node's chain tip.
         let start_height = best_block as i32;
@@ -873,29 +868,29 @@ mod tests {
     use std::time::Instant;
 
     use bip324::serde::NetworkMessage;
-    use bitcoin::p2p::address::AddrV2;
-    use bitcoin::p2p::ServiceFlags;
     use bitcoin::Network;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::p2p::address::AddrV2;
     use floresta_mempool::Mempool;
-    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::Mutex;
     use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
     use tokio::sync::oneshot;
-    use tokio::sync::Mutex;
 
+    use crate::TransportProtocol;
     use crate::address_man::AddressState;
     use crate::address_man::LocalAddress;
     use crate::node::ConnectionKind;
     use crate::node::NodeNotification;
     use crate::node::NodeRequest;
-    use crate::p2p_wire::peer::peer_utils;
     use crate::p2p_wire::peer::Peer;
     use crate::p2p_wire::peer::PeerError;
     use crate::p2p_wire::peer::ReaderMessage;
     use crate::p2p_wire::peer::State;
-    use crate::p2p_wire::transport::test_transport::Writer;
+    use crate::p2p_wire::peer::peer_utils;
     use crate::p2p_wire::transport::WriteTransport;
-    use crate::TransportProtocol;
+    use crate::p2p_wire::transport::test_transport::Writer;
 
     /// All the data needed to run a test.
     struct SetupData {

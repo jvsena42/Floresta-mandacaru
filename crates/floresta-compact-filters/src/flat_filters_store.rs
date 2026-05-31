@@ -7,6 +7,7 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -14,6 +15,9 @@ use std::sync::PoisonError;
 
 use crate::IterableFilterStore;
 use crate::IterableFilterStoreError;
+
+/// The maximum size that a block filter can have.
+pub const MAX_FILTER_SIZE: u32 = 1_000_000;
 
 pub struct FiltersIterator {
     reader: BufReader<File>,
@@ -54,35 +58,42 @@ struct FlatFiltersStoreInner {
 
 impl From<PoisonError<MutexGuard<'_, FlatFiltersStoreInner>>> for IterableFilterStoreError {
     fn from(_: PoisonError<MutexGuard<'_, FlatFiltersStoreInner>>) -> Self {
-        IterableFilterStoreError::Poisoned
+        IterableFilterStoreError::PoisonedLock
     }
 }
 
 pub struct FlatFiltersStore(Mutex<FlatFiltersStoreInner>);
 
 impl FlatFiltersStore {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)
+            .open(path)
             .unwrap();
 
-        let index = format!("{}-index", path.to_string_lossy());
+        let mut index_path = path.as_os_str().to_owned();
+        index_path.push("-index");
         let mut index = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(index)
+            .open(&index_path)
             .unwrap();
 
         index.seek(SeekFrom::Start(0)).unwrap();
         index.write_all(&4_u64.to_le_bytes()).unwrap();
 
-        Self(Mutex::new(FlatFiltersStoreInner { file, path, index }))
+        Self(Mutex::new(FlatFiltersStoreInner {
+            file,
+            path: path.into(),
+            index,
+        }))
     }
 }
 
@@ -181,8 +192,8 @@ impl IterableFilterStore for FlatFiltersStore {
     ) -> Result<(), IterableFilterStoreError> {
         let length = block_filter.content.len() as u32;
 
-        if length > 1_000_000 {
-            return Err(IterableFilterStoreError::FilterTooLarge);
+        if length > MAX_FILTER_SIZE {
+            return Err(IterableFilterStoreError::OversizedBlockFilter);
         }
 
         let mut inner = self.0.lock()?;
@@ -211,13 +222,13 @@ mod tests {
     use std::fs::remove_file;
 
     use super::FlatFiltersStore;
-    use crate::bip158::BlockFilter;
     use crate::IterableFilterStore;
+    use crate::bip158::BlockFilter;
 
     #[test]
     fn test_filter_store() {
         let path = "test_filter_store";
-        let store = FlatFiltersStore::new(path.into());
+        let store = FlatFiltersStore::new(path);
 
         let res = store.get_height().unwrap_err();
         assert!(matches!(res, crate::IterableFilterStoreError::Io(_)));

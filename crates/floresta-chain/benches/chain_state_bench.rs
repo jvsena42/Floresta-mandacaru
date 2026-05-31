@@ -5,35 +5,39 @@ use std::fs::File;
 use std::hint::black_box;
 use std::io::Cursor;
 
-use bitcoin::block::Header as BlockHeader;
-use bitcoin::consensus::deserialize;
-use bitcoin::consensus::Decodable;
 use bitcoin::Block;
 use bitcoin::Network;
 use bitcoin::OutPoint;
-use criterion::criterion_group;
-use criterion::criterion_main;
+use bitcoin::block::Header as BlockHeader;
+use bitcoin::consensus::Decodable;
+use bitcoin::consensus::deserialize;
 use criterion::BatchSize;
 use criterion::Criterion;
 use criterion::SamplingMode;
-use floresta_chain::pruned_utreexo::consensus::Consensus;
-use floresta_chain::pruned_utreexo::utxo_data::UtxoData;
-use floresta_chain::pruned_utreexo::UpdatableChainstate;
+use criterion::criterion_group;
+use criterion::criterion_main;
 use floresta_chain::AssumeValidArg;
 use floresta_chain::ChainState;
 use floresta_chain::FlatChainStore;
 use floresta_chain::FlatChainStoreConfig;
+use floresta_chain::pruned_utreexo::UpdatableChainstate;
+use floresta_chain::pruned_utreexo::consensus::Consensus;
+use floresta_chain::pruned_utreexo::utxo_data::UtxoData;
 use rustreexo::proof::Proof;
 
-/// Reads the first 151 blocks (or 150 blocks on top of genesis) from blocks.txt, which are regtest
+/// Reads the first 151 blocks (or 150 blocks on top of genesis) from `regtest_blocks.txt`
 fn read_blocks_txt() -> Vec<Block> {
-    let blocks: Vec<_> = include_str!("../testdata/blocks.txt")
+    let blocks: Vec<_> = include_str!("../testdata/regtest_blocks.txt")
         .lines()
         .take(151)
         .map(|b| deserialize(&hex::decode(b).unwrap()).unwrap())
         .collect();
 
-    assert_eq!(blocks.len(), 151, "Expected 151 blocks in blocks.txt");
+    assert_eq!(
+        blocks.len(),
+        151,
+        "Expected 151 blocks in regtest_blocks.txt"
+    );
     blocks
 }
 
@@ -68,11 +72,11 @@ fn setup_test_chain(
         fork_file_size: Some(10_000), // Will be rounded up to 16,384
         cache_size: Some(10),
         file_permission: Some(0o660),
-        path: format!("./tmp-db/{test_id}/"),
+        path: format!("./tmp-db/{test_id}/").into(),
     };
 
     let chainstore = FlatChainStore::new(config).unwrap();
-    ChainState::new(chainstore, network, assume_valid_arg)
+    ChainState::open(chainstore, network, assume_valid_arg).unwrap()
 }
 
 fn decode_block_and_inputs(

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 name: Benchmarks
 
 on:
@@ -6,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+permissions: {}
 
 jobs:
   benchmark:
@@ -13,10 +16,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.81.0
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          components: rustfmt, clippy
+          persist-credentials: false
+
+      - name: Install 1.85.0 Rust Toolchain
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --no-self-update
+          rustup default 1.85.0
 
         # Bi-weekly numbers to refresh caches every two weeks, ensuring recent project changes are cached
       - name: Set bi-weekly cache key
@@ -34,7 +42,7 @@ jobs:
       # Restore Rust build cache and artifacts
       - name: Restore Rust cache
         id: cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -56,7 +64,7 @@ jobs:
       # This happens everytime we modify any `cargo.lock` or `cargo.toml`, or each two weeks (caching recent changes)
       - name: Save Rust cache
         if: success() && steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -67,7 +75,7 @@ jobs:
 
       # Store benchmark results
       - name: Store benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: benchmark-results
           path: target/criterion

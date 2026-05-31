@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::path::PathBuf;
+
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -166,5 +168,5 @@ pub struct ActiveCommand {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetRpcInfoRes {
     active_commands: Vec<ActiveCommand>,
-    logpath: String,
+    logpath: PathBuf,
 }

@@ -5,18 +5,18 @@ use core::fmt;
 use core::fmt::Display;
 use core::fmt::Formatter;
 use core::net::AddrParseError;
+use std::path::PathBuf;
 
 use bitcoin::consensus::encode;
 use floresta_chain::BlockValidationErrors;
 use floresta_chain::BlockchainError;
-use floresta_chain::FlatChainstoreError;
 #[cfg(feature = "compact-filters")]
 use floresta_compact_filters::IterableFilterStoreError;
-use floresta_watch_only::kv_database::KvDatabaseError;
 use floresta_watch_only::WatchOnlyError;
+use floresta_watch_only::descriptor::DescriptorError;
+use floresta_watch_only::kv_database::KvDatabaseError;
 use tokio_rustls::rustls::pki_types;
 
-use crate::slip132;
 #[derive(Debug)]
 pub enum FlorestadError {
     /// Encoding/decoding error.
@@ -47,7 +47,7 @@ pub enum FlorestadError {
     TomlParsing(toml::de::Error),
 
     /// Parsing registered HD version bytes from slip132.
-    WalletInput(slip132::Error),
+    WalletInput(DescriptorError),
 
     /// Parsing a bitcoin address.
     AddressParsing(bitcoin::address::ParseError),
@@ -74,10 +74,10 @@ pub enum FlorestadError {
     CouldNotGenerateSelfSignedCert(rcgen::Error),
 
     /// Writing a file to the filesystem.
-    CouldNotWriteFile(String, std::io::Error),
+    CouldNotWriteFile(PathBuf, std::io::Error),
 
     /// Data directory doesn't exist or is not writable.
-    InvalidDataDir(String),
+    InvalidDataDir(PathBuf),
 
     /// Obtaining a lock on the data directory.
     CouldNotOpenKvDatabase(KvDatabaseError),
@@ -102,19 +102,13 @@ pub enum FlorestadError {
     FailedToBindElectrumServer(std::io::Error),
 
     /// Failed to create the TLS data directory.
-    CouldNotCreateTLSDataDir(String, std::io::Error),
-
-    /// Failed to provide a valid xpub.
-    InvalidProvidedXpub(String, slip132::Error),
+    CouldNotCreateTLSDataDir(PathBuf, std::io::Error),
 
     /// Failed to obtain the wallet cache.
     CouldNotObtainWalletCache(WatchOnlyError<KvDatabaseError>),
 
     /// Failed to push a descriptor to the wallet.
     CouldNotPushDescriptor(String),
-
-    /// The network is unsupported.
-    UnsupportedNetwork(bitcoin::Network),
 
     /// Invalid Ip address error.
     InvalidIpAddress(AddrParseError),
@@ -124,9 +118,6 @@ pub enum FlorestadError {
 
     /// Resolve a hostname error.
     CouldNotResolveHostname(std::io::Error),
-
-    /// Create a flat chain store error.
-    CouldNotCreateFlatChainStore(FlatChainstoreError),
 
     /// Load a flat chain store error.
     CouldNotLoadFlatChainStore(BlockchainError),
@@ -172,10 +163,18 @@ impl Display for FlorestadError {
                 write!(f, "Error while generating self-signed certificate: {err}")
             }
             FlorestadError::CouldNotWriteFile(path, err) => {
-                write!(f, "Error while creating file {path}: {err}")
+                write!(
+                    f,
+                    "Error while creating file at path={}: {err}",
+                    path.display()
+                )
             }
             FlorestadError::InvalidDataDir(path) => {
-                write!(f, "Data directory doesn't exist or is not writable: {path}")
+                write!(
+                    f,
+                    "Data directory at path={} doesn't exist or is not writable",
+                    path.display()
+                )
             }
             FlorestadError::CouldNotOpenKvDatabase(err) => {
                 write!(f, "Cannot open a key-value database: {err}")
@@ -202,19 +201,17 @@ impl Display for FlorestadError {
                 write!(f, "Failed to bind Electrum server: {err}")
             }
             FlorestadError::CouldNotCreateTLSDataDir(path, err) => {
-                write!(f, "Could not create TLS data directory {path}: {err}")
-            }
-            FlorestadError::InvalidProvidedXpub(xpub, err) => {
-                write!(f, "Invalid provided xpub {xpub}: {err:?}")
+                write!(
+                    f,
+                    "Could not create TLS data directory at path={}: {err}",
+                    path.display()
+                )
             }
             FlorestadError::CouldNotObtainWalletCache(err) => {
                 write!(f, "Could not obtain wallet cache: {err}")
             }
             FlorestadError::CouldNotPushDescriptor(err) => {
                 write!(f, "Could not push descriptor to wallet: {err}")
-            }
-            FlorestadError::UnsupportedNetwork(err) => {
-                write!(f, "Unsupported network: {err}")
             }
             FlorestadError::InvalidIpAddress(err) => {
                 write!(f, "Invalid IP address: {err}")
@@ -224,9 +221,6 @@ impl Display for FlorestadError {
             }
             FlorestadError::CouldNotResolveHostname(host) => {
                 write!(f, "Could not resolve hostname: {host}")
-            }
-            FlorestadError::CouldNotCreateFlatChainStore(err) => {
-                write!(f, "Failure while creating chainstore: {err:?}")
             }
             FlorestadError::CouldNotLoadFlatChainStore(err) => {
                 write!(f, "Failure while loading flat chainstore: {err:?}")
@@ -254,7 +248,7 @@ impl_from_error!(Io, std::io::Error);
 impl_from_error!(ScriptValidation, bitcoin::blockdata::script::Error);
 impl_from_error!(Blockchain, BlockchainError);
 impl_from_error!(SerdeJson, serde_json::Error);
-impl_from_error!(WalletInput, slip132::Error);
+impl_from_error!(WalletInput, DescriptorError);
 impl_from_error!(TomlParsing, toml::de::Error);
 impl_from_error!(BlockValidation, BlockValidationErrors);
 impl_from_error!(AddressParsing, bitcoin::address::ParseError);

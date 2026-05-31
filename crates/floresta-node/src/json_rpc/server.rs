@@ -3,7 +3,8 @@
 use core::net::SocketAddr;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::slice;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
@@ -11,6 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use axum::Json;
+use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -18,13 +21,6 @@ use axum::http::Method;
 use axum::http::Response;
 use axum::http::StatusCode;
 use axum::routing::post;
-use axum::Json;
-use axum::Router;
-use bitcoin::consensus::deserialize;
-use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::hashes::hex::FromHex;
-use bitcoin::hashes::Hash;
-use bitcoin::hex::DisplayHex;
 use bitcoin::Address;
 use bitcoin::BlockHash;
 use bitcoin::Network;
@@ -33,16 +29,20 @@ use bitcoin::Transaction;
 use bitcoin::TxIn;
 use bitcoin::TxOut;
 use bitcoin::Txid;
+use bitcoin::consensus::deserialize;
+use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::hashes::Hash;
+use bitcoin::hashes::hex::FromHex;
+use bitcoin::hex::DisplayHex;
 use floresta_chain::ThreadSafeChain;
-use floresta_common::parse_descriptors;
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 use floresta_compact_filters::network_filters::NetworkFilters;
-use floresta_watch_only::kv_database::KvDatabase;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::CachedTransaction;
+use floresta_watch_only::kv_database::KvDatabase;
 use floresta_wire::node_interface::NodeInterface;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing::debug;
@@ -57,13 +57,13 @@ use super::res::ScriptPubKeyJson;
 use super::res::ScriptSigJson;
 use super::res::TxInJson;
 use super::res::TxOutJson;
+use crate::json_rpc::request::RpcRequest;
 use crate::json_rpc::request::arg_parser::get_bool;
 use crate::json_rpc::request::arg_parser::get_hash;
 use crate::json_rpc::request::arg_parser::get_hashes_array;
 use crate::json_rpc::request::arg_parser::get_numeric;
 use crate::json_rpc::request::arg_parser::get_optional_field;
 use crate::json_rpc::request::arg_parser::get_string;
-use crate::json_rpc::request::RpcRequest;
 use crate::json_rpc::res::RescanConfidence;
 
 pub(super) struct InflightRpc {
@@ -92,7 +92,7 @@ pub struct RpcImpl<Blockchain: RpcChain> {
     pub(super) node: NodeInterface,
     pub(super) kill_signal: Arc<RwLock<bool>>,
     pub(super) inflight: Arc<RwLock<HashMap<Value, InflightRpc>>>,
-    pub(super) log_path: String,
+    pub(super) log_path: PathBuf,
     pub(super) start_time: Instant,
     /// Whether a wallet rescan (`rescanblockchain` or the rescan kicked off by
     /// `loaddescriptor`) is currently running. Used to dedup concurrent rescans
@@ -103,6 +103,8 @@ pub struct RpcImpl<Blockchain: RpcChain> {
     pub(super) rescan_blocks_processed: Arc<AtomicU32>,
     /// Total matched blocks the in-progress rescan has to process.
     pub(super) rescan_blocks_total: Arc<AtomicU32>,
+    pub(super) user_agent: String,
+    pub(super) proxy: Option<SocketAddr>,
 }
 
 type Result<T> = std::result::Result<T, JsonRpcError>;
@@ -124,30 +126,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 
     fn load_descriptor(&self, descriptor: String) -> Result<bool> {
-        let desc = slice::from_ref(&descriptor);
-        let parsed = parse_descriptors(desc)?;
-
-        // `parse_descriptors` expands multipath descriptors (e.g. `.../<0;1>/*`)
-        // into one single-path descriptor per chain via miniscript's
-        // `into_single_descriptors()`. We must cache addresses from every
-        // expansion, otherwise subscribers to any chain other than the last
-        // one popped (historically, receive addresses when change comes last)
-        // see empty history over the Electrum protocol because their
-        // scriptPubKeys were never registered with the wallet.
-        for descriptor in &parsed {
-            for index in 0..100 {
-                let script_pubkey = descriptor
-                    .at_derivation_index(index)
-                    .unwrap()
-                    .script_pubkey();
-                self.wallet.cache_address(script_pubkey);
-            }
-        }
-
-        debug!(
-            "Caching complete for {} derived descriptor(s); rescanning with block filters",
-            parsed.len()
-        );
+        let addresses = self.wallet.push_descriptor(&descriptor)?;
+        info!("Descriptor pushed: {descriptor}");
+        debug!("Rescanning with block filters for addresses: {addresses:?}");
 
         let addresses = self.wallet.get_cached_addresses();
         let wallet = self.wallet.clone();
@@ -187,9 +168,6 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 "rescan already in progress; descriptor cached, will be covered by the next rescan"
             );
         }
-
-        self.wallet.push_descriptor(&descriptor)?;
-        debug!("Descriptor pushed: {descriptor}");
 
         Ok(true)
     }
@@ -343,10 +321,24 @@ async fn handle_json_rpc_request(
 
         "getblockheader" => {
             let hash = get_hash(&params, 0, "block_hash")?;
+            let verbosity = get_optional_field(&params, 1, "verbosity", get_bool)?.unwrap_or(true);
+
             state
-                .get_block_header(hash)
+                .get_block_header(hash, verbosity)
+                .await
                 .map(|h| serde_json::to_value(h).unwrap())
         }
+
+        "getdeploymentinfo" => {
+            let blockhash = get_optional_field(&params, 0, "blockhash", get_hash)?;
+            state
+                .get_deployment_info(blockhash)
+                .map(|info| serde_json::to_value(info).unwrap())
+        }
+
+        "getdifficulty" => state
+            .get_difficulty()
+            .map(|v| serde_json::to_value(v).unwrap()),
 
         "gettxout" => {
             let txid = get_hash(&params, 0, "txid")?;
@@ -422,6 +414,16 @@ async fn handle_json_rpc_request(
         // network
         "getpeerinfo" => state
             .get_peer_info()
+            .await
+            .map(|v| serde_json::to_value(v).unwrap()),
+
+        "getconnectioncount" => state
+            .get_connection_count()
+            .await
+            .map(|v| serde_json::to_value(v).unwrap()),
+
+        "getnetworkinfo" => state
+            .get_network_info()
             .await
             .map(|v| serde_json::to_value(v).unwrap()),
 
@@ -523,6 +525,7 @@ fn get_http_error_code(err: &JsonRpcError) -> u16 {
         | JsonRpcError::InvalidParameterType(_)
         | JsonRpcError::MissingParameter(_)
         | JsonRpcError::ChainWorkOverflow
+        | JsonRpcError::ConversionOverflow(_)
         | JsonRpcError::MempoolAccept(_)
         | JsonRpcError::Wallet(_) => 400,
 
@@ -564,6 +567,7 @@ fn get_json_rpc_error_code(err: &JsonRpcError) -> i32 {
         | JsonRpcError::InvalidRescanVal
         | JsonRpcError::NoAddressesToRescan
         | JsonRpcError::ChainWorkOverflow
+        | JsonRpcError::ConversionOverflow(_)
         | JsonRpcError::Wallet(_)
         | JsonRpcError::MempoolAccept(_) => -32600,
 
@@ -905,7 +909,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         block_filter_storage: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
         block_filter_start: Option<u32>,
         address: Option<SocketAddr>,
-        log_path: String,
+        log_path: impl AsRef<Path>,
+        user_agent: String,
+        proxy: Option<SocketAddr>,
     ) {
         let address = address.unwrap_or_else(|| {
             format!("127.0.0.1:{}", Self::get_port(&network))
@@ -945,11 +951,13 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 block_filter_storage,
                 block_filter_start,
                 inflight: Arc::new(RwLock::new(HashMap::new())),
-                log_path,
+                log_path: log_path.as_ref().into(),
                 start_time: Instant::now(),
                 rescan_in_progress: Arc::new(AtomicBool::new(false)),
                 rescan_blocks_processed: Arc::new(AtomicU32::new(0)),
                 rescan_blocks_total: Arc::new(AtomicU32::new(0)),
+                user_agent,
+                proxy,
             }));
 
         axum::serve(listener, router)

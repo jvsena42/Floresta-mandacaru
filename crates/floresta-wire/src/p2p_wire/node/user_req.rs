@@ -2,15 +2,15 @@
 
 use std::time::Instant;
 
-use bitcoin::p2p::ServiceFlags;
 use bitcoin::Block;
+use bitcoin::p2p::ServiceFlags;
 use floresta_chain::ChainBackend;
+use floresta_common::try_and_log;
 use tokio::sync::oneshot;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
-use super::try_and_log;
 use super::NodeRequest;
 use super::UtreexoNode;
 use crate::block_proof::Bitmap;
@@ -87,6 +87,12 @@ where
 
             UserRequest::GetPeerInfo => {
                 self.handle_get_peer_info(responder);
+                return;
+            }
+
+            UserRequest::GetConnectionCount => {
+                let count = self.connected_peers();
+                try_and_log!(responder.send(NodeResponse::GetConnectionCount(count)));
                 return;
             }
 

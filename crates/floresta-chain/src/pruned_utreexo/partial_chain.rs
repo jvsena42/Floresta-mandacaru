@@ -25,20 +25,20 @@
 
 use core::cell::UnsafeCell;
 
-use bitcoin::block::Header as BlockHeader;
 use bitcoin::Block;
 use bitcoin::BlockHash;
+use bitcoin::block::Header as BlockHeader;
 use floresta_common::prelude::*;
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::stump::Stump;
 use tracing::info;
 
+use super::BlockchainInterface;
+use super::UpdatableChainstate;
 use super::chainparams::ChainParams;
 use super::consensus::Consensus;
 use super::error::BlockValidationErrors;
 use super::error::BlockchainError;
-use super::BlockchainInterface;
-use super::UpdatableChainstate;
 use crate::pruned_utreexo::utxo_data::UtxoData;
 
 #[doc(hidden)]
@@ -148,8 +148,8 @@ impl PartialChainStateInner {
         let acc = match Consensus::update_acc(&self.current_acc, block, height, proof, del_hashes) {
             Ok(acc) => acc,
             Err(_) => {
-                self.error = Some(BlockValidationErrors::InvalidProof);
-                return Err(BlockchainError::InvalidProof);
+                self.error = Some(BlockValidationErrors::InvalidUtreexoProof);
+                return Err(BlockchainError::InvalidUtreexoProof);
             }
         };
 
@@ -178,7 +178,7 @@ impl PartialChainStateInner {
 
         let prev_block = self.get_ancestor(height)?;
         if block.header.prev_blockhash != prev_block.block_hash() {
-            return Err(BlockValidationErrors::BlockExtendsAnOrphanChain)?;
+            Err(BlockValidationErrors::BlockExtendsAnOrphanChain)?;
         }
 
         // Validate block transactions
@@ -308,7 +308,9 @@ impl UpdatableChainstate for PartialChainState {
     }
 
     fn invalidate_block(&self, _block: BlockHash) -> Result<(), BlockchainError> {
-        unimplemented!("we know if a block is invalid, just break out of your loop and use the is_valid() method")
+        unimplemented!(
+            "we know if a block is invalid, just break out of your loop and use the is_valid() method"
+        )
     }
 
     fn handle_transaction(&self) -> Result<(), BlockchainError> {
@@ -468,27 +470,29 @@ impl From<PartialChainStateInner> for PartialChainState {
 mod tests {
     use std::collections::HashMap;
 
-    use bitcoin::block::Header;
-    use bitcoin::consensus::encode::deserialize_hex;
     use bitcoin::Block;
     use bitcoin::Network;
+    use bitcoin::block::Header;
+    use bitcoin::consensus::encode::deserialize_hex;
     use floresta_common::acchashes;
     use rustreexo::node_hash::BitcoinNodeHash;
     use rustreexo::proof::Proof;
     use rustreexo::stump::Stump;
 
     use super::PartialChainState;
+    use crate::BlockchainError;
+    use crate::pruned_utreexo::UpdatableChainstate;
     use crate::pruned_utreexo::chainparams::ChainParams;
     use crate::pruned_utreexo::consensus::Consensus;
     use crate::pruned_utreexo::error::BlockValidationErrors;
     use crate::pruned_utreexo::partial_chain::PartialChainStateInner;
-    use crate::pruned_utreexo::UpdatableChainstate;
-    use crate::BlockchainError;
 
     #[test]
     fn test_with_invalid_block() {
         fn run(block: &str, reason: BlockValidationErrors) {
-            let genesis = parse_block("0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f20020000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000");
+            let genesis = parse_block(
+                "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f20020000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000",
+            );
             let block = parse_block(block);
 
             let chainstate = get_empty_pchain(vec![genesis.header, block.header]);
@@ -499,8 +503,14 @@ mod tests {
                 _ => panic!("unexpected {res:?}"),
             };
         }
-        run("0000002000226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f39adbcd7823048d34357bdca86cd47172afe2a4af8366b5b34db36df89386d49b23ec964ffff7f20000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff165108feddb99c6b8435060b2f503253482f627463642fffffffff0100f2052a01000000160014806cef41295922d32ddfca09c26cc4acd36c3ed000000000", BlockValidationErrors::BlockExtendsAnOrphanChain);
-        run("0000002000226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f40adbcd7823048d34357bdca86cd47172afe2a4af8366b5b34db36df89386d49b23ec964ffff7f20000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff165108feddb99c6b8435060b2f503253482f627463642fffffffff0100f2052a01000000160014806cef41295922d32ddfca09c26cc4acd36c3ed000000000", BlockValidationErrors::BadMerkleRoot);
+        run(
+            "0000002000226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f39adbcd7823048d34357bdca86cd47172afe2a4af8366b5b34db36df89386d49b23ec964ffff7f20000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff165108feddb99c6b8435060b2f503253482f627463642fffffffff0100f2052a01000000160014806cef41295922d32ddfca09c26cc4acd36c3ed000000000",
+            BlockValidationErrors::BlockExtendsAnOrphanChain,
+        );
+        run(
+            "0000002000226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f40adbcd7823048d34357bdca86cd47172afe2a4af8366b5b34db36df89386d49b23ec964ffff7f20000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff165108feddb99c6b8435060b2f503253482f627463642fffffffff0100f2052a01000000160014806cef41295922d32ddfca09c26cc4acd36c3ed000000000",
+            BlockValidationErrors::BadMerkleRoot,
+        );
     }
     fn parse_block(hex: &str) -> Block {
         deserialize_hex(hex).unwrap()
@@ -522,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_updating_single_chain() {
-        let blocks = include_str!("../../testdata/blocks.txt");
+        let blocks = include_str!("../../testdata/regtest_blocks.txt");
         let mut parsed_blocks = vec![];
         for (i, block) in blocks.lines().enumerate() {
             if i > 100 {
@@ -558,7 +568,7 @@ mod tests {
     fn test_updating_multiple_chains() {
         // We have two chains, one with 100 blocks, one with 50 blocks. We expect the
         // accumulator to be what we expect after 100 blocks and after 150 blocks.
-        let blocks = include_str!("../../testdata/blocks.txt");
+        let blocks = include_str!("../../testdata/regtest_blocks.txt");
         let mut parsed_blocks = vec![];
         for block in blocks.lines() {
             parsed_blocks.push(parse_block(block));

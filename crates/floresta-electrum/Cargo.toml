@@ -1,7 +1,8 @@
 [package]
 name = "floresta-electrum"
 version = "0.5.1"
-edition = "2021"
+rust-version.workspace = true
+edition.workspace = true
 authors = ["Floresta Developers <contact@getfloresta.org>"]
 description = """
     A simple Electrum server implementation for Floresta. It is based on the
@@ -9,7 +10,7 @@ description = """
     that supports Electrum servers.
 """
 repository = "https://github.com/getfloresta/Floresta"
-license = "MIT"
+license.workspace = true
 readme.workspace = true # Floresta/README.md
 keywords = ["bitcoin", "utreexo", "node", "blockchain", "rust"]
 categories = ["cryptography::cryptocurrencies"]

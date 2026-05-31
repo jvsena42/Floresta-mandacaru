@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::fs;
+use std::path::Path;
+
 use serde::Deserialize;
 
 use crate::error::FlorestadError;
@@ -17,8 +20,9 @@ pub struct ConfigFile {
 }
 
 impl ConfigFile {
-    pub fn from_file(filename: &str) -> Result<Self, FlorestadError> {
-        let file = std::fs::read_to_string(filename)?;
-        Ok(toml::from_str(&file)?)
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, FlorestadError> {
+        let config_file = fs::read_to_string(path.as_ref())?;
+
+        Ok(toml::from_str(&config_file)?)
     }
 }

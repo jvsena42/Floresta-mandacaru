@@ -8,25 +8,25 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use bitcoin::p2p::address::AddrV2;
-use bitcoin::p2p::ServiceFlags;
 use bitcoin::Network;
+use bitcoin::p2p::ServiceFlags;
+use bitcoin::p2p::address::AddrV2;
 use floresta_chain::ChainBackend;
-use floresta_common::service_flags;
 use floresta_common::Ema;
+use floresta_common::service_flags;
+use floresta_common::try_and_log;
 use floresta_mempool::Mempool;
 use tokio::net::tcp::WriteHalf;
 use tokio::spawn;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::oneshot;
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::debug;
 use tracing::info;
 
-use super::try_and_log;
 use super::ConnectionKind;
 use super::InflightRequests;
 use super::LocalPeerView;
@@ -34,16 +34,16 @@ use super::NodeNotification;
 use super::NodeRequest;
 use super::PeerStatus;
 use super::UtreexoNode;
+use crate::TransportProtocol;
 use crate::address_man::AddressMan;
 use crate::address_man::AddressState;
 use crate::address_man::LocalAddress;
 use crate::node_context::NodeContext;
 use crate::p2p_wire::error::AddrParseError;
 use crate::p2p_wire::error::WireError;
-use crate::p2p_wire::peer::create_actors;
 use crate::p2p_wire::peer::Peer;
+use crate::p2p_wire::peer::create_actors;
 use crate::p2p_wire::transport;
-use crate::TransportProtocol;
 
 /// How long before we consider using alternative ways to find addresses,
 /// such as hard-coded peers
@@ -394,7 +394,7 @@ where
                 AddressState::NeverTried,
                 ServiceFlags::NONE,
                 port,
-                rand::random(),
+                rand::random::<u64>() as usize,
             ));
         }
 
@@ -426,7 +426,7 @@ where
                     return Err(AddrParseError::Inconclusive);
                 }
 
-                let id = rand::random();
+                let id = rand::random::<u64>() as usize;
                 Ok(LocalAddress::new(
                     AddrV2::Ipv4(ip),
                     0,
@@ -452,7 +452,7 @@ where
 
                 let ip = dns_lookup::lookup_host(hostname)
                     .map_err(|_e| AddrParseError::InvalidHostname)?;
-                let id = rand::random();
+                let id = rand::random::<u64>() as usize;
                 let ip = match ip[0] {
                     IpAddr::V4(ip) => AddrV2::Ipv4(ip),
                     IpAddr::V6(ip) => AddrV2::Ipv6(ip),
@@ -539,7 +539,9 @@ where
 
         self.last_dns_seed_call = Instant::now();
 
-        info!("Floresta has been running for a while without enough addresses, requesting more from DNS seeds");
+        info!(
+            "Floresta has been running for a while without enough addresses, requesting more from DNS seeds"
+        );
         try_and_log!(self.get_peers_from_dns());
     }
 
@@ -575,7 +577,7 @@ where
     }
 
     pub(crate) fn init_peers(&mut self) -> Result<(), WireError> {
-        let anchors = self.common.address_man.start_addr_man(self.datadir.clone());
+        let anchors = self.common.address_man.start_addr_man(&self.common.datadir);
         let enough_addresses = self.common.address_man.enough_addresses();
 
         if !self.config.disable_dns_seeds && !enough_addresses {
@@ -689,8 +691,8 @@ where
 mod tests {
     use floresta_chain::pruned_utreexo::partial_chain::PartialChainState;
 
-    use crate::node::running_ctx::RunningNode;
     use crate::node::UtreexoNode;
+    use crate::node::running_ctx::RunningNode;
 
     fn check_address_resolving(address: &str, port: u16, should_succeed: bool, description: &str) {
         let result =

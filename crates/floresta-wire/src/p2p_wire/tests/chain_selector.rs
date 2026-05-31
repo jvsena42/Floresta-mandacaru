@@ -10,12 +10,12 @@ mod tests {
     use rustreexo::node_hash::BitcoinNodeHash;
     use rustreexo::stump::Stump;
 
+    use crate::p2p_wire::tests::utils::PeerData;
     use crate::p2p_wire::tests::utils::create_false_acc;
     use crate::p2p_wire::tests::utils::setup_node;
     use crate::p2p_wire::tests::utils::signet_blocks;
     use crate::p2p_wire::tests::utils::signet_headers;
     use crate::p2p_wire::tests::utils::signet_roots;
-    use crate::p2p_wire::tests::utils::PeerData;
     const STARTING_LIE_BLOCK_HEIGHT: usize = 30;
 
     pub const NUM_BLOCKS: usize = 120;

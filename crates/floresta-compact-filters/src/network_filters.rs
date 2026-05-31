@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use bitcoin::bip158::BlockFilter;
 use bitcoin::BlockHash;
+use bitcoin::bip158::BlockFilter;
 use floresta_chain::pruned_utreexo::BlockchainInterface;
 
 use crate::IterableFilterStore;

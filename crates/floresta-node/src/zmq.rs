@@ -24,8 +24,8 @@
 
 use std::collections::HashMap;
 
-use bitcoin::consensus::serialize;
 use bitcoin::OutPoint;
+use bitcoin::consensus::serialize;
 use floresta_chain::BlockConsumer;
 use floresta_chain::UtxoData;
 use tracing::error;

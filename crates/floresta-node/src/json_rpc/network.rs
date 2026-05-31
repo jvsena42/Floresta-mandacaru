@@ -6,15 +6,41 @@ use core::net::IpAddr;
 use core::net::SocketAddr;
 
 use bitcoin::Network;
+use corepc_types::v30::GetNetworkInfo;
+use corepc_types::v30::GetNetworkInfoNetwork;
+use floresta_common::PROTOCOL_VERSION;
+use floresta_common::advertised_services;
+use floresta_common::service_flags_strings;
+use floresta_wire::address_man::ReachableNetworks;
 use floresta_wire::node_interface::PeerInfo;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 use super::res::JsonRpcError;
 use super::server::RpcChain;
 use super::server::RpcImpl;
 
 type Result<T> = std::result::Result<T, JsonRpcError>;
+
+/// Encode a `CARGO_PKG_VERSION` string (`"<major>.<minor>.<patch>"`) as Bitcoin Core's
+/// numeric `MMmmpp` version. Returns `0` for malformed input.
+fn parse_mmmmpp(version: &str) -> usize {
+    let mut parts = version.splitn(3, '.');
+
+    let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let patch = parts
+        .next()
+        .map(|p| {
+            p.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    major * 10_000 + minor * 100 + patch
+}
 
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     pub(crate) async fn ping(&self) -> Result<bool> {
@@ -117,5 +143,79 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             .get_peer_info()
             .await
             .map_err(|_| JsonRpcError::Node("Failed to get peer information".to_string()))
+    }
+
+    pub(crate) async fn get_connection_count(&self) -> Result<usize> {
+        self.node
+            .get_connection_count()
+            .await
+            .map_err(|_| JsonRpcError::Node("Failed to get connection count".to_string()))
+    }
+
+    pub(crate) async fn get_network_info(&self) -> Result<GetNetworkInfo> {
+        // Floresta does not listen for inbound connections, so every peer is outbound.
+        let connections_in = 0;
+        let connections_out = self
+            .node
+            .get_connection_count()
+            .await
+            .map_err(|_| JsonRpcError::Node("Failed to get connection count".to_string()))?;
+
+        let advertised_services = advertised_services();
+        let local_services = format!("{:016x}", advertised_services.to_u64());
+        let local_services_names = service_flags_strings(&advertised_services);
+
+        let proxy_str = self.proxy.map(|addr| addr.to_string()).unwrap_or_default();
+        let proxy_set = self.proxy.is_some();
+
+        let networks = ReachableNetworks::ALL
+            .into_iter()
+            .map(|net| {
+                let reachable = ReachableNetworks::SUPPORTED.contains(&net);
+
+                GetNetworkInfoNetwork {
+                    name: net.to_string(),
+                    limited: !reachable,
+                    reachable,
+                    proxy: proxy_str.clone(),
+                    proxy_randomize_credentials: proxy_set,
+                }
+            })
+            .collect();
+
+        let version = parse_mmmmpp(env!("CARGO_PKG_VERSION"));
+
+        Ok(GetNetworkInfo {
+            version,
+            subversion: self.user_agent.clone(),
+            protocol_version: PROTOCOL_VERSION as usize,
+            local_services,
+            local_services_names,
+            local_relay: false,
+            time_offset: 0,
+            connections: connections_in + connections_out,
+            connections_in,
+            connections_out,
+            network_active: true,
+            networks,
+            // Since Floresta has no mempool, relay_fee and incremental_fee are hardcoded to 0.
+            relay_fee: 0.0,
+            incremental_fee: 0.0,
+            local_addresses: Vec::new(), // Floresta doesn't track local addresses since it does not accept inbound connections
+            warnings: Vec::new(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_mmmmpp;
+
+    #[test]
+    fn parse_mmmmpp_encodes_semver_correctly() {
+        assert_eq!(parse_mmmmpp("0.9.0-rc1"), 900);
+        assert_eq!(parse_mmmmpp("23.1.5"), 230_105);
+        assert_eq!(parse_mmmmpp("1.2"), 10_200);
+        assert_eq!(parse_mmmmpp("1"), 10_000);
     }
 }

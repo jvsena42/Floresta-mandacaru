@@ -19,7 +19,7 @@ This will start the full node, and you can connect to it with an Electrum wallet
 floresta-cli getblockchaininfo
 ```
 
-For more information on how to use the `floresta-cli` tool, you can check the [API documentation](https://github.com/getfloresta/Floresta/blob/master/crates/floresta-cli/README.md).
+For more information on how to use the `floresta-cli` tool, you can check the [API documentation](https://github.com/getfloresta/Floresta/blob/master/bin/floresta-cli/README.md).
 
 ## TLS
 
@@ -96,10 +96,10 @@ Floresta comes with a watch-only wallet that you can use to track your transacti
 information, either as a configuration file or as a command line argument. See the [sample configuration file](../config.toml.sample) for an example config. Floresta supports SLIP-132 extended public keys (xpubs) and output descriptors. You can add new wallets to follow at any time, just
 call the `rescanblockchain` rpc after adding the wallet.
 
-You can add new descriptors to the wallet with the `importdescriptor` rpc.
+You can add new descriptors to the wallet with the `loaddescriptor` rpc.
 
 ```bash
-floresta-cli importdescriptor "wpkh(xpub6CFy3kRXorC3NMTt8qrsY9ucUfxVLXyFQ49JSLm3iEG5gfAmWewYFzjNYFgRiCjoB9WWEuJQiyYGCdZvUTwPEUPL9pPabT8bkbiD9Po47XG/<0;1>/*)"
+floresta-cli loaddescriptor "wpkh(xpub6CFy3kRXorC3NMTt8qrsY9ucUfxVLXyFQ49JSLm3iEG5gfAmWewYFzjNYFgRiCjoB9WWEuJQiyYGCdZvUTwPEUPL9pPabT8bkbiD9Po47XG/<0;1>/*)"
 ```
 
 The rescan assumes that you have compact block filters for the blocks that you're scanning. You can either download all the filters

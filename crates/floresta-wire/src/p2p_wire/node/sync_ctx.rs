@@ -6,23 +6,23 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bitcoin::p2p::ServiceFlags;
-use floresta_chain::proof_util;
 use floresta_chain::ThreadSafeChain;
+use floresta_chain::proof_util;
 use floresta_common::service_flags;
+use floresta_common::try_and_log;
+use rand::rng;
 use rand::seq::IteratorRandom;
-use rand::thread_rng;
 use tokio::time;
 use tokio::time::MissedTickBehavior;
 use tracing::debug;
 use tracing::info;
 
-use crate::node::periodic_job;
-use crate::node::try_and_log;
 use crate::node::ConnectionKind;
 use crate::node::InflightRequests;
 use crate::node::NodeNotification;
 use crate::node::NodeRequest;
 use crate::node::UtreexoNode;
+use crate::node::periodic_job;
 use crate::node_context::LoopControl;
 use crate::node_context::NodeContext;
 use crate::p2p_wire::error::WireError;
@@ -158,7 +158,7 @@ where
                 .filter(|peer| {
                     peer.is_regular_peer() && !peer.services.has(service_flags::UTREEXO.into())
                 })
-                .choose(&mut thread_rng())
+                .choose(&mut rng())
                 .and_then(|p| p.channel.send(NodeRequest::Shutdown).ok());
         }
 

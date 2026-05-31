@@ -7,9 +7,9 @@
 //! wallets with unknown balances.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 use bitcoin::Block;
 use bitcoin::Network;
@@ -87,7 +87,7 @@ async fn main() {
     // the block data after we have validated it. This saves a lot of space, but it means that
     // we can't serve blocks to other nodes or rescan the blockchain without downloading
     // it again.
-    let chain_store_config = FlatChainStoreConfig::new(DATA_DIR.into());
+    let chain_store_config = FlatChainStoreConfig::new(DATA_DIR);
     let chain_store =
         FlatChainStore::new(chain_store_config).expect("failed to open the blockchain database");
 
@@ -98,11 +98,9 @@ async fn main() {
     // signatures in the blockchain, just the ones after the assume valid block. We are giving a Disabled
     // value, so we will validate all signatures regardless.
     // We place the chain state in an Arc, so we can share it with other components.
-    let chain = Arc::new(ChainState::new(
-        chain_store,
-        Network::Bitcoin,
-        AssumeValidArg::Disabled,
-    ));
+    let chain = Arc::new(
+        ChainState::open(chain_store, Network::Bitcoin, AssumeValidArg::Disabled).unwrap(),
+    );
 
     // Create the indexer and subscribe to new blocks with the spent UTXOs
     let indexer = FeeRateIndexer::new();

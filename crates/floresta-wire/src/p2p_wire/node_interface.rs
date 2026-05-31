@@ -7,22 +7,22 @@ use core::net::IpAddr;
 use core::net::SocketAddr;
 use std::time::Instant;
 
-use bitcoin::p2p::ServiceFlags;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Transaction;
 use bitcoin::Txid;
-use floresta_mempool::mempool::AcceptToMempoolError;
+use bitcoin::p2p::ServiceFlags;
+use floresta_mempool::mempool::MempoolError;
 use rustreexo::proof::Proof;
 use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
+use super::UtreexoNodeConfig;
 use super::node::ConnectionKind;
 use super::node::NodeNotification;
 use super::node::PeerStatus;
 use super::transport::TransportProtocol;
-use super::UtreexoNodeConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// A request to addnode that can be made to the node.
@@ -66,6 +66,9 @@ pub enum UserRequest {
 
     /// Return information about all connected peers.
     GetPeerInfo,
+
+    /// Return the number of connected peers.
+    GetConnectionCount,
 
     /// Add a peer to the node's peer list.
     ///
@@ -134,6 +137,9 @@ pub enum NodeResponse {
     /// A response containing a list of peer information.
     GetPeerInfo(Vec<PeerInfo>),
 
+    /// The number of connected peers
+    GetConnectionCount(usize),
+
     /// A response indicating whether a peer was successfully added.
     Add(bool),
 
@@ -150,7 +156,7 @@ pub enum NodeResponse {
     Ping(bool),
 
     /// Transaction broadcast
-    TransactionBroadcastResult(Result<Txid, AcceptToMempoolError>),
+    TransactionBroadcastResult(Result<Txid, MempoolError>),
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +207,7 @@ impl NodeInterface {
     pub async fn broadcast_transaction(
         &self,
         transaction: Transaction,
-    ) -> Result<Result<Txid, AcceptToMempoolError>, oneshot::error::RecvError> {
+    ) -> Result<Result<Txid, MempoolError>, oneshot::error::RecvError> {
         let val = self
             .send_request(UserRequest::SendTransaction(transaction))
             .await?;
@@ -306,6 +312,13 @@ impl NodeInterface {
         let val = self.send_request(UserRequest::GetPeerInfo).await?;
 
         extract_variant!(GetPeerInfo, val);
+    }
+
+    /// Returns the number of peers currently connected to the node
+    pub async fn get_connection_count(&self) -> Result<usize, oneshot::error::RecvError> {
+        let val = self.send_request(UserRequest::GetConnectionCount).await?;
+
+        extract_variant!(GetConnectionCount, val);
     }
 
     /// Pings all connected peers to check if they are alive.

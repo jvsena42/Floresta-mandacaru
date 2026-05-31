@@ -19,9 +19,11 @@
 mod cli;
 #[cfg(unix)]
 mod daemonize;
+mod logger;
 
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
@@ -30,33 +32,34 @@ use std::time::Duration;
 use bitcoin::Network;
 use clap::Parser;
 use cli::Cli;
-use floresta_node::init_logging;
 use floresta_node::Config;
 use floresta_node::Florestad;
-use floresta_node::WorkerGuard;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use tracing::Level;
 use tracing::info;
 
 #[cfg(unix)]
 use crate::daemonize::Daemon;
+use crate::logger::start_logger;
 
 fn main() {
     let params = Cli::parse();
     params.validate();
 
-    // If not provided defaults to `$HOME/.floresta`. Uses a subdirectory for non-mainnet networks.
-    let data_dir = data_dir_path(params.data_dir, params.network);
+    // If not provided, defaults to `$HOME/.floresta`.
+    // Uses a subdirectory for non-mainnet networks.
+    let datadir = datadir_path(params.data_dir, params.network);
 
     // Create the data directory if it doesn't exist
-    fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
-        eprintln!("Could not create data dir {data_dir:?}: {e}");
+    fs::create_dir_all(&datadir).unwrap_or_else(|e| {
+        eprintln!("Could not create data dir {datadir:?}: {e}");
         exit(1);
     });
 
     let config = Config {
-        data_dir,
+        datadir,
         disable_dns_seeds: params.connect.is_some() || params.disable_dns_seeds,
         network: params.network,
         debug: params.debug,
@@ -95,7 +98,7 @@ fn main() {
 
     #[cfg(unix)]
     if params.daemon {
-        let mut daemon = Daemon::new(&config.data_dir);
+        let mut daemon = Daemon::new(&config.datadir);
         if let Some(pid_file) = params.pid_file {
             daemon = daemon.pid_file(pid_file);
         }
@@ -103,17 +106,18 @@ fn main() {
         daemon.fork().expect("failed to daemonize");
     }
 
-    let mut _log_guard: Option<WorkerGuard> = None;
-    if config.log_to_stdout || config.log_to_file {
-        let dir = &config.data_dir;
+    let log_level = match config.debug {
+        true => Level::DEBUG,
+        false => Level::INFO,
+    };
 
-        // Initialize logging (stdout/file) per config and retain the file guard
-        _log_guard = init_logging(dir, config.log_to_file, config.log_to_stdout, config.debug)
-            .unwrap_or_else(|e| {
-                eprintln!("Logging file couldn't be created at {dir:?}: {e}");
-                exit(1);
-            });
-    }
+    // The guard must stay alive until the end of `main` to flush file logs when dropped.
+    let _logger_guard = start_logger(
+        &config.datadir,
+        config.log_to_file,
+        config.log_to_stdout,
+        log_level,
+    );
 
     let _rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -155,81 +159,90 @@ fn main() {
         }
     });
 
-    // drop them outside the async block, so we won't cause a nested drop of the runtime
-    // due to the rpc server, causing a panic.
+    // Drop `florestad` and the runtime.
+    // They are dropped outside the async block to avoid a nested
+    // drop of the runtime due to the RPC server, which panics.
     drop(florestad);
     drop(_rt);
-    drop(_log_guard); // flush file logs on exit
+    // Flush logs to the file system when dropped.
+    drop(_logger_guard);
 }
 
-fn data_dir_path(dir: Option<String>, network: Network) -> String {
-    // base dir: provided `dir` or $HOME/.floresta or "./.floresta"
-    let mut base: PathBuf = dir
-        .as_ref()
-        .map(|s| s.trim_end_matches(['/', '\\']).into())
+/// Assemble the data directory [`PathBuf`] for the given [`Network`].
+///
+/// The data directory path is determined in this order:
+/// - If `base_dir` is provided, it is used as-is.
+/// - If `base_dir` is not provided and the `$HOME` environment
+///   variable is set, `$HOME/.floresta` is used.
+/// - If `base_dir` is not provided and the `$HOME` environment
+///   variable is not set, the current directory is used.
+///
+/// For non-mainnet networks, the data directory is suffixed with
+/// the network name (e.g. `<base_dir>/signet`).
+///
+/// Paths with redundant slashes are automatically normalized.
+fn datadir_path(base_dir: Option<impl AsRef<Path>>, network: Network) -> PathBuf {
+    let base_dir = base_dir
+        .map(|p| {
+            let s = p.as_ref().to_string_lossy().replace('\\', "/");
+            Path::new(&s).components().collect::<PathBuf>()
+        })
         .unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".floresta")
         });
 
-    // network-specific subdir
     match network {
-        Network::Bitcoin => {} // no subdir
-        Network::Signet => base.push("signet"),
-        Network::Testnet => base.push("testnet3"),
-        Network::Testnet4 => base.push("testnet4"),
-        Network::Regtest => base.push("regtest"),
+        Network::Bitcoin => base_dir,
+        Network::Signet => base_dir.join("signet"),
+        Network::Testnet => base_dir.join("testnet3"),
+        Network::Testnet4 => base_dir.join("testnet4"),
+        Network::Regtest => base_dir.join("regtest"),
     }
-
-    base.to_string_lossy().into_owned()
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    /// Test that `datadir_path` returns the expected path for the given [`Network`].
     fn test_data_dir_path() {
-        let net = Network::Bitcoin;
+        // (<input path>, <normalized path>)
+        let paths: &[(&str, &str)] = &[
+            ("path/to/dir", "path/to/dir"),
+            ("path/to/dir/", "path/to/dir"),
+            ("path///", "path"),
+            ("path//to//dir//", "path/to/dir"),
+            ("path\\to\\dir", "path/to/dir"),
+        ];
+        let networks: &[(Network, Option<&str>)] = &[
+            (Network::Bitcoin, None),
+            (Network::Signet, Some("signet")),
+            (Network::Testnet, Some("testnet3")),
+            (Network::Testnet4, Some("testnet4")),
+            (Network::Regtest, Some("regtest")),
+        ];
+
+        for &(input_path, normalized_path) in paths {
+            for &(network, suffix) in networks {
+                let expected_path = match suffix {
+                    Some(s) => PathBuf::from(normalized_path).join(s),
+                    None => PathBuf::from(normalized_path),
+                };
+                assert_eq!(datadir_path(Some(input_path), network), expected_path);
+            }
+        }
+
+        // Default path when none is provided
         let default_expected = dirs::home_dir()
             .unwrap_or(PathBuf::from("."))
             .join(".floresta");
 
         assert_eq!(
-            data_dir_path(None, net),
-            default_expected.display().to_string(),
+            datadir_path(None::<&str>, Network::Bitcoin),
+            default_expected
         );
-
-        // Using other made-up directories
-        let mut path = Some("path/to/dir".into());
-        assert_eq!(data_dir_path(path, net), "path/to/dir");
-
-        path = Some("path/to/dir/".into());
-        assert_eq!(data_dir_path(path, net), "path/to/dir");
-
-        // Test removing the '\' separator
-        path = Some(format!("path{}", '\\'));
-        assert_eq!(data_dir_path(path, net), "path");
-
-        // Test removing many separators
-        path = Some("path///".into());
-        assert_eq!(data_dir_path(path, net), "path");
-
-        // Using other networks
-        for &(net, suffix) in &[
-            (Network::Testnet, "testnet3"),
-            (Network::Testnet4, "testnet4"),
-            (Network::Signet, "signet"),
-            (Network::Regtest, "regtest"),
-        ] {
-            let expected = PathBuf::from("path").join(suffix);
-
-            assert_eq!(
-                data_dir_path(Some("path///".into()), net),
-                expected.display().to_string(),
-            );
-        }
     }
 }

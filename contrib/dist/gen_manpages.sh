@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Convert all markdown files in /doc/rpc/ to man pages in /doc/rpc_man/
 # Must have pandoc installed
 

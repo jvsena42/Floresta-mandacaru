@@ -61,7 +61,7 @@ test-functional-run arg="":
 test-functional-uv-fmt:
     @just check-command uv test-functional-uv-fmt "https://docs.astral.sh/uv/getting-started/installation/"
     uv run black --verbose ./tests
-    uv run pylint --verbose ./tests
+    uv run pylint --verbose $(find ./tests -name "*.py")
 
 # Run the functional tests
 test-functional:
@@ -137,6 +137,14 @@ pcc:
     just lint-features '-- -D warnings'
     just test-features
     just test-functional
+    just check-flake
+
+# Run nix flake check if nix is available and flake files were modified
+check-flake:
+    @if command -v nix >/dev/null && git diff --name-only HEAD | grep -qE '^flake\.(nix|lock)$'; then \
+        echo "Flake files changed, running nix flake check..."; \
+        nix flake check; \
+    fi
 
 # Must have pandoc installed
 # Needs sudo to overwrite existing man pages
@@ -149,7 +157,7 @@ gen-manpages path="":
 # Run typos
 spell-check:
     @just check-command typos spell-check "cargo +nightly install typos-cli --locked"
-    typos
+    typos --config _typos.toml
 
 # Usage:
 #   just install                   # installs both florestad and floresta-cli
