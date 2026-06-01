@@ -565,7 +565,10 @@ impl Florestad {
         #[cfg(not(feature = "compact-filters"))]
         let cfilters = None;
 
+        // Only consumed by the json-rpc server (see `getblockchaininfo`'s
+        // `filters_start`); unused when that feature is off.
         #[cfg(feature = "compact-filters")]
+        #[cfg_attr(not(feature = "json-rpc"), allow(unused_variables))]
         let cfilters_start_resolved: Option<u32> = if self.config.cfilters {
             let chain_tip = blockchain_state.get_height().unwrap_or(0);
             resolve_filter_start_height(self.config.filters_start_height, chain_tip)
@@ -574,6 +577,7 @@ impl Florestad {
         };
 
         #[cfg(not(feature = "compact-filters"))]
+        #[cfg_attr(not(feature = "json-rpc"), allow(unused_variables))]
         let cfilters_start_resolved: Option<u32> = None;
 
         // If this network already allows pow fraud proofs, we should use it instead of assumeutreexo
