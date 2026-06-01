@@ -4,16 +4,16 @@
 
 use std::collections::HashMap;
 
-use bitcoin::block::Header as BlockHeader;
-use bitcoin::block::Version;
-use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use bitcoin::CompactTarget;
 use bitcoin::TxMerkleNode;
-use floresta_chain::pruned_utreexo::flat_chain_store::FlatChainStore;
-use floresta_chain::pruned_utreexo::flat_chain_store::FlatChainStoreConfig;
+use bitcoin::block::Header as BlockHeader;
+use bitcoin::block::Version;
+use bitcoin::hashes::Hash;
 use floresta_chain::ChainStore;
 use floresta_chain::DiskBlockHeader;
+use floresta_chain::pruned_utreexo::flat_chain_store::FlatChainStore;
+use floresta_chain::pruned_utreexo::flat_chain_store::FlatChainStoreConfig;
 use libfuzzer_sys::arbitrary::Arbitrary;
 use libfuzzer_sys::arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
@@ -138,7 +138,7 @@ fuzz_target!(|input: FuzzInput| {
         fork_file_size: Some(64),
         cache_size: Some(15),
         file_permission: Some(0o666),
-        path: temp_dir.path().to_str().unwrap().to_string(),
+        path: temp_dir.path().into(),
     };
 
     let mut store = match FlatChainStore::new(config) {

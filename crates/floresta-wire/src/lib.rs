@@ -17,12 +17,13 @@
     html_favicon_url = "https://raw.githubusercontent.com/getfloresta/floresta-media/master/logo_png/Icon-Green(main).png"
 )]
 
-use bitcoin::block::Header as BlockHeader;
 use bitcoin::Block;
 use bitcoin::Transaction;
+use bitcoin::block::Header as BlockHeader;
 pub use rustreexo;
 #[cfg(not(target_arch = "wasm32"))]
 mod p2p_wire;
+pub use p2p_wire::UtreexoNodeConfig;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::address_man;
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,7 +37,6 @@ pub use p2p_wire::node_context;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::node_interface;
 pub use p2p_wire::transport::TransportProtocol;
-pub use p2p_wire::UtreexoNodeConfig;
 
 /// NodeHooks is a trait that defines the hooks that a node can use to interact with the network
 /// and the blockchain. Every time an event happens, the node will call the corresponding hook.

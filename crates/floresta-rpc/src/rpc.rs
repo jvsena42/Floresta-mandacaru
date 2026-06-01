@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use core::fmt::Debug;
+use std::vec;
 
-use bitcoin::block::Header as BlockHeader;
 use bitcoin::BlockHash;
 use bitcoin::Txid;
 use corepc_types::v29::GetTxOut;
+use corepc_types::v30::GetDeploymentInfo;
 use serde_json::Number;
 use serde_json::Value;
 
@@ -42,7 +43,16 @@ pub trait FlorestaRPC {
     /// in the Bitcoin protocol specification. A header contains the block's version,
     /// the previous block hash, the merkle root, the timestamp, the difficulty target,
     /// and the nonce.
-    fn get_block_header(&self, hash: BlockHash) -> Result<BlockHeader>;
+    #[doc = include_str!("../../../doc/rpc/getblockheader.md")]
+    fn get_block_header(
+        &self,
+        hash: BlockHash,
+        verbosity: Option<bool>,
+    ) -> Result<GetBlockHeaderRes>;
+
+    #[doc = include_str!("../../../doc/rpc/getdeploymentinfo.md")]
+    fn get_deployment_info(&self, blockhash: Option<BlockHash>) -> Result<GetDeploymentInfo>;
+
     /// Gets a transaction from the blockchain
     ///
     /// This method returns a transaction that's cached in our wallet. If the verbosity flag is
@@ -74,24 +84,24 @@ pub trait FlorestaRPC {
 
     /// Returns the current height of the blockchain
     fn get_block_count(&self) -> Result<u32>;
+
+    #[doc = include_str!("../../../doc/rpc/getdifficulty.md")]
+    fn get_difficulty(&self) -> Result<f64>;
     /// Sends a hex-encoded transaction to the network
     ///
     /// This method sends a transaction to the network. The transaction should be encoded as a
     /// hexadecimal string. If the transaction is valid, it will be broadcast to the network, and
     /// return the transaction id. If the transaction is invalid, an error will be returned.
     fn send_raw_transaction(&self, tx: String) -> Result<Txid>;
-    /// Gets the current accumulator for the chain we're on
-    ///
-    /// This method returns the current accumulator for the chain we're on. The accumulator is
-    /// a set of roots, that let's us prove that a UTXO exists in the chain. This method returns
-    /// a vector of hexadecimal strings, each of which is a root in the accumulator.
+    #[doc = include_str!("../../../doc/rpc/getroots.md")]
     fn get_roots(&self) -> Result<Vec<String>>;
-    /// Gets information about the peers we're connected with
-    ///
-    /// This method returns information about the peers we're connected with. This includes
-    /// the peer's IP address, the peer's version, the peer's user agent, the transport protocol
-    /// and the peer's current height.
+    #[doc = include_str!("../../../doc/rpc/getpeerinfo.md")]
     fn get_peer_info(&self) -> Result<Vec<PeerInfo>>;
+    /// Returns the number of peers currently connected to the node.
+    fn get_connection_count(&self) -> Result<usize>;
+    /// Returns general state info regarding P2P networking, in a Bitcoin Core v30
+    /// compatible shape.
+    fn get_network_info(&self) -> Result<GetNetworkInfo>;
     /// Returns a block, given a block hash
     ///
     /// This method returns a block, given a block hash. If the verbosity flag is 0, the block
@@ -104,9 +114,7 @@ pub trait FlorestaRPC {
     /// or is spent, an empty object is returned. If you want to find a utxo that's not in
     /// the cache, you can use the findtxout method.
     fn get_tx_out(&self, tx_id: Txid, outpoint: u32) -> Result<GetTxOut>;
-    /// Stops the florestad process
-    ///
-    /// This can be used to gracefully stop the florestad process.
+    #[doc = include_str!("../../../doc/rpc/stop.md")]
     fn stop(&self) -> Result<String>;
     /// Tells florestad to connect with a peer
     ///
@@ -138,11 +146,11 @@ pub trait FlorestaRPC {
     fn get_memory_info(&self, mode: String) -> Result<GetMemInfoRes>;
     /// Returns stats about our RPC server
     fn get_rpc_info(&self) -> Result<GetRpcInfoRes>;
-    /// Returns for how long florestad has been running, in seconds
+    #[doc = include_str!("../../../doc/rpc/uptime.md")]
     fn uptime(&self) -> Result<u32>;
     /// Returns a list of all descriptors currently loaded in the wallet
     fn list_descriptors(&self) -> Result<Vec<String>>;
-    /// Sends a ping to all peers, checking if they are still alive
+    #[doc = include_str!("../../../doc/rpc/ping.md")]
     fn ping(&self) -> Result<()>;
 }
 
@@ -259,6 +267,18 @@ impl<T: JsonRPCClient> FlorestaRPC for T {
         self.call("getblockcount", &[])
     }
 
+    fn get_deployment_info(&self, blockhash: Option<BlockHash>) -> Result<GetDeploymentInfo> {
+        let params = match blockhash {
+            Some(h) => vec![Value::String(h.to_string())],
+            None => vec![],
+        };
+        self.call("getdeploymentinfo", &params)
+    }
+
+    fn get_difficulty(&self) -> Result<f64> {
+        self.call("getdifficulty", &[])
+    }
+
     fn get_tx_out(&self, tx_id: Txid, outpoint: u32) -> Result<GetTxOut> {
         let result: serde_json::Value = self.call(
             "gettxout",
@@ -293,6 +313,14 @@ impl<T: JsonRPCClient> FlorestaRPC for T {
         self.call("getpeerinfo", &[])
     }
 
+    fn get_connection_count(&self) -> Result<usize> {
+        self.call("getconnectioncount", &[])
+    }
+
+    fn get_network_info(&self) -> Result<GetNetworkInfo> {
+        self.call("getnetworkinfo", &[])
+    }
+
     fn get_best_block_hash(&self) -> Result<BlockHash> {
         self.call("getbestblockhash", &[])
     }
@@ -317,8 +345,16 @@ impl<T: JsonRPCClient> FlorestaRPC for T {
         self.call("getblockfilter", &[Value::Number(Number::from(height))])
     }
 
-    fn get_block_header(&self, hash: BlockHash) -> Result<BlockHeader> {
-        self.call("getblockheader", &[Value::String(hash.to_string())])
+    fn get_block_header(
+        &self,
+        hash: BlockHash,
+        verbosity: Option<bool>,
+    ) -> Result<GetBlockHeaderRes> {
+        let mut params = vec![Value::String(hash.to_string())];
+        if let Some(verbosity) = verbosity {
+            params.push(Value::Bool(verbosity));
+        }
+        self.call("getblockheader", &params)
     }
 
     fn get_blockchain_info(&self) -> Result<GetBlockchainInfoRes> {

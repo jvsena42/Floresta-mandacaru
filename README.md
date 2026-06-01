@@ -14,8 +14,8 @@
     <a href="https://docs.getfloresta.sh">
       <img alt="API Docs" src="https://img.shields.io/badge/docs-floresta-brightgreen"/>
     </a>
-    <a href="https://blog.rust-lang.org/2024/09/05/Rust-1.81.0/">
-      <img alt="MSRV 1.81.0+" src="https://img.shields.io/badge/rustc-1.81.0%2B-orange.svg"/>
+    <a href="https://blog.rust-lang.org/2025/02/20/Rust-1.85.0/">
+        <img src="https://img.shields.io/badge/MSRV-1.85.0%2B-orange.svg"/>
     </a>
     <a href="https://github.com/getfloresta/Floresta/blob/master/LICENSE.md">
       <img src="https://img.shields.io/badge/License-MIT%2FApache--2.0-red.svg"/>
@@ -120,8 +120,12 @@ at your option.
 
 ## Acknowledgments
 
-* [Utreexo](https://eprint.iacr.org/2019/611)
-* [Bitcoin Core](https://github.com/bitcoin/bitcoin)
-* [Rust Bitcoin](https://github.com/rust-bitcoin/rust-bitcoin)
-* [Rust Miniscript](https://github.com/rust-bitcoin/rust-miniscript)
-* [Rust Bitcoin Kernel](https://github.com/TheCharlatan/rust-bitcoinkernel)
+- [Utreexo](https://eprint.iacr.org/2019/611)
+  - [Draft BIP-0181 - Accumulator Specification](https://github.com/kcalvinalvin/bips/blob/2025-08-10-utreexo-bips/bip-0181.md)
+  - [Draft BIP-0182 - Transaction and block validation](https://github.com/kcalvinalvin/bips/blob/2025-08-10-utreexo-bips/bip-0182.md)
+  - [Draft BIP-0183 - Peer Services](https://github.com/kcalvinalvin/bips/blob/2025-08-10-utreexo-bips/bip-0183.md)
+  - Note: the Utreexo BIPs are a work in progress and changes are expected. Their proposed merge into the official BIPs repository is tracked in [bitcoin/bips#1923](https://github.com/bitcoin/bips/pull/1923).
+- [Bitcoin Core](https://github.com/bitcoin/bitcoin)
+- [Rust Bitcoin](https://github.com/rust-bitcoin/rust-bitcoin)
+- [Rust Miniscript](https://github.com/rust-bitcoin/rust-miniscript)
+- [Rust Bitcoin Kernel](https://github.com/TheCharlatan/rust-bitcoinkernel)

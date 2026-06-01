@@ -1,7 +1,8 @@
 [package]
 name = "floresta-wire"
 version = "0.5.1"
-edition = "2021"
+rust-version.workspace = true
+edition.workspace = true
 authors = ["Floresta Developers <contact@getfloresta.org>"]
 description = """
     Some utreexo-aware wire protocol for floresta. You can use this crate
@@ -9,7 +10,7 @@ description = """
     your own transactions.
 """
 repository = "https://github.com/getfloresta/Floresta"
-license = "MIT"
+license.workspace = true
 readme = "README.md"
 keywords = ["bitcoin", "utreexo", "p2p", "networking"]
 categories = ["cryptography::cryptocurrencies", "network-programming"]
@@ -19,13 +20,16 @@ bip324 = { version = "0.10", features = [ "tokio" ] }
 bitcoin = { workspace = true }
 dns-lookup = { workspace = true }
 rand = { workspace = true }
-rustls = { version = "=0.23.27", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustreexo = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 ureq = { version = "3.1", features = ["socks-proxy", "json", "rustls-no-provider"], default-features = false }
+# These pins are needed for MSRV:
+tonic = { version = "=0.14.5" }
+tonic-prost = { version = "=0.14.5" }
 
 # Local dependencies
 floresta-chain = { workspace = true, features = ["flat-chainstore"] }

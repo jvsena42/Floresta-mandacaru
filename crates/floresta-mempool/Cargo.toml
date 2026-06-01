@@ -1,7 +1,8 @@
 [package]
 name = "floresta-mempool"
 version = "0.5.1"
-edition = "2021"
+rust-version.workspace = true
+edition.workspace = true
 authors = ["Floresta Developers <contact@getfloresta.org>"]
 description = """
     A policy-driven, stateful transaction mempool for Floresta,
@@ -9,7 +10,7 @@ description = """
     block template construction.
 """
 repository = "https://github.com/getfloresta/Floresta"
-license = "MIT"
+license.workspace = true
 readme.workspace = true
 keywords = ["bitcoin", "mempool", "transactions"]
 

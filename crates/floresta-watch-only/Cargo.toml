@@ -1,12 +1,13 @@
 [package]
 name = "floresta-watch-only"
 version = "0.5.1"
-edition = "2021"
+rust-version.workspace = true
+edition.workspace = true
 description = "A simple, lightweight and Electrum-First, watch-only wallet"
 authors = ["Floresta Developers <contact@getfloresta.org>"]
 keywords = ["bitcoin", "watch-only", "electrum-server"]
 categories = ["cryptography::cryptocurrencies"]
-license = "MIT"
+license.workspace = true
 repository = "https://github.com/getfloresta/Floresta"
 readme.workspace = true # Floresta/README.md
 
@@ -16,10 +17,11 @@ kv = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["alloc"] }
 tracing = { workspace = true }
+miniscript = { workspace = true, features = ["compiler", "std"] }
 
 # Local dependencies
 floresta-chain = { workspace = true }
-floresta-common = { workspace = true, features = ["descriptors-no-std"] }
+floresta-common = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

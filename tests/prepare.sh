@@ -25,6 +25,8 @@ BINARIES_DIR="$TEMP_DIR/binaries"
 # Dont use mktemp so we can have deterministic results for each version of floresta.
 mkdir -p "$BINARIES_DIR"
 
+BINARIES_DIR="$(cd "$BINARIES_DIR" && pwd)"
+
 # Create a temporary disposable directory, switch to it, and ensure it is removed on function exit
 create_disposable_dir() {
     DISPOSABLE_DIR=$(mktemp -d)
@@ -255,7 +257,12 @@ build_utreexod() {
     cd "$DISPOSABLE_DIR/utreexod"
 
     echo "Building utreexod..."
-    go build -o "$BINARIES_DIR/." . || exit 1
+    go build -o utreexod . || exit 1
+
+    echo "Copying utreexod to binaries directory..."
+    cp -f utreexod "$BINARIES_DIR/utreexod" || exit 1
+    chmod +x "$BINARIES_DIR/utreexod"
+
     echo "Utreexod built successfully."
 }
 

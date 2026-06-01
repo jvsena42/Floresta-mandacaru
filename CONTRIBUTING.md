@@ -34,10 +34,9 @@ When adding a new feature ensure that it is covered by functional tests where po
 When refactoring, structure your PR to make it easy to review and don't
 hesitate to split it into multiple small, focused PRs.
 
-The Minimum Supported Rust Version is **1.81.0** (enforced by our CI).
+The Minimum Supported Rust Version is **1.85.0** (enforced by CI).
 
 Commits should cover both the issue fixed and the solution's rationale.
-
 
 These [guidelines](https://chris.beams.io/posts/git-commit/) should be kept in mind. Commit
 messages follow the ["Conventional Commits 1.0.0"](https://www.conventionalcommits.org/en/v1.0.0/) to make commit histories easier to read by humans and automated tools. The types of commits we use are:
@@ -84,10 +83,10 @@ We welcome everyone to review and give their feedback on changes to Floresta. Th
 
 A review can be a conceptual review, where the reviewer leaves a comment:
 
-- Concept (N)ACK: "I do (not) agree with the general goal of this pull request",
-- Approach (N)ACK: Concept (N)ACK, but "I do (not) agree with the approach of this change".
+- **\[_Concept_] \[_N_]ACK**: "I do \[_not_] agree with the general goal of this pull request",
+- **Approach \[_N_]ACK**: "[_Concept ACK._] I do \[_not_] agree with the approach of this change".
 
-A NACK needs to include a rationale why the change is not worthwhile. NACKs without accompanying reasoning may be disregarded.
+A NACK **needs to include a rationale** why the change is not worthwhile. NACKs without accompanying reasoning may be disregarded.
 
 ### Code Review
 After conceptual agreement on the change, code review can be provided. A review begins with ACK BRANCH_COMMIT, where BRANCH_COMMIT is the top of the PR branch, followed by a description of how the reviewer did the review. The following language is used within pull request comments:
@@ -106,7 +105,7 @@ Coding Conventions
 
 There's a few rules to make sure the code is readable and maintainable. Most of them are checked by `cargo-fmt` and `clippy`, and are enforced by CI. You can run locally `cargo +nightly fmt && cargo +nightly clippy --all` or, if you have the [Just Command Runner](https://github.com/casey/just) you might use `just lint`.
 
-For the sake of clarity, please use an empty line between items, in both the Python and Rust code. Some examples:
+For the sake of clarity, **please use an empty line between items**, in both the Python and Rust code. Some examples:
 
 ```rust
 ///! Awesome module
@@ -179,8 +178,7 @@ If you have `just`, we have a script that performs all the checks we do on CI (t
 
 When it comes to error handling, we prefer exact and meaningful error handling to deliver consumers (developers and users) an accurate error that describes exactly what happened wrong.
 
-Instead of:
-
+**DON'T**:
 ```rust
 /// A function that will give the same error for totally different purposes.
 pub fn validate_block_time(
@@ -196,8 +194,7 @@ pub fn validate_block_time(
 }
 ```
 
-prefer:
-
+**DO**:
 ```rust
 /// A function that exactly explains what can go wrong and why in its code and in return type
 pub fn validate_block_time(
@@ -208,7 +205,7 @@ pub fn validate_block_time(
     let its_too_old = mtp > block_timestamp;
     let its_too_new = block_timestamp > (time.get_time().sub(2 * HOUR));
     if its_too_old {
-        return Err(BlockValidationErrors::BlockTooNew);
+        return Err(BlockValidationErrors::BlockTooOld);
     }
     if its_too_new {
         return Err(BlockValidationErrors::BlockTooNew);
@@ -264,7 +261,7 @@ Given the critical nature of Floresta as a node implementation, we take security
 Testing
 -------
 
-We expect to have 100% test coverage for critical parts, and a decent level of coverage for everything. We have a few types of tests:
+We expect to have 100% test coverage for critical parts, and a decent level of coverage for everything else. We have a few types of tests:
 
   - Unit: Those tests specific parts of the code, and are usually written in Rust. You can run them using `cargo test`. Ideally, every API-exposed function should have their own unit test.
   - Functional: Tests the behavior of the running program, intended to check whether the codebase as a whole works as expected. They are either written in Rust or Python.
@@ -286,7 +283,7 @@ All files MUST include the [SPDX License Identifier](https://spdx.dev/learn/hand
 Release
 -----------
 
-Once a maintainer and the contributors decide we have a stable enough `master` with sufficient features, we will create a new branch at that point. From this point, all new changes will go in the next release. The release branch (named after the version, i.e. 0.8.0) will only accept bugfixes and backports. After sufficient testing and making sure we don't have bugs left, this branch will be released by one of the maintainers.
+Once a maintainer and the contributors decide we have a stable enough `master` with sufficient features, we will create a new branch at that point. From this point, all new changes will go in the next release. The release branch (named after the version, i.e. `0.8.x`) will only accept bugfixes and backports. After sufficient testing and making sure we don't have bugs left, this branch will be released by one of the maintainers.
 
 The release will have pre-built binaries available on github's asset page. They **must** be GPG signed, and have a list of hashes for each asset.
 
@@ -313,10 +310,11 @@ If you have any questions, related to this process or the codebase in general. D
 LLM and AI Agent Usage
 ----------------------
 
-This project does not accept contributions from AI bots. All PRs that appear to come from such accounts will be closed.
+__IMPORTANT__:
+This project does not accept contributions from AI agents. All PRs that appear to come from such accounts will be closed.
 
 Patches created by LLMs and AI agents are also viewed with suspicion unless a human has reviewed them.
 All LLM generated patches MUST have text in the git log and in the PR description that indicates the
 patch was created using an LLM. First time contributions by way of LLM generated patches are not welcome.
 
-Thanks for your time, please be respectful of ours.
+Thank you for your time, please be respectful of ours.

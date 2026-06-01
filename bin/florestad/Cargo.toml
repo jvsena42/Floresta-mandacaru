@@ -1,9 +1,10 @@
 [package]
 name = "florestad"
 version = "0.9.1"
-edition = "2021"
+rust-version.workspace = true
+edition.workspace = true
 authors = ["Floresta Developers <contact@getfloresta.org>"]
-license = "MIT"
+license.workspace = true
 description = """
 The main binary for Floresta, a lightweight Bitcoin node implementation in Rust,
 utilizing Utreexo for efficient state management.
@@ -25,9 +26,12 @@ console-subscriber = { workspace = true, optional = true }
 dirs = { version = "4.0", default-features = false }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-appender = { version = "0.2", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["chrono", "ansi", "env-filter"] }
 
 # Local dependencies
 floresta-node = { workspace = true }
+floresta-common = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2" }

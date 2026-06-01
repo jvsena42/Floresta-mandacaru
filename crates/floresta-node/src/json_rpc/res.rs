@@ -4,12 +4,16 @@ use core::fmt;
 use core::fmt::Debug;
 use core::fmt::Display;
 use core::fmt::Formatter;
+use core::num::TryFromIntError;
+use std::convert::Infallible;
 
 use axum::response::IntoResponse;
+use corepc_types::v30::GetBlockHeaderVerbose;
 use corepc_types::v30::GetBlockVerboseOne;
 use floresta_chain::extensions::HeaderExtError;
 use floresta_common::impl_error_from;
-use floresta_mempool::mempool::AcceptToMempoolError;
+use floresta_mempool::mempool::MempoolError;
+use floresta_watch_only::descriptor::DescriptorError;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -160,6 +164,18 @@ pub enum GetBlockRes {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+/// The response for `getblockheader`, which can be either a raw hex-encoded block header or a verbose
+/// one with all the fields parsed and decoded.
+pub enum GetBlockHeaderRes {
+    /// The raw hex-encoded block header, as returned by `getblockheader` with verbosity false
+    Raw(String),
+
+    /// A verbose block header, as returned by `getblockheader` with verbosity true
+    Verbose(Box<GetBlockHeaderVerbose>),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RpcError {
     pub code: i32,
     pub message: String,
@@ -197,7 +213,7 @@ pub enum JsonRpcError {
     InvalidScript,
 
     /// The provided descriptor is invalid, e.g., if it does not match the expected format
-    InvalidDescriptor(miniscript::Error),
+    InvalidDescriptor(DescriptorError),
 
     /// The requested block is not found in the blockchain
     BlockNotFound,
@@ -253,45 +269,77 @@ pub enum JsonRpcError {
     InvalidTimestamp,
 
     /// Something went wrong when attempting to publish a transaction to mempool
-    MempoolAccept(AcceptToMempoolError),
+    MempoolAccept(MempoolError),
 
     /// A wallet rescan is already running; a second one was requested before it finished.
     RescanInProgress,
+
+    /// A numeric conversion overflows, e.g., u64 to u32
+    ConversionOverflow(String),
 }
 
-impl_error_from!(JsonRpcError, AcceptToMempoolError, MempoolAccept);
+impl_error_from!(JsonRpcError, MempoolError, MempoolAccept);
 
 impl Display for JsonRpcError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            JsonRpcError::InvalidTimestamp => write!(f, "Invalid timestamp, ensure that it is between the genesis and the tip."),
-            JsonRpcError::InvalidRescanVal => write!(f, "Your rescan request contains invalid values"),
-            JsonRpcError::NoAddressesToRescan => write!(f, "You do not have any address to proceed with the rescan"),
+            JsonRpcError::InvalidTimestamp => write!(
+                f,
+                "Invalid timestamp, ensure that it is between the genesis and the tip."
+            ),
+            JsonRpcError::InvalidRescanVal => {
+                write!(f, "Your rescan request contains invalid values")
+            }
+            JsonRpcError::NoAddressesToRescan => {
+                write!(f, "You do not have any address to proceed with the rescan")
+            }
             JsonRpcError::MissingParameter(opt) => write!(f, "Missing parameter: {opt}"),
-            JsonRpcError::InvalidParameterType(opt) => write!(f, "Invalid parameter type for: {opt}"),
+            JsonRpcError::InvalidParameterType(opt) => {
+                write!(f, "Invalid parameter type for: {opt}")
+            }
             JsonRpcError::InvalidRequest => write!(f, "Invalid request"),
-            JsonRpcError::InvalidHex =>  write!(f, "Invalid hex"),
-            JsonRpcError::MethodNotFound =>  write!(f, "Method not found"),
-            JsonRpcError::Decode(e) =>  write!(f, "error decoding request: {e}"),
-            JsonRpcError::TxNotFound =>  write!(f, "Transaction not found"),
-            JsonRpcError::InvalidDescriptor(e) =>  write!(f, "Invalid descriptor: {e}"),
-            JsonRpcError::BlockNotFound =>  write!(f, "Block not found"),
+            JsonRpcError::InvalidHex => write!(f, "Invalid hex"),
+            JsonRpcError::MethodNotFound => write!(f, "Method not found"),
+            JsonRpcError::Decode(e) => write!(f, "error decoding request: {e}"),
+            JsonRpcError::TxNotFound => write!(f, "Transaction not found"),
+            JsonRpcError::InvalidDescriptor(e) => write!(f, "Invalid descriptor: {e}"),
+            JsonRpcError::BlockNotFound => write!(f, "Block not found"),
             JsonRpcError::Chain => write!(f, "Chain error"),
             JsonRpcError::InvalidAddress => write!(f, "Invalid address"),
             JsonRpcError::Node(e) => write!(f, "Node error: {e}"),
-            JsonRpcError::NoBlockFilters => write!(f, "You don't have block filters enabled, please start florestad without --no-cfilters to run this RPC"),
-            JsonRpcError::InInitialBlockDownload => write!(f, "Node is in initial block download, wait until it's finished"),
+            JsonRpcError::NoBlockFilters => write!(
+                f,
+                "You don't have block filters enabled, please start florestad without --no-cfilters to run this RPC"
+            ),
+            JsonRpcError::InInitialBlockDownload => write!(
+                f,
+                "Node is in initial block download, wait until it's finished"
+            ),
             JsonRpcError::InvalidScript => write!(f, "Invalid script"),
             JsonRpcError::InvalidVerbosityLevel => write!(f, "Invalid verbosity level"),
-            JsonRpcError::InvalidMemInfoMode => write!(f, "Invalid meminfo mode, should be stats or mallocinfo"),
+            JsonRpcError::InvalidMemInfoMode => {
+                write!(f, "Invalid meminfo mode, should be stats or mallocinfo")
+            }
             JsonRpcError::Wallet(e) => write!(f, "Wallet error: {e}"),
             JsonRpcError::Filters(e) => write!(f, "Error with filters: {e}"),
-            JsonRpcError::ChainWorkOverflow => write!(f, "Overflow while calculating the chain work"),
+            JsonRpcError::ChainWorkOverflow => {
+                write!(f, "Overflow while calculating the chain work")
+            }
             JsonRpcError::InvalidAddnodeCommand => write!(f, "Invalid addnode command"),
-            JsonRpcError::InvalidDisconnectNodeCommand => write!(f, "Invalid disconnectnode command"),
+            JsonRpcError::InvalidDisconnectNodeCommand => {
+                write!(f, "Invalid disconnectnode command")
+            }
             JsonRpcError::PeerNotFound => write!(f, "Peer not found in the peer list"),
-            JsonRpcError::MempoolAccept(e) => write!(f, "Could not send transaction to mempool due to {e}"),
-            JsonRpcError::RescanInProgress => write!(f, "A rescan is already in progress, please wait for it to finish"),
+            JsonRpcError::MempoolAccept(e) => {
+                write!(f, "Could not send transaction to mempool due to {e}")
+            }
+            JsonRpcError::RescanInProgress => {
+                write!(
+                    f,
+                    "A rescan is already in progress, please wait for it to finish"
+                )
+            }
+            JsonRpcError::ConversionOverflow(e) => write!(f, "Numeric conversion overflow: {e}"),
         }
     }
 }
@@ -321,7 +369,19 @@ impl From<HeaderExtError> for JsonRpcError {
     }
 }
 
-impl_error_from!(JsonRpcError, miniscript::Error, InvalidDescriptor);
+impl From<TryFromIntError> for JsonRpcError {
+    fn from(e: TryFromIntError) -> Self {
+        JsonRpcError::ConversionOverflow(e.to_string())
+    }
+}
+
+impl From<Infallible> for JsonRpcError {
+    fn from(e: Infallible) -> Self {
+        JsonRpcError::ConversionOverflow(e.to_string())
+    }
+}
+
+impl_error_from!(JsonRpcError, DescriptorError, InvalidDescriptor);
 
 impl<T: Debug> From<floresta_watch_only::WatchOnlyError<T>> for JsonRpcError {
     fn from(e: floresta_watch_only::WatchOnlyError<T>) -> Self {

@@ -13,25 +13,25 @@ use std::collections::HashMap;
 use bitcoin::OutPoint;
 use bitcoin::Transaction;
 use bitcoinkernel::VERIFY_ALL;
+use floresta_chain::BlockchainError;
 use floresta_chain::pruned_utreexo::consensus::Consensus;
 use floresta_chain::pruned_utreexo::utxo_data::UtxoData;
-use floresta_chain::BlockchainError;
 use serde_json::Value;
+use util::VERIFY_FLAGS_COUNT;
 use util::exclude_individual_flags;
 use util::fill_flags;
 use util::fmt_shift_flags;
 use util::trim_flags;
-use util::VERIFY_FLAGS_COUNT;
 
 // The dummy height that we use for all the test transactions
 const TX_HEIGHT: u32 = 100_000;
 
 /// Defines the types for auto-deserializing the test vectors and the required conversions.
 mod parse {
-    use bitcoin::consensus::encode::deserialize_hex;
     use bitcoin::Amount;
     use bitcoin::TxOut;
     use bitcoin::Txid;
+    use bitcoin::consensus::encode::deserialize_hex;
     use serde::Deserialize;
     use util::parse_flags;
     use util::parse_script;
@@ -139,11 +139,18 @@ pub fn assert_tx(
     match (res, should_pass) {
         (Err(e), true) => panic!(
             "Tx unexpectedly failed with flags = {}\nerror: {:?}\n\n{:#?}\n\n{:#?}\n\nRaw JSON vector: {}",
-            fmt_shift_flags(flags), e, tx, coins, raw
+            fmt_shift_flags(flags),
+            e,
+            tx,
+            coins,
+            raw
         ),
         (Ok(_), false) => panic!(
             "Tx unexpectedly passed with flags = {}\n\n{:#?}\n\n{:#?}\n\nRaw JSON vector: {}",
-            fmt_shift_flags(flags), tx, coins, raw
+            fmt_shift_flags(flags),
+            tx,
+            coins,
+            raw
         ),
         _ => {} // expected fail or success
     }

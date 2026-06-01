@@ -18,10 +18,12 @@
 )]
 #![allow(clippy::manual_is_multiple_of)]
 
+use core::error;
 use core::fmt;
 use core::fmt::Debug;
 use core::fmt::Display;
 use core::fmt::Formatter;
+use std::io;
 use std::sync::PoisonError;
 use std::sync::RwLockWriteGuard;
 
@@ -43,43 +45,46 @@ pub trait BlockFilterStore: Send + Sync {
     fn get_height(&self) -> Option<u32>;
 }
 
+/// Errors that can happen whilst interacting with the [`IterableFilterStore`].
+#[derive(Debug)]
 pub enum IterableFilterStoreError {
-    /// I/O error
-    Io(std::io::Error),
-    /// End of the file
+    /// An I/O error.
+    ///
+    /// See the inner error for more information.
+    Io(io::Error),
+
+    /// The reader reached the end of the file.
     Eof,
-    /// Lock error
-    Poisoned,
-    /// Filter too large, probably a bug
-    FilterTooLarge,
-}
 
-impl Debug for IterableFilterStoreError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            IterableFilterStoreError::Io(e) => write!(f, "I/O error: {e}"),
-            IterableFilterStoreError::Eof => write!(f, "End of file"),
-            IterableFilterStoreError::Poisoned => write!(f, "Lock poisoned"),
-            IterableFilterStoreError::FilterTooLarge => write!(f, "Filter too large"),
-        }
-    }
-}
+    /// The cache lock is poisoned.
+    PoisonedLock,
 
-impl From<std::io::Error> for IterableFilterStoreError {
-    fn from(e: std::io::Error) -> Self {
-        IterableFilterStoreError::Io(e)
-    }
+    /// The filter is larger than [`MAX_FILTER_SIZE`](crate::flat_filters_store::MAX_FILTER_SIZE).
+    OversizedBlockFilter,
 }
 
 impl Display for IterableFilterStoreError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        Debug::fmt(self, f)
+        match self {
+            IterableFilterStoreError::Io(e) => write!(f, "IterableFilterStore I/O Error: {e:?}"),
+            IterableFilterStoreError::Eof => write!(f, "The IterableFilterStore reached EOF"),
+            IterableFilterStoreError::PoisonedLock => write!(f, "The lock is poisoned"),
+            IterableFilterStoreError::OversizedBlockFilter => write!(f, "The filter is too large"),
+        }
+    }
+}
+
+impl error::Error for IterableFilterStoreError {}
+
+impl From<io::Error> for IterableFilterStoreError {
+    fn from(e: io::Error) -> Self {
+        IterableFilterStoreError::Io(e)
     }
 }
 
 impl From<PoisonError<RwLockWriteGuard<'_, FlatFiltersStore>>> for IterableFilterStoreError {
     fn from(_: PoisonError<RwLockWriteGuard<'_, FlatFiltersStore>>) -> Self {
-        IterableFilterStoreError::Poisoned
+        IterableFilterStoreError::PoisonedLock
     }
 }
 

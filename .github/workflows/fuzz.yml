@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 name: Fuzz Tests
 
 on:
@@ -6,12 +8,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_FUZZ_VERSION: 0.11.4
+  CARGO_FUZZ_VERSION: 0.13.1
   APT_CONFIG: |
     Dir::Cache "./.apt-cache";
     Dir::Cache::archives "./.apt-cache/archives";
     Dir::State "./.apt-state";
     Dir::State::lists "./.apt-state/lists/";
+
+permissions: {}
 
 jobs:
   fuzz:
@@ -19,12 +23,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install latest nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          components: rustfmt, clippy
+          persist-credentials: false
+
+      - name: Install Nightly Rust Toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup default nightly
 
       # Calculate cache keys
       - name: Generate cache keys
@@ -34,11 +41,11 @@ jobs:
           # Use '10#' to always treat week number as base-10 (avoids octal when number has a leading zero)
           BIWEEK=$(( (10#$WEEK + 1) / 2 ))
           echo "CACHE_VERSION=${YEAR}(${BIWEEK})" >> $GITHUB_ENV
-          
+
           # Hash of all files that could affect the build
           HASH=$(echo "${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.github/workflows/**') }}")
           echo "BUILD_HASH=${HASH}" >> $GITHUB_ENV
-          
+
           # Hash of apt packages we need
           APT_PACKAGES="build-essential cmake clang"
           echo "APT_HASH=$(echo $APT_PACKAGES | sha256sum | cut -d' ' -f1)" >> $GITHUB_ENV
@@ -47,7 +54,7 @@ jobs:
       # Restore Rust build cache
       - name: Restore Rust cache
         id: cache-rust
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -56,15 +63,16 @@ jobs:
             ~/.cargo/bin/cargo-fuzz
             target/
             fuzz/target/
-          key: ${{ runner.os }}-cargo-${{ env.CACHE_VERSION }}-${{ env.BUILD_HASH }}
+          key: ${{ runner.os }}-cargo-${{ env.CACHE_VERSION }}-fuzz${{ env.CARGO_FUZZ_VERSION }}-${{ env.BUILD_HASH }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ env.CACHE_VERSION }}-
-            ${{ runner.os }}-cargo-
+              ${{ runner.os }}-cargo-${{ env.CACHE_VERSION }}-fuzz${{ env.CARGO_FUZZ_VERSION }}-
+              ${{ runner.os }}-cargo-${{ env.CACHE_VERSION }}-
+              ${{ runner.os }}-cargo-
 
       # Restore apt packages cache
       - name: Restore apt cache
         id: cache-apt
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ./.apt-cache
@@ -86,7 +94,7 @@ jobs:
       # Install cargo-fuzz only if not found in cache
       - name: Install cargo-fuzz
         if: steps.cache-rust.outputs.cache-hit != 'true'
-        run: cargo +nightly install cargo-fuzz --locked --force
+        run: cargo +nightly install cargo-fuzz --version ${{ env.CARGO_FUZZ_VERSION }} --force
 
       # Pull corpus data from the floresta-qa-assets repository
       - name: Pull corpus data
@@ -102,13 +110,13 @@ jobs:
           cargo +nightly fuzz list
           for target in $(cargo fuzz list); do
             echo "Running fuzz target: $target"
-            cargo +nightly fuzz run $target -- -max_total_time=60
+            CARGO_PROFILE_RELEASE_LTO=false cargo +nightly fuzz run $target -- -max_total_time=60
           done
 
       # Save Rust cache if there was no exact match
       - name: Save Rust cache
         if: success() && steps.cache-rust.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -122,7 +130,7 @@ jobs:
       # Save apt cache if there was no exact match
       - name: Save apt cache
         if: success() && steps.cache-apt.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ./.apt-cache
@@ -132,7 +140,7 @@ jobs:
       # Upload artifacts (if crashes are found)
       - name: Upload artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts

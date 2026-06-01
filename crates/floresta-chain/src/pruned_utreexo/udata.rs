@@ -3,14 +3,14 @@
 //! UData is the serialized data used for proof propagation in utreexo. It contains all
 //! data needed for validating some piece of information, like a transaction and a block.
 
-use bitcoin::consensus;
-use bitcoin::consensus::Decodable;
-use bitcoin::consensus::Encodable;
-use bitcoin::hashes::sha256;
-use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use bitcoin::OutPoint;
 use bitcoin::TxOut;
+use bitcoin::consensus;
+use bitcoin::consensus::Decodable;
+use bitcoin::consensus::Encodable;
+use bitcoin::hashes::Hash;
+use bitcoin::hashes::sha256;
 use sha2::Digest;
 use sha2::Sha512_256;
 
@@ -185,11 +185,6 @@ pub mod proof_util {
     use core::fmt::Display;
     use core::fmt::Formatter;
 
-    use bitcoin::blockdata::script;
-    use bitcoin::blockdata::script::Instruction;
-    use bitcoin::consensus::Encodable;
-    use bitcoin::hashes::sha256;
-    use bitcoin::hashes::Hash;
     use bitcoin::Amount;
     use bitcoin::Block;
     use bitcoin::BlockHash;
@@ -203,18 +198,24 @@ pub mod proof_util {
     use bitcoin::Txid;
     use bitcoin::WPubkeyHash;
     use bitcoin::WScriptHash;
+    use bitcoin::blockdata::script;
+    use bitcoin::blockdata::script::Instruction;
+    use bitcoin::consensus::Encodable;
+    use bitcoin::hashes::Hash;
+    use bitcoin::hashes::sha256;
     use floresta_common::impl_error_from;
     use rustreexo::node_hash::BitcoinNodeHash;
     use sha2::Digest;
     use sha2::Sha512_256;
 
     use super::LeafData;
-    use crate::prelude::*;
-    use crate::pruned_utreexo::consensus::UTREEXO_TAG_V1;
-    use crate::pruned_utreexo::utxo_data::UtxoData;
     use crate::BlockchainError;
     use crate::CompactLeafData;
     use crate::ScriptPubKeyKind;
+    use crate::prelude::*;
+    use crate::pruned_utreexo::consensus::Consensus;
+    use crate::pruned_utreexo::consensus::UTREEXO_TAG_V1;
+    use crate::pruned_utreexo::utxo_data::UtxoData;
 
     #[derive(Debug)]
     /// Errors that may occur while reconstructing a leaf's scriptPubKey.
@@ -227,6 +228,16 @@ pub mod proof_util {
 
         /// The last instruction in the scriptsig was not an `OP_PUSHBYTES`.
         NotPushBytes,
+    }
+
+    impl Display for LeafErrorKind {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            match self {
+                LeafErrorKind::EmptyStack => write!(f, "Empty stack"),
+                LeafErrorKind::InvalidInstruction(e) => write!(f, "Invalid instruction: {e}"),
+                LeafErrorKind::NotPushBytes => write!(f, "Not push bytes"),
+            }
+        }
     }
 
     /// Error while reconstructing a leaf's scriptPubKey, returned by `process_proof`.
@@ -302,20 +313,6 @@ pub mod proof_util {
         })
     }
 
-    /// Checks if a script is unspendable either by its length or if it contains the `OP_RETURN` opcode.
-    /// It follows the implementation on Bitcoin Core.
-    fn is_unspendable(script: &ScriptBuf) -> bool {
-        if script.len() > 10_000 {
-            return true;
-        }
-
-        if !script.is_empty() && script.as_bytes()[0] == 0x6a {
-            return true;
-        }
-
-        false
-    }
-
     /// Computes the hash of a leaf node in the utreexo accumulator.
     #[inline]
     fn get_leaf_hashes(
@@ -376,7 +373,7 @@ pub mod proof_util {
             for (vout, output) in tx.output.iter().enumerate() {
                 let utxo_id = (txid, vout as u32);
 
-                if is_unspendable(&output.script_pubkey) || spent.contains(&utxo_id) {
+                if Consensus::is_unspendable(&output.script_pubkey) || spent.contains(&utxo_id) {
                     // Do not add unspendable nor already spent utxos
                     continue;
                 }
@@ -559,23 +556,23 @@ pub mod proof_util {
 
 #[cfg(test)]
 mod test {
-    use bitcoin::blockdata::script;
-    use bitcoin::consensus::encode::deserialize_hex;
-    use bitcoin::opcodes::all::OP_NOP;
-    use bitcoin::opcodes::all::OP_PUSHBYTES_1;
     use bitcoin::Amount;
     use bitcoin::BlockHash;
     use bitcoin::ScriptBuf;
     use bitcoin::Transaction;
     use bitcoin::TxIn;
+    use bitcoin::blockdata::script;
+    use bitcoin::consensus::encode::deserialize_hex;
+    use bitcoin::opcodes::all::OP_NOP;
+    use bitcoin::opcodes::all::OP_PUSHBYTES_1;
     use floresta_common::bhash;
 
-    use super::proof_util::reconstruct_leaf_data;
     use super::CompactLeafData;
     use super::LeafData;
     use super::ScriptPubKeyKind;
-    use crate::proof_util::reconstruct_script_pubkey;
+    use super::proof_util::reconstruct_leaf_data;
     use crate::proof_util::LeafErrorKind;
+    use crate::proof_util::reconstruct_script_pubkey;
 
     macro_rules! assert_recover_spk {
         (

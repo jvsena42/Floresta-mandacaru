@@ -17,7 +17,6 @@ use core::fmt::Debug;
 use core::fmt::Display;
 use core::fmt::Formatter;
 
-use bitcoin::Network;
 use bitcoin::OutPoint;
 use bitcoin::Txid;
 use floresta_common::impl_error_from;
@@ -28,31 +27,87 @@ use crate::extensions::ChainWorkOverflow;
 use crate::proof_util::UtreexoLeafError;
 use crate::pruned_utreexo::chain_state_builder::BlockchainBuilderError;
 
-pub trait DatabaseError: Debug + Send + Sync + 'static {}
+pub trait DatabaseError: Debug + Display + Send + Sync + 'static {}
 
 #[derive(Debug)]
-/// This is the highest level error type in floresta-chain, returned by the [crate::ChainState] methods.
-/// It represents errors encountered during blockchain validation.
+/// Errors that can happen whilst interacting with the local blockchain.
+///
+/// It's the highest level error type in [`floresta_chain`](crate),
+/// and is returned by [`ChainState`](crate::ChainState) methods.
 pub enum BlockchainError {
+    /// The block is not present in the [`ChainState`](crate::ChainState).
     BlockNotPresent,
+
+    /// The block is an orphan or is invalid.
     OrphanOrInvalidBlock,
-    Parsing(String),
+
+    /// The block failed validation.
     BlockValidation(BlockValidationErrors),
+
+    /// The block contains invalid transaction(s).
     TransactionError(TransactionError),
-    InvalidProof,
-    UtreexoError(StumpError),
+
+    /// The Utreexo proof for this block is invalid.
+    InvalidUtreexoProof,
+
+    /// Error whilst interacting with the [accumulator](rustreexo::stump::Stump).
+    AccumulatorError(StumpError),
+
+    /// Failed to reconstruct a scriptpubkey from a [leaf](crate::pruned_utreexo::udata::CompactLeafData).
     UtreexoLeaf(UtreexoLeafError),
+
+    /// Error whilst interacting with the the [`ChainStore`](crate::ChainStore).
     Database(Box<dyn DatabaseError>),
-    ConsensusDecode(bitcoin::consensus::encode::Error),
+
+    /// The [`ChainState`](crate::ChainState) is not initialized.
     ChainNotInitialized,
+
+    /// The [`ChainState`](crate::ChainState)'s tip is invalid.
     InvalidTip(String),
-    Io(ioError),
-    UnsupportedNetwork(Network),
+
+    /// The [`ChainState`](crate::ChainState)'s validation index is invalid.
     BadValidationIndex,
+
+    /// A [`ChainState`](crate::ChainState) operation overflowed.
     OperationOverflow(ChainWorkOverflow),
 }
 
 impl_error_from!(BlockchainError, ChainWorkOverflow, OperationOverflow);
+impl Display for BlockchainError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlockNotPresent => write!(f, "The block is not present in the ChainState"),
+            Self::OrphanOrInvalidBlock => write!(f, "The block was orphaned or is invalid"),
+            Self::BlockValidation(e) => write!(f, "Failed to validate the block: {e}"),
+            Self::TransactionError(e) => {
+                write!(f, "The block contains invalid transaction(s): {e}")
+            }
+            Self::InvalidUtreexoProof => write!(f, "The Utreexo proof for this block is invalid"),
+            Self::AccumulatorError(e) => {
+                write!(f, "Error whilst interacting with the accumulator: {e:?}")
+            }
+            Self::UtreexoLeaf(e) => write!(
+                f,
+                "Failed to reconstruct a scriptpubkey from Compact Leaf Data: {e}"
+            ),
+            Self::Database(e) => {
+                write!(f, "Error whilst interacting with the the ChainState: {e}")
+            }
+            Self::ChainNotInitialized => write!(f, "The ChainState is not initialized"),
+            Self::InvalidTip(e) => write!(f, "The ChainState's tip is invalid: {e}"),
+            Self::BadValidationIndex => write!(f, "The ChainState's validation index is invalid"),
+            Self::OperationOverflow(_) => write!(f, "A ChainState operation overflowed"),
+        }
+    }
+}
+
+impl Error for BlockchainError {}
+
+impl<T: DatabaseError> From<T> for BlockchainError {
+    fn from(value: T) -> Self {
+        BlockchainError::Database(Box::new(value))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 /// Represents errors encountered during transaction validation.
@@ -86,7 +141,7 @@ pub enum BlockValidationErrors {
     EmptyBlock,
     BlockExtendsAnOrphanChain,
     BadBip34,
-    InvalidProof,
+    InvalidUtreexoProof,
     CoinbaseNotMatured,
     UnspendableUTXO,
     BIP94TimeWarp,
@@ -170,23 +225,20 @@ impl Display for BlockValidationErrors {
                 write!(f, "This block extends a chain we don't have the ancestors")
             }
             BlockValidationErrors::BadBip34 => write!(f, "BIP34 commitment mismatch"),
-            BlockValidationErrors::InvalidProof => write!(f, "Invalid proof"),
+            BlockValidationErrors::InvalidUtreexoProof => write!(f, "Invalid proof"),
             BlockValidationErrors::CoinbaseNotMatured => {
                 write!(f, "Coinbase not matured yet")
             }
             BlockValidationErrors::UnspendableUTXO => {
-                write!(f, "Attempts to spend unspendable UTXO that was overwritten by the historical BIP30 violation")
+                write!(
+                    f,
+                    "Attempts to spend unspendable UTXO that was overwritten by the historical BIP30 violation"
+                )
             }
             BlockValidationErrors::BIP94TimeWarp => {
                 write!(f, "BIP94 time warp detected")
             }
         }
-    }
-}
-
-impl<T: DatabaseError> From<T> for BlockchainError {
-    fn from(value: T) -> Self {
-        BlockchainError::Database(Box::new(value))
     }
 }
 
@@ -196,20 +248,6 @@ impl<T: DatabaseError> From<T> for BlockchainBuilderError {
     }
 }
 
-impl_error_from!(BlockchainError, ioError, Io);
 impl_error_from!(BlockchainError, TransactionError, TransactionError);
-impl_error_from!(
-    BlockchainError,
-    bitcoin::consensus::encode::Error,
-    ConsensusDecode
-);
 impl_error_from!(BlockchainError, BlockValidationErrors, BlockValidation);
-impl_error_from!(BlockchainError, StumpError, UtreexoError);
-
-impl Display for BlockchainError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl Error for BlockchainError {}
+impl_error_from!(BlockchainError, StumpError, AccumulatorError);

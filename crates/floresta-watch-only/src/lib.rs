@@ -15,28 +15,29 @@ use core::fmt::Debug;
 use core::fmt::Display;
 use core::fmt::Formatter;
 
-use bitcoin::hashes::sha256;
+use bitcoin::Network;
 use bitcoin::ScriptBuf;
+use bitcoin::hashes::sha256;
 use floresta_chain::BlockConsumer;
 use floresta_chain::UtxoData;
 use floresta_common::get_spk_hash;
-use floresta_common::parse_descriptors;
 
+pub mod descriptor;
 pub mod kv_database;
 #[cfg(any(test, feature = "memory-database"))]
 pub mod memory_database;
 pub mod merkle;
 
-use bitcoin::consensus::deserialize;
-use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::hash_types::Txid;
-use bitcoin::hashes::hex::FromHex;
-use bitcoin::hashes::sha256::Hash;
-use bitcoin::hashes::Hash as HashTrait;
 use bitcoin::Block;
 use bitcoin::OutPoint;
 use bitcoin::Transaction;
 use bitcoin::TxOut;
+use bitcoin::consensus::deserialize;
+use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::hash_types::Txid;
+use bitcoin::hashes::Hash as HashTrait;
+use bitcoin::hashes::hex::FromHex;
+use bitcoin::hashes::sha256::Hash;
 use floresta_common::prelude::*;
 use merkle::MerkleProof;
 use serde::Deserialize;
@@ -44,11 +45,24 @@ use serde::Serialize;
 use sync::RwLock;
 use tracing::error;
 
+use crate::descriptor::DescriptorError;
+use crate::descriptor::derive_addresses_from_descriptor;
+use crate::descriptor::derive_addresses_from_list_descriptors;
+use crate::descriptor::parse_xpub;
+
+/// How much descriptors to derive each time.
+const DERIVATION_COUNT: u32 = 100;
+
+/// Initial index for address derivation.
+const INDEX_INITIAL: u32 = 0;
+
 #[derive(Debug)]
 pub enum WatchOnlyError<DatabaseError: Debug> {
     WalletNotInitialized,
     TransactionNotFound,
     DatabaseError(DatabaseError),
+    DuplicateDescriptor(String),
+    InvalidDescriptor(DescriptorError),
 }
 
 impl<DatabaseError: Debug> Display for WatchOnlyError<DatabaseError> {
@@ -62,6 +76,12 @@ impl<DatabaseError: Debug> Display for WatchOnlyError<DatabaseError> {
             }
             WatchOnlyError::DatabaseError(e) => {
                 write!(f, "Database error: {e:?}")
+            }
+            WatchOnlyError::DuplicateDescriptor(desc) => {
+                write!(f, "Descriptor is already cached: {desc}")
+            }
+            WatchOnlyError::InvalidDescriptor(e) => {
+                write!(f, "Invalid descriptor: {e:?}")
             }
         }
     }
@@ -161,9 +181,9 @@ pub trait AddressCacheDatabase {
     /// Saves the height of the last block we filtered
     fn set_cache_height(&self, height: u32) -> Result<(), Self::Error>;
     /// Saves the descriptor of associated cache
-    fn desc_save(&self, descriptor: &str) -> Result<(), Self::Error>;
+    fn save_descriptor(&self, descriptor: &str) -> Result<(), Self::Error>;
     /// Get associated descriptors
-    fn descs_get(&self) -> Result<Vec<String>, Self::Error>;
+    fn get_descriptors(&self) -> Result<Vec<String>, Self::Error>;
     /// Get a transaction from the database
     fn get_transaction(&self, txid: &Txid) -> Result<CachedTransaction, Self::Error>;
     /// Saves a transaction to the database
@@ -341,7 +361,7 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
     /// Setup is the first command that should be executed. In a new cache. It sets our wallet's
     /// state, like the height we should start scanning and the wallet's descriptor.
     fn setup(&self) -> Result<(), WatchOnlyError<D::Error>> {
-        if self.database.descs_get().is_err() {
+        if self.database.get_descriptors().is_err() {
             self.database.set_cache_height(0)?;
         }
         Ok(())
@@ -349,25 +369,26 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
 
     fn derive_addresses(&mut self) -> Result<(), WatchOnlyError<D::Error>> {
         let mut stats = self.database.get_stats()?;
-        let descriptors = self.database.descs_get()?;
-        let descriptors = parse_descriptors(&descriptors).expect("We validate those descriptors");
-        for desc in descriptors {
-            let index = stats.derivation_index;
-            for idx in index..(index + 100) {
-                let script = desc
-                    .at_derivation_index(idx)
-                    .expect("We validate those descriptors before saving")
-                    .script_pubkey();
-                self.cache_address(script);
-            }
-        }
-        stats.derivation_index += 100;
+        let descriptors = self.database.get_descriptors()?;
+
+        let addresses = derive_addresses_from_list_descriptors(
+            &descriptors,
+            stats.derivation_index,
+            DERIVATION_COUNT,
+        )
+        .map_err(WatchOnlyError::InvalidDescriptor)?;
+
+        addresses.iter().for_each(|address| {
+            self.cache_address(address.clone());
+        });
+
+        stats.derivation_index += DERIVATION_COUNT;
         Ok(self.database.save_stats(&stats)?)
     }
 
     fn maybe_derive_addresses(&mut self) {
         let stats = self.database.get_stats().unwrap();
-        if stats.transaction_count > (stats.derivation_index as usize * 100) {
+        if stats.transaction_count > (stats.derivation_index as usize * DERIVATION_COUNT as usize) {
             let res = self.derive_addresses();
             if res.is_err() {
                 error!("Error deriving addresses: {res:?}");
@@ -630,10 +651,10 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
     }
 
     /// Tells whether or not a descriptor is already cached
-    pub fn is_cached(&self, desc: &String) -> Result<bool, WatchOnlyError<D::Error>> {
+    pub fn is_cached(&self, desc: &str) -> Result<bool, WatchOnlyError<D::Error>> {
         let inner = self.inner.read().expect("poisoned lock");
-        let known_descs = inner.database.descs_get()?;
-        Ok(known_descs.contains(desc))
+        let known_descs = inner.database.get_descriptors()?;
+        Ok(known_descs.iter().any(|s| s == desc))
     }
 
     /// Tells whether an address is already cached
@@ -642,9 +663,39 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
         inner.address_map.contains_key(script_hash)
     }
 
-    pub fn push_descriptor(&self, descriptor: &str) -> Result<(), WatchOnlyError<D::Error>> {
+    /// Push a descriptor into the wallet checking whether it is already cached, returning an error if so
+    pub fn push_descriptor(
+        &self,
+        descriptor: &str,
+    ) -> Result<Vec<ScriptBuf>, WatchOnlyError<D::Error>> {
+        if self.is_cached(descriptor)? {
+            return Err(WatchOnlyError::DuplicateDescriptor(descriptor.to_string()));
+        }
+
+        let address_descriptors =
+            derive_addresses_from_descriptor(descriptor, INDEX_INITIAL, DERIVATION_COUNT)
+                .map_err(WatchOnlyError::InvalidDescriptor)?;
+
+        for address in address_descriptors.clone() {
+            self.cache_address(address);
+        }
+
         let inner = self.inner.write().expect("poisoned lock");
-        Ok(inner.database.desc_save(descriptor)?)
+        inner.database.save_descriptor(descriptor)?;
+
+        Ok(address_descriptors)
+    }
+
+    /// Adds an XPUB to the wallet, derives descriptors from it, saves these descriptors persistently,
+    /// derives addresses, and caches them if they're not cached already.
+    pub fn push_xpub(&self, xpub: &str, network: Network) -> Result<(), WatchOnlyError<D::Error>> {
+        let descriptors = parse_xpub(xpub, network).map_err(WatchOnlyError::InvalidDescriptor)?;
+
+        for descriptor in descriptors {
+            self.push_descriptor(&descriptor)?;
+        }
+
+        Ok(())
     }
 
     pub fn get_position(&self, txid: &Txid) -> Option<u32> {
@@ -758,7 +809,7 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
         let inner = self.inner.read().expect("poisoned lock");
         inner
             .database
-            .descs_get()
+            .get_descriptors()
             .map_err(WatchOnlyError::DatabaseError)
     }
 
@@ -792,20 +843,21 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
 mod test {
     use core::str::FromStr;
 
-    use bitcoin::address::NetworkChecked;
-    use bitcoin::consensus::deserialize;
-    use bitcoin::consensus::Decodable;
-    use bitcoin::hashes::hex::FromHex;
-    use bitcoin::hashes::sha256;
     use bitcoin::Address;
     use bitcoin::OutPoint;
     use bitcoin::ScriptBuf;
     use bitcoin::Txid;
+    use bitcoin::address::NetworkChecked;
+    use bitcoin::consensus::Decodable;
+    use bitcoin::consensus::deserialize;
+    use bitcoin::hashes::hex::FromHex;
+    use bitcoin::hashes::sha256;
     use floresta_common::get_spk_hash;
     use floresta_common::prelude::*;
 
-    use super::memory_database::MemoryDatabase;
     use super::AddressCache;
+    use super::memory_database::MemoryDatabase;
+    use crate::DERIVATION_COUNT;
     use crate::merkle::MerkleProof;
 
     const BLOCK_FIRST_UTXO: &str = "00000020b4f594a390823c53557c5a449fa12413cbbae02be529c11c4eb320ff8e000000dd1211eb35ca09dc0ee519b0f79319fae6ed32c66f8bbf353c38513e2132c435474d81633c4b011e195a220002010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff0403edce01feffffff028df2052a0100000016001481113cad52683679a83e76f76f84a4cfe36f75010000000000000000776a24aa21a9ed67863b4f356b7b9f3aab7a2037615989ef844a0917fb0a1dcd6c23a383ee346b4c4fecc7daa2490047304402203768ff10a948a2dd1825cc5a3b0d336d819ea68b5711add1390b290bf3b1cba202201d15e73791b2df4c0904fc3f7c7b2f22ab77762958e9bc76c625138ad3a04d290100012000000000000000000000000000000000000000000000000000000000000000000000000002000000000101be07b18750559a418d144f1530be380aa5f28a68a0269d6b2d0e6ff3ff25f3200000000000feffffff0240420f00000000001600142b6a2924aa9b1b115d1ac3098b0ba0e6ed510f2a326f55d94c060000160014c2ed86a626ee74d854a12c9bb6a9b72a80c0ddc50247304402204c47f6783800831bd2c75f44d8430bf4d962175349dc04d690a617de6c1eaed502200ffe70188a6e5ad89871b2acb4d0f732c2256c7ed641d2934c6e84069c792abc012103ba174d9c66078cf813d0ac54f5b19b5fe75104596bdd6c1731d9436ad8776f41ecce0100";
@@ -906,9 +958,11 @@ mod test {
         );
 
         // [get_cached_transaction]
-        assert!(cache
-            .get_cached_transaction(&transaction.compute_txid())
-            .is_some());
+        assert!(
+            cache
+                .get_cached_transaction(&transaction.compute_txid())
+                .is_some()
+        );
 
         // [get_address_utxos]
         let tx_out = transaction.output[0].clone();
@@ -981,11 +1035,14 @@ mod test {
         // [is_cached], [push_descriptor]
         let desc = "wsh(sortedmulti(1,[54ff5a12/48h/1h/0h/2h]tpubDDw6pwZA3hYxcSN32q7a5ynsKmWr4BbkBNHydHPKkM4BZwUfiK7tQ26h7USm8kA1E2FvCy7f7Er7QXKF8RNptATywydARtzgrxuPDwyYv4x/<0;1>/*,[bcf969c0/48h/1h/0h/2h]tpubDEFdgZdCPgQBTNtGj4h6AehK79Jm4LH54JrYBJjAtHMLEAth7LuY87awx9ZMiCURFzFWhxToRJK6xp39aqeJWrG5nuW3eBnXeMJcvDeDxfp/<0;1>/*))#fuw35j0q";
         cache.push_descriptor(desc).unwrap();
-        assert!(cache.is_cached(&desc.to_string()).unwrap());
+        assert!(cache.is_cached(desc).unwrap());
 
         // [derive_addresses]
         cache.derive_addresses().unwrap();
-        assert_eq!(cache.get_stats().unwrap().derivation_index, 100);
+        assert_eq!(
+            cache.get_stats().unwrap().derivation_index,
+            DERIVATION_COUNT
+        );
     }
 
     #[test]

@@ -6,10 +6,10 @@ use std::io::Cursor;
 
 use arbitrary::Arbitrary;
 use arbitrary::Unstructured;
+use bitcoin::BlockHash;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
-use bitcoin::BlockHash;
 use floresta_chain::BestChain;
 use libfuzzer_sys::fuzz_target;
 

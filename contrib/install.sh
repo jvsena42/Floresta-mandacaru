@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 if [ "$EUID" -eq 0 ]; then
     echo "❌ Do not run this script as root or with sudo. It's too dangerous."
     exit 1

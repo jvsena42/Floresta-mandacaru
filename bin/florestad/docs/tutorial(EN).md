@@ -45,17 +45,17 @@ For multisig addresses, a wallet like Sparrow is recommended. Simply copy the "o
 See [below](#config_example) for an example of a valid file.
 
 ```bash
-floresta -c config.toml --network signet run
+florestad -c config.toml --network signet
 ```
 or
 
 ```bash
-./target/release/floresta -c config.toml --network signet run
+./target/release/florestad -c config.toml --network signet
 ```
 or
 
 ```bash
-cargo run --release -- -c config.toml --network signet run
+cargo run --release --bin florestad -- -c config.toml --network signet
 ```
 Where:
 

@@ -2,22 +2,22 @@
 
 use std::time::Instant;
 
-use bitcoin::p2p::ServiceFlags;
 use bitcoin::Block;
 use bitcoin::BlockHash;
-use floresta_chain::proof_util;
-use floresta_chain::proof_util::UtreexoLeafError;
+use bitcoin::p2p::ServiceFlags;
 use floresta_chain::BlockValidationErrors;
 use floresta_chain::BlockchainError;
 use floresta_chain::ChainBackend;
 use floresta_chain::CompactLeafData;
+use floresta_chain::proof_util;
+use floresta_chain::proof_util::UtreexoLeafError;
 use floresta_common::service_flags;
+use floresta_common::try_and_log;
 use rustreexo::proof::Proof;
 use tracing::debug;
 use tracing::error;
 use tracing::warn;
 
-use super::try_and_log;
 use super::InflightRequests;
 use super::NodeRequest;
 use super::UtreexoNode;
@@ -316,8 +316,8 @@ where
             BlockchainError::TransactionError(tx_err) => Some(tx_err.error),
             BlockchainError::BlockValidation(block_err) => Some(block_err),
             // TODO: we need clearer error definitions for utreexo failures
-            BlockchainError::UtreexoError(_) | BlockchainError::InvalidProof => {
-                Some(BlockValidationErrors::InvalidProof)
+            BlockchainError::AccumulatorError(_) | BlockchainError::InvalidUtreexoProof => {
+                Some(BlockValidationErrors::InvalidUtreexoProof)
             }
             _ => None,
         }
@@ -336,7 +336,7 @@ where
         let hash = block.block_hash();
         match e {
             // The utreexo peer sent us an invalid utreexo proof. Block is not yet processed.
-            BlockValidationErrors::InvalidProof => {
+            BlockValidationErrors::InvalidUtreexoProof => {
                 self.blocks
                     .insert(hash, InflightBlock::new(block, block_peer));
 

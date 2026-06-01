@@ -4,12 +4,13 @@ use core::error::Error;
 use core::fmt;
 use core::fmt::Display;
 use core::fmt::Formatter;
+use std::path::Path;
 
+use bitcoin::Txid;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::encode::Error as EncodingError;
 use bitcoin::consensus::serialize;
 use bitcoin::hashes::Hash;
-use bitcoin::Txid;
 use floresta_common::impl_error_from;
 use floresta_common::prelude::*;
 use kv::Bucket;
@@ -17,54 +18,77 @@ use kv::Config;
 use kv::Store;
 
 use super::AddressCacheDatabase;
+use super::CachedAddress;
+use super::CachedTransaction;
 use super::Stats;
 
+/// A key-value database for the watch-only wallet.
 pub struct KvDatabase(Store, Bucket<'static, String, Vec<u8>>);
-impl KvDatabase {
-    pub fn new(datadir: String) -> Result<KvDatabase> {
-        // Configure the database
-        let cfg = Config::new(datadir);
 
-        // Open the key/value store
-        let store = Store::new(cfg)?;
-        let bucket = store.bucket::<String, Vec<u8>>(Some("addresses"))?;
-        Ok(KvDatabase(store, bucket))
+impl KvDatabase {
+    /// Create a new [`KvDatabase`] inside the `datadir`.
+    pub fn new(datadir: impl AsRef<Path>) -> Result<KvDatabase> {
+        let kv_db_config = Config::new(datadir);
+
+        let kv_db_store = Store::new(kv_db_config)?;
+        let kv_db_bucket = kv_db_store.bucket::<String, Vec<u8>>(Some("addresses"))?;
+
+        Ok(KvDatabase(kv_db_store, kv_db_bucket))
     }
 }
+
+/// Errors related to the [`KvDatabase`].
 #[derive(Debug)]
 pub enum KvDatabaseError {
+    /// A [`kv`] error.
     KvError(kv::Error),
+
+    /// A [`serde_json`] error.
     SerdeJsonError(serde_json::Error),
+
+    /// The wallet is not initialized.
     WalletNotInitialized,
+
+    /// Failed to deseriliaze data.
     DeserializeError(EncodingError),
+
+    /// The [`CachedTransaction`] was not found.
     TransactionNotFound,
 }
-impl_error_from!(KvDatabaseError, serde_json::Error, SerdeJsonError);
-impl_error_from!(KvDatabaseError, kv::Error, KvError);
-impl_error_from!(KvDatabaseError, EncodingError, DeserializeError);
 
 impl Display for KvDatabaseError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            KvDatabaseError::KvError(e) => write!(f, "KvError: {e}"),
-            KvDatabaseError::SerdeJsonError(e) => write!(f, "SerdeJsonError: {e}"),
-            KvDatabaseError::WalletNotInitialized => write!(f, "WalletNotInitialized"),
-            KvDatabaseError::DeserializeError(e) => write!(f, "DeserializeError: {e}"),
-            KvDatabaseError::TransactionNotFound => write!(f, "TransactionNotFound"),
+            KvDatabaseError::KvError(e) => write!(f, "kv error: {e}"),
+            KvDatabaseError::SerdeJsonError(e) => write!(f, "JSON error: {e}"),
+            KvDatabaseError::WalletNotInitialized => write!(f, "The wallet is not initialized"),
+            KvDatabaseError::DeserializeError(e) => write!(f, "Error whilst deserilializing: {e}"),
+            KvDatabaseError::TransactionNotFound => {
+                write!(f, "The requested transaction was not found in the database")
+            }
         }
     }
 }
 
 impl Error for KvDatabaseError {}
 
+impl_error_from!(KvDatabaseError, serde_json::Error, SerdeJsonError);
+impl_error_from!(KvDatabaseError, kv::Error, KvError);
+impl_error_from!(KvDatabaseError, EncodingError, DeserializeError);
+
 type Result<T> = floresta_common::prelude::Result<T, KvDatabaseError>;
 
 impl AddressCacheDatabase for KvDatabase {
     type Error = KvDatabaseError;
-    fn load(&self) -> Result<Vec<super::CachedAddress>> {
+
+    /// Load [`CachedAddress`]es from the [`KvDatabase`].
+    fn load(&self) -> Result<Vec<CachedAddress>> {
+        let bucket = &self.1;
         let mut addresses = Vec::new();
-        for item in self.1.iter() {
+
+        for item in bucket.iter() {
             let item = item?;
+
             let key = item.key::<String>()?;
             if *"height" == key || *"desc" == key {
                 continue;
@@ -75,98 +99,131 @@ impl AddressCacheDatabase for KvDatabase {
         }
         Ok(addresses)
     }
-    fn save(&self, address: &super::CachedAddress) {
+
+    /// Save a [`CachedAddress`] to the [`KvDatabase`].
+    fn save(&self, address: &CachedAddress) {
         let key = address.script_hash.to_string();
         let value = serde_json::to_vec(&address).expect("Invalid object serialization");
+        let bucket = &self.1;
 
-        self.1
+        bucket
             .set(&key, &value)
             .expect("Fatal: Database isn't working");
-        self.1.flush().expect("Could not write to disk");
+        bucket.flush().expect("Could not write to disk");
     }
-    fn update(&self, address: &super::CachedAddress) {
+
+    /// Update a [`CachedAddress`] in the [`KvDatabase`].
+    fn update(&self, address: &CachedAddress) {
         self.save(address);
     }
+
+    /// Get the height which [`CachedAddress`]es are cached to.
     fn get_cache_height(&self) -> Result<u32> {
-        let height = self.1.get(&String::from("height"))?;
-        if let Some(height) = height {
-            return Ok(deserialize(&height)?);
+        let bucket = &self.1;
+
+        let cached_height = bucket.get(&String::from("height"))?;
+        if let Some(cached_height) = cached_height {
+            return Ok(deserialize(&cached_height)?);
         }
+
         Err(KvDatabaseError::WalletNotInitialized)
     }
+
+    /// Set the height which [`CachedAddress`]es are cached to.
     fn set_cache_height(&self, height: u32) -> Result<()> {
-        self.1.set(&String::from("height"), &serialize(&height))?;
-        self.1.flush()?;
-        Ok(())
-    }
+        let bucket = &self.1;
 
-    fn desc_save(&self, descriptor: &str) -> Result<()> {
-        let mut descs = self.descs_get()?;
-        descs.push(String::from(descriptor));
-        self.1
-            .set(&String::from("desc"), &serde_json::to_vec(&descs).unwrap())?;
-        self.1.flush()?;
+        bucket.set(&String::from("height"), &serialize(&height))?;
+        bucket.flush()?;
 
         Ok(())
     }
 
-    fn descs_get(&self) -> Result<Vec<String>> {
-        let res = self.1.get(&String::from("desc"))?;
-        if let Some(res) = res {
-            return Ok(serde_json::de::from_slice(&res)?);
+    /// Add a new descriptor to the [`KvDatabase`].
+    fn save_descriptor(&self, descriptor: &str) -> Result<()> {
+        let bucket = &self.1;
+        let mut descriptors = self.get_descriptors()?;
+
+        descriptors.push(String::from(descriptor));
+
+        bucket.set(
+            &String::from("desc"),
+            &serde_json::to_vec(&descriptors).unwrap(),
+        )?;
+        bucket.flush()?;
+
+        Ok(())
+    }
+
+    /// Get the [`KvDatabase`]'s descriptors.
+    fn get_descriptors(&self) -> Result<Vec<String>> {
+        let descriptor = self.1.get(&String::from("desc"))?;
+
+        if let Some(descriptor) = descriptor {
+            return Ok(serde_json::de::from_slice(&descriptor)?);
         }
         Ok(Vec::new())
     }
 
-    fn get_transaction(&self, txid: &bitcoin::Txid) -> Result<super::CachedTransaction> {
-        let store = self.0.bucket::<&[u8], Vec<u8>>(Some("transactions"))?;
-        let res = store.get(&txid.as_byte_array().to_vec().as_slice())?;
-        if let Some(res) = res {
-            return Ok(serde_json::de::from_slice(&res)?);
+    /// Get a [`CachedTransaction`] from the [`KvDatabase`], given its [`Txid`].
+    fn get_transaction(&self, txid: &Txid) -> Result<CachedTransaction> {
+        let tx_store = self.0.bucket::<&[u8], Vec<u8>>(Some("transactions"))?;
+
+        let transaction = tx_store.get(&txid.as_byte_array().to_vec().as_slice())?;
+        if let Some(transaction) = transaction {
+            return Ok(serde_json::de::from_slice(&transaction)?);
         }
         Err(KvDatabaseError::TransactionNotFound)
     }
 
-    fn save_transaction(&self, tx: &super::CachedTransaction) -> Result<()> {
-        let store = self.0.bucket::<&[u8], Vec<u8>>(Some("transactions"))?;
-        let ser_tx = serde_json::to_vec(&tx)?;
-        store.set(
+    /// Save a [`CachedTransaction`] to the [`KvDatabase`].
+    fn save_transaction(&self, tx: &CachedTransaction) -> Result<()> {
+        let tx_store = self.0.bucket::<&[u8], Vec<u8>>(Some("transactions"))?;
+        let bucket = &self.1;
+
+        let serialized_tx = serde_json::to_vec(&tx)?;
+        tx_store.set(
             &tx.tx.compute_txid().as_byte_array().to_vec().as_slice(),
-            &ser_tx,
+            &serialized_tx,
         )?;
-        self.1.flush()?;
+        bucket.flush()?;
 
         Ok(())
     }
 
-    fn get_stats(&self) -> Result<super::Stats> {
-        let store = self.0.bucket::<&[u8], Vec<u8>>(Some("stats"))?;
-        let res = store.get(&String::from("stats").as_bytes())?;
-        if let Some(res) = res {
-            return Ok(serde_json::de::from_slice(&res)?);
-        }
-        Err(KvDatabaseError::TransactionNotFound)
-    }
-
-    fn save_stats(&self, stats: &Stats) -> Result<()> {
-        let store = self.0.bucket::<&[u8], Vec<u8>>(Some("stats"))?;
-        let ser_stats = serde_json::to_vec(&stats)?;
-        store.set(&String::from("stats").as_bytes(), &ser_stats)?;
-        self.1.flush()?;
-
-        Ok(())
-    }
-
-    fn list_transactions(&self) -> Result<Vec<bitcoin::Txid>> {
+    /// List the [`CachedTransaction`]s [`Txid`]s.
+    fn list_transactions(&self) -> Result<Vec<Txid>> {
         let mut transactions = Vec::new();
-        let store = self.0.bucket::<&[u8], Vec<u8>>(Some("transactions"))?;
+        let tx_store = self.0.bucket::<&[u8], Vec<u8>>(Some("transactions"))?;
 
-        for item in store.iter() {
+        for item in tx_store.iter() {
             let item = item?;
             let key = item.key::<&[u8]>()?;
             transactions.push(Txid::from_slice(key).unwrap());
         }
         Ok(transactions)
+    }
+
+    /// Get [`Stats`] about the [`KvDatabase`].
+    fn get_stats(&self) -> Result<Stats> {
+        let stats_store = self.0.bucket::<&[u8], Vec<u8>>(Some("stats"))?;
+
+        let stats = stats_store.get(&String::from("stats").as_bytes())?;
+        if let Some(stats) = stats {
+            return Ok(serde_json::de::from_slice(&stats)?);
+        }
+        Err(KvDatabaseError::TransactionNotFound)
+    }
+
+    /// Save [`Stats`] to the [`KvDatabase`].
+    fn save_stats(&self, stats: &Stats) -> Result<()> {
+        let stats_store = self.0.bucket::<&[u8], Vec<u8>>(Some("stats"))?;
+
+        let ser_stats = serde_json::to_vec(&stats)?;
+        stats_store.set(&String::from("stats").as_bytes(), &ser_stats)?;
+        self.1.flush()?;
+
+        Ok(())
     }
 }
 
@@ -174,12 +231,12 @@ impl AddressCacheDatabase for KvDatabase {
 mod test {
     use core::str::FromStr;
 
+    use bitcoin::Address;
+    use bitcoin::Transaction;
     use bitcoin::address::NetworkChecked;
     use bitcoin::consensus::deserialize;
     use bitcoin::hashes::hex::FromHex;
     use bitcoin::hashes::sha256;
-    use bitcoin::Address;
-    use bitcoin::Transaction;
     use floresta_common::get_spk_hash;
 
     use super::KvDatabase;
@@ -251,8 +308,8 @@ mod test {
         db.set_cache_height(test_height).unwrap();
         assert_eq!(db.get_cache_height().unwrap(), test_height);
 
-        db.desc_save(desc).unwrap();
-        assert_eq!(db.descs_get().unwrap(), vec![desc]);
+        db.save_descriptor(desc).unwrap();
+        assert_eq!(db.get_descriptors().unwrap(), vec![desc]);
 
         db.update(&cache_address);
         assert_eq!(db.load().unwrap()[0].script_hash, cache_address.script_hash);

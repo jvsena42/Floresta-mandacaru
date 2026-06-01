@@ -16,19 +16,38 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::ffi::c_uint;
 
-use bitcoin::blockdata::constants::genesis_block;
-use bitcoin::p2p::ServiceFlags;
-use bitcoin::params::Params;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Network;
+use bitcoin::blockdata::constants::genesis_block;
+use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
+use bitcoin::p2p::ServiceFlags;
+use bitcoin::params::Params;
 use floresta_common::acchashes;
 use floresta_common::bhash;
 use floresta_common::service_flags;
 use rustreexo::node_hash::BitcoinNodeHash;
 
-use crate::prelude::*;
 use crate::AssumeValidArg;
+use crate::prelude::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubsidyHalvingInterval {
+    /// Bitcoin, testnet, testnet4, and signet: 210,000 blocks.
+    Bitcoin,
+
+    /// Regtest: 150 blocks.
+    Regtest,
+}
+
+impl SubsidyHalvingInterval {
+    pub const fn get(self) -> u32 {
+        match self {
+            Self::Bitcoin => SUBSIDY_HALVING_INTERVAL,
+            Self::Regtest => 150,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 /// This struct encapsulates all chain-specific parameters.
@@ -40,7 +59,7 @@ pub struct ChainParams {
     pub genesis: Block,
 
     /// Interval of blocks until the block reward halves
-    pub subsidy_halving_interval: u64,
+    pub subsidy_halving_interval: SubsidyHalvingInterval,
 
     /// When we retarget we expect this many seconds to be elapsed since last time. If
     /// it's more, we decrease difficulty, if it's less we increase difficulty
@@ -316,7 +335,7 @@ impl From<Network> for ChainParams {
                 network,
                 genesis,
                 pow_target_timespan: 14 * 24 * 60 * 60, // two weeks
-                subsidy_halving_interval: 210_000,
+                subsidy_halving_interval: SubsidyHalvingInterval::Bitcoin,
                 coinbase_maturity: 100,
                 segwit_activation_height: 481_824,
                 csv_activation_height: 419_328,
@@ -328,7 +347,7 @@ impl From<Network> for ChainParams {
                 network,
                 genesis,
                 pow_target_timespan: 14 * 24 * 60 * 60, // two weeks
-                subsidy_halving_interval: 210_000,
+                subsidy_halving_interval: SubsidyHalvingInterval::Bitcoin,
                 coinbase_maturity: 100,
                 segwit_activation_height: 834_624,
                 csv_activation_height: 770_112,
@@ -340,7 +359,7 @@ impl From<Network> for ChainParams {
                 network,
                 genesis,
                 pow_target_timespan: 14 * 24 * 60 * 60,
-                subsidy_halving_interval: 210_000,
+                subsidy_halving_interval: SubsidyHalvingInterval::Bitcoin,
                 coinbase_maturity: 100,
                 segwit_activation_height: 1,
                 csv_activation_height: 1,
@@ -352,7 +371,7 @@ impl From<Network> for ChainParams {
                 network,
                 genesis,
                 pow_target_timespan: 14 * 24 * 60 * 60, // two weeks
-                subsidy_halving_interval: 210_000,
+                subsidy_halving_interval: SubsidyHalvingInterval::Bitcoin,
                 coinbase_maturity: 100,
                 csv_activation_height: 1,
                 segwit_activation_height: 1,
@@ -364,7 +383,7 @@ impl From<Network> for ChainParams {
                 network,
                 genesis,
                 pow_target_timespan: 14 * 24 * 60 * 60, // two weeks
-                subsidy_halving_interval: 150,
+                subsidy_halving_interval: SubsidyHalvingInterval::Regtest,
                 coinbase_maturity: 100,
                 csv_activation_height: 0,
                 segwit_activation_height: 0,
@@ -387,6 +406,7 @@ pub fn get_chain_dns_seeds(network: Network) -> Vec<DnsSeed> {
     let x9 = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
     let x49 = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS;
     let x1009 = ServiceFlags::NETWORK | ServiceFlags::WITNESS | service_flags::UTREEXO.into();
+    let x1000 = service_flags::UTREEXO.into();
 
     #[rustfmt::skip]
     match network {
@@ -400,13 +420,15 @@ pub fn get_chain_dns_seeds(network: Network) -> Vec<DnsSeed> {
             seeds.push(DnsSeed::new(Network::Bitcoin, "seed.bitcoin.sprovoost.nl", x49));
             seeds.push(DnsSeed::new(Network::Bitcoin, "dnsseed.emzy.de", x49));
             seeds.push(DnsSeed::new(Network::Bitcoin, "seed.bitcoin.wiz.biz", x49));
+            seeds.push(DnsSeed::new(Network::Bitcoin, "bitcoin.seed.dlsouza.lol", x1000));
         }
         Network::Signet => {
-            seeds.push(DnsSeed::new(Network::Signet, "seed.dlsouza.lol", x1009));
+            seeds.push(DnsSeed::new(Network::Signet, "signet.seed.dlsouza.lol", x1000));
             seeds.push(DnsSeed::new(Network::Signet, "seed.signet.bitcoin.sprovoost.nl", x49));
         }
         Network::Testnet => {
             seeds.push(DnsSeed::new(Network::Testnet, "testnet-seed.bitcoin.jonasschnelli.ch", x49));
+            seeds.push(DnsSeed::new(Network::Testnet, "testnet.seed.dlsouza.lol", x1000));
             seeds.push(DnsSeed::new(Network::Testnet, "seed.tbtc.petertodd.org", x49));
             seeds.push(DnsSeed::new(Network::Testnet, "seed.testnet.bitcoin.sprovoost.nl", x49));
             seeds.push(DnsSeed::new(Network::Testnet, "testnet-seed.bluematt.me", none));
@@ -419,4 +441,61 @@ pub fn get_chain_dns_seeds(network: Network) -> Vec<DnsSeed> {
     };
 
     seeds
+}
+
+/// Returns the buried deployment list for a network, as `(name, activation_height)` pairs.
+///
+/// Heights are sourced from Bitcoin Core's `chainparams.cpp` at v30.2
+/// (commit `4d7d5f6b79d4c11c47e7a828d81296918fd11d4d`):
+/// <https://github.com/bitcoin/bitcoin/blob/4d7d5f6b79d4c11c47e7a828d81296918fd11d4d/src/kernel/chainparams.cpp>
+//
+// TODO: also emit BIP9 deployments (`taproot`, `testdummy`); requires the versionbits state machine.
+pub fn buried_deployments_for(network: Network) -> &'static [(&'static str, u32)] {
+    const BITCOIN_BURIED: &[(&str, u32)] = &[
+        ("bip34", 227_931),
+        ("bip66", 363_725),
+        ("bip65", 388_381),
+        ("csv", 419_328),
+        ("segwit", 481_824),
+    ];
+
+    const TESTNET_BURIED: &[(&str, u32)] = &[
+        ("bip34", 21_111),
+        ("bip66", 330_776),
+        ("bip65", 581_885),
+        ("csv", 770_112),
+        ("segwit", 834_624),
+    ];
+
+    const TESTNET4_BURIED: &[(&str, u32)] = &[
+        ("bip34", 1),
+        ("bip66", 1),
+        ("bip65", 1),
+        ("csv", 1),
+        ("segwit", 1),
+    ];
+
+    const SIGNET_BURIED: &[(&str, u32)] = &[
+        ("bip34", 1),
+        ("bip66", 1),
+        ("bip65", 1),
+        ("csv", 1),
+        ("segwit", 1),
+    ];
+
+    const REGTEST_BURIED: &[(&str, u32)] = &[
+        ("bip34", 1),
+        ("bip66", 1),
+        ("bip65", 1),
+        ("csv", 1),
+        ("segwit", 0),
+    ];
+
+    match network {
+        Network::Bitcoin => BITCOIN_BURIED,
+        Network::Testnet => TESTNET_BURIED,
+        Network::Testnet4 => TESTNET4_BURIED,
+        Network::Signet => SIGNET_BURIED,
+        Network::Regtest => REGTEST_BURIED,
+    }
 }

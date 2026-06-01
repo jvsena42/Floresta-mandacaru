@@ -7,35 +7,36 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use bitcoin::consensus::deserialize;
-use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::hashes::hex::FromHex;
-use bitcoin::hashes::sha256;
 use bitcoin::ScriptBuf;
 use bitcoin::Transaction;
 use bitcoin::TxOut;
 use bitcoin::Txid;
+use bitcoin::consensus::deserialize;
+use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::hashes::hex::FromHex;
+use bitcoin::hashes::sha256;
 use floresta_chain::pruned_utreexo::BlockchainInterface;
 use floresta_common::get_hash_from_u8;
 use floresta_common::get_spk_hash;
 use floresta_common::spsc::Channel;
+use floresta_common::try_and_log;
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 use floresta_compact_filters::network_filters::NetworkFilters;
-use floresta_watch_only::kv_database::KvDatabase;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::CachedTransaction;
+use floresta_watch_only::kv_database::KvDatabase;
 use floresta_wire::node_interface::NodeInterface;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 use tokio_rustls::TlsAcceptor;
 use tracing::debug;
 use tracing::error;
@@ -260,10 +261,10 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         // Methods are in alphabetical order
         match request.method.as_str() {
             "blockchain.block.header" => {
-                let height = get_arg!(request, u64, 0);
+                let height = get_arg!(request, u32, 0);
                 let hash = self
                     .chain
-                    .get_block_hash(height as u32)
+                    .get_block_hash(height)
                     .map_err(|_| super::error::Error::InvalidParams)?;
                 let header = self
                     .chain
@@ -273,27 +274,32 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 json_rpc_res!(request, header)
             }
             "blockchain.block.headers" => {
-                let start_height = get_arg!(request, u64, 0);
-                let count = get_arg!(request, u64, 1);
-                let mut headers = String::new();
-                let count = if count < 2016 { count } else { 2016 };
-                for height in start_height..(start_height + count) {
-                    let hash = self
-                        .chain
-                        .get_block_hash(height as u32)
-                        .map_err(|_| super::error::Error::InvalidParams)?;
+                const MAX_COUNT: u32 = 2016;
 
-                    let header = self
-                        .chain
-                        .get_block_header(&hash)
-                        .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
-                    let header = serialize_hex(&header);
-                    headers.push_str(&header);
-                }
+                let start_height = get_arg!(request, u32, 0);
+                let count = get_arg!(request, u32, 1).min(MAX_COUNT);
+
+                let chain_height = self
+                    .chain
+                    .get_height()
+                    .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
+
+                let end_height =
+                    (chain_height.saturating_add(1)).min(start_height.saturating_add(count));
+
+                let heights = start_height..end_height;
+                let count = heights.len();
+
+                let headers = heights.filter_map(|height| {
+                    let hash = self.chain.get_block_hash(height).ok()?;
+                    let header = self.chain.get_block_header(&hash).ok()?;
+                    Some(serialize_hex(&header))
+                });
+
                 json_rpc_res!(request, {
                     "count": count,
-                    "hex": headers,
-                    "max": 2016
+                    "hex": String::from_iter(headers),
+                    "max": MAX_COUNT,
                 })
             }
             "blockchain.estimatefee" => json_rpc_res!(request, 0.0001),
@@ -350,11 +356,9 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 for (utxo, prevout) in utxos.unwrap().into_iter() {
                     let height = self.address_cache.get_height(&prevout.txid).unwrap();
 
-                    let position = self.address_cache.get_position(&prevout.txid).unwrap();
-
                     final_utxos.push(json!({
                         "height": height,
-                        "tx_pos": position,
+                        "tx_pos": prevout.vout,
                         "tx_hash": prevout.txid,
                         "value": utxo.value
                     }));
@@ -716,10 +720,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
 
         if self.chain.get_height().unwrap() == height {
             for client in &mut self.clients.values() {
-                let res = client.write(serde_json::to_string(&result).unwrap().as_bytes());
-                if res.is_err() {
-                    info!("Could not write to client {client:?}");
-                }
+                try_and_log!(client.write(serde_json::to_string(&result).unwrap().as_bytes()));
             }
         }
 
@@ -827,9 +828,8 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                     "method": "blockchain.scripthash.subscribe",
                     "params": [hash, status_hash]
                 });
-                if let Err(err) = client.write(serde_json::to_string(&notify).unwrap().as_bytes()) {
-                    error!("{err}");
-                }
+
+                try_and_log!(client.write(serde_json::to_string(&notify).unwrap().as_bytes()));
             }
         }
     }
@@ -878,7 +878,9 @@ pub async fn client_accept_loop(
                     let mut first = [0u8; 1];
                     if let Ok(n) = stream.peek(&mut first).await {
                         if n > 0 && first[0] == 0x16 {
-                            warn!("Client attempted a TLS handshake on the plaintext Electrum port; disable TLS for this server (use the non-SSL / ':t' option).");
+                            warn!(
+                                "Client attempted a TLS handshake on the plaintext Electrum port; disable TLS for this server (use the non-SSL / ':t' option)."
+                            );
                             return;
                         }
                     }
@@ -964,15 +966,15 @@ mod test {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use bitcoin::address::NetworkChecked;
-    use bitcoin::block::Header as BlockHeader;
-    use bitcoin::consensus::deserialize;
-    use bitcoin::consensus::Decodable;
-    use bitcoin::hashes::hex::FromHex;
-    use bitcoin::hashes::sha256;
     use bitcoin::Address;
     use bitcoin::Network;
     use bitcoin::Transaction;
+    use bitcoin::address::NetworkChecked;
+    use bitcoin::block::Header as BlockHeader;
+    use bitcoin::consensus::Decodable;
+    use bitcoin::consensus::deserialize;
+    use bitcoin::hashes::hex::FromHex;
+    use bitcoin::hashes::sha256;
     use floresta_chain::AssumeValidArg;
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
@@ -980,19 +982,19 @@ mod test {
     use floresta_common::assert_ok;
     use floresta_common::get_spk_hash;
     use floresta_mempool::Mempool;
+    use floresta_watch_only::AddressCache;
     use floresta_watch_only::kv_database::KvDatabase;
     use floresta_watch_only::merkle::MerkleProof;
-    use floresta_watch_only::AddressCache;
-    use floresta_wire::address_man::AddressMan;
-    use floresta_wire::address_man::SUPPORTED_NETWORKS;
-    use floresta_wire::node::running_ctx::RunningNode;
-    use floresta_wire::node::UtreexoNode;
     use floresta_wire::UtreexoNodeConfig;
-    use rcgen::generate_simple_self_signed;
+    use floresta_wire::address_man::AddressMan;
+    use floresta_wire::address_man::ReachableNetworks;
+    use floresta_wire::node::UtreexoNode;
+    use floresta_wire::node::running_ctx::RunningNode;
     use rcgen::CertifiedKey;
-    use serde_json::json;
+    use rcgen::generate_simple_self_signed;
     use serde_json::Number;
     use serde_json::Value;
+    use serde_json::json;
     use tokio::io::AsyncBufReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::io::BufReader;
@@ -1002,13 +1004,13 @@ mod test {
     use tokio::sync::RwLock;
     use tokio::task;
     use tokio::time::timeout;
-    use tokio_rustls::rustls::pki_types::pem::PemObject;
-    use tokio_rustls::rustls::pki_types::PrivateKeyDer;
-    use tokio_rustls::rustls::ServerConfig;
     use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
 
-    use super::client_accept_loop;
     use super::ElectrumServer;
+    use super::client_accept_loop;
 
     /// A size used for mempool tests, no specific meaning just a randomly
     /// chosen size.
@@ -1105,11 +1107,12 @@ mod test {
         let test_id = rand::random::<u32>();
         let conf = FlatChainStoreConfig::new(format!("./tmp-db/{test_id}.floresta/"));
         let chainstore = FlatChainStore::new(conf).unwrap();
-        let chain = ChainState::<FlatChainStore>::new(
+        let chain = ChainState::<FlatChainStore>::open(
             chainstore,
             Network::Signet,
             AssumeValidArg::Hardcoded,
-        );
+        )
+        .unwrap();
 
         let headers = get_test_signet_headers();
         chain.push_headers(headers, 1).unwrap();
@@ -1119,7 +1122,7 @@ mod test {
             disable_dns_seeds: true,
             network: Network::Signet,
             pow_fraud_proofs: true,
-            datadir: "/tmp-db".to_string(),
+            datadir: "/tmp-db".into(),
             user_agent: "floresta".to_string(),
             ..Default::default()
         };
@@ -1131,7 +1134,7 @@ mod test {
                 Arc::new(Mutex::new(Mempool::new(MEMPOOL_SIZE))),
                 None,
                 Arc::new(RwLock::new(false)),
-                AddressMan::new(None, SUPPORTED_NETWORKS),
+                AddressMan::new(None, &ReachableNetworks::SUPPORTED),
             )
             .unwrap();
 
@@ -1356,9 +1359,11 @@ mod test {
 
         assert_ok!(send_request(mempool_req, port).await);
 
-        assert!(send_request(unsubscribe_req, port).await.unwrap()["result"]
-            .as_bool()
-            .unwrap());
+        assert!(
+            send_request(unsubscribe_req, port).await.unwrap()["result"]
+                .as_bool()
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1395,10 +1400,14 @@ mod test {
             "6bb0665122c7dcecc6e6c45b6384ee2bdce148aea097896e6f3e9e08070353ea".to_string()
         );
 
+        let unspent_response = send_request(unspent_req, port).await.unwrap();
+
         assert_eq!(
-            send_request(unspent_req, port).await.unwrap()["result"][0]["tx_hash"],
+            unspent_response["result"][0]["tx_hash"],
             "6bb0665122c7dcecc6e6c45b6384ee2bdce148aea097896e6f3e9e08070353ea".to_string()
-        )
+        );
+
+        assert_eq!(unspent_response["result"][0]["tx_pos"], 0);
     }
 
     #[tokio::test]

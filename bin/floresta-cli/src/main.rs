@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use core::fmt::Debug;
+use std::path::PathBuf;
 mod parsers;
 
 use anyhow::Ok;
@@ -62,6 +63,7 @@ fn do_request(cmd: &Cli, client: Client) -> anyhow::Result<String> {
         }
         Methods::GetBestBlockHash => serde_json::to_string_pretty(&client.get_best_block_hash()?)?,
         Methods::GetBlockCount => serde_json::to_string_pretty(&client.get_block_count()?)?,
+        Methods::GetDifficulty => serde_json::to_string_pretty(&client.get_difficulty()?)?,
         Methods::GetTxOut { txid, vout } => {
             serde_json::to_string_pretty(&client.get_tx_out(txid, vout)?)?
         }
@@ -85,8 +87,8 @@ fn do_request(cmd: &Cli, client: Client) -> anyhow::Result<String> {
         Methods::SendRawTransaction { tx } => {
             serde_json::to_string_pretty(&client.send_raw_transaction(tx)?)?
         }
-        Methods::GetBlockHeader { hash } => {
-            serde_json::to_string_pretty(&client.get_block_header(hash)?)?
+        Methods::GetBlockHeader { hash, verbosity } => {
+            serde_json::to_string_pretty(&client.get_block_header(hash, verbosity)?)?
         }
         Methods::LoadDescriptor { desc } => {
             serde_json::to_string_pretty(&client.load_descriptor(desc)?)?
@@ -96,6 +98,9 @@ fn do_request(cmd: &Cli, client: Client) -> anyhow::Result<String> {
             serde_json::to_string_pretty(&client.get_block(hash, verbosity)?)?
         }
         Methods::GetPeerInfo => serde_json::to_string_pretty(&client.get_peer_info()?)?,
+        Methods::GetConnectionCount => {
+            serde_json::to_string_pretty(&client.get_connection_count()?)?
+        }
         Methods::Stop => serde_json::to_string_pretty(&client.stop()?)?,
         Methods::AddNode {
             node,
@@ -128,17 +133,21 @@ fn do_request(cmd: &Cli, client: Client) -> anyhow::Result<String> {
         Methods::Uptime => serde_json::to_string_pretty(&client.uptime()?)?,
         Methods::ListDescriptors => serde_json::to_string_pretty(&client.list_descriptors()?)?,
         Methods::Ping => serde_json::to_string_pretty(&client.ping()?)?,
+        Methods::GetNetworkInfo => serde_json::to_string_pretty(&client.get_network_info()?)?,
+        Methods::GetDeploymentInfo { blockhash } => {
+            serde_json::to_string_pretty(&client.get_deployment_info(blockhash)?)?
+        }
     })
 }
 
 #[derive(Debug, Parser)]
-#[command(author = "Davidson Souza", version = "0.1.0", about = r#"
+#[command(author = "Davidson Souza", version = env!("CARGO_PKG_VERSION"), about = r#"
     A simple command line interface to the Floresta JSON RPC interface.
 "#, long_about = None)]
 pub struct Cli {
     /// Sets a custom config file
     #[arg(short, long, value_name = "FILE")]
-    pub config_file: Option<String>,
+    pub config_file: Option<PathBuf>,
     /// Which network should we use
     #[arg(short, long, default_value_t=Network::Bitcoin)]
     pub network: Network,
@@ -196,6 +205,15 @@ pub enum Methods {
         disable_help_subcommand = true
     )]
     GetBlockCount,
+
+    #[doc = include_str!("../../../doc/rpc/getdifficulty.md")]
+    #[command(
+        name = "getdifficulty",
+        about = "Returns the proof-of-work difficulty as a multiple of the minimum difficulty.",
+        long_about = Some(include_str!("../../../doc/rpc/getdifficulty.md")),
+        disable_help_subcommand = true
+    )]
+    GetDifficulty,
 
     /// Returns the proof that one or more transactions were included in a block
     #[command(name = "gettxoutproof")]
@@ -259,8 +277,26 @@ pub enum Methods {
     SendRawTransaction { tx: String },
 
     /// Returns the block header for the given block hash
-    #[command(name = "getblockheader")]
-    GetBlockHeader { hash: BlockHash },
+    #[doc = include_str!("../../../doc/rpc/getblockheader.md")]
+    #[command(
+        name = "getblockheader",
+        about = "Returns the block header for the given block hash",
+        long_about = Some(include_str!("../../../doc/rpc/getblockheader.md")),
+        disable_help_subcommand = true
+    )]
+    GetBlockHeader {
+        hash: BlockHash,
+        verbosity: Option<bool>,
+    },
+
+    #[doc = include_str!("../../../doc/rpc/getdeploymentinfo.md")]
+    #[command(
+        name = "getdeploymentinfo",
+        about = "Returns data regarding deployments of consensus changes.",
+        long_about = Some(include_str!("../../../doc/rpc/getdeploymentinfo.md")),
+        disable_help_subcommand = true
+    )]
+    GetDeploymentInfo { blockhash: Option<BlockHash> },
 
     /// Loads a new descriptor to the watch only wallet
     #[doc = include_str!("../../../doc/rpc/loaddescriptor.md")]
@@ -272,8 +308,13 @@ pub enum Methods {
     )]
     LoadDescriptor { desc: String },
 
-    /// Returns the roots of the current utreexo forest
-    #[command(name = "getroots")]
+    #[doc = include_str!("../../../doc/rpc/getroots.md")]
+    #[command(
+        name = "getroots",
+        about = "Returns the roots of the current utreexo forest",
+        long_about = Some(include_str!("../../../doc/rpc/getroots.md")),
+        disable_help_subcommand = true
+    )]
     GetRoots,
 
     /// Returns a block
@@ -289,9 +330,23 @@ pub enum Methods {
         verbosity: Option<u32>,
     },
 
-    /// Returns information about the peers we are connected to
-    #[command(name = "getpeerinfo")]
+    #[doc = include_str!("../../../doc/rpc/getpeerinfo.md")]
+    #[command(
+        name = "getpeerinfo",
+        about = "Returns information about the peers we are connected to",
+        long_about = Some(include_str!("../../../doc/rpc/getpeerinfo.md")),
+        disable_help_subcommand = true
+    )]
     GetPeerInfo,
+
+    #[doc = include_str!("../../../doc/rpc/getconnectioncount.md")]
+    #[command(
+        name = "getconnectioncount",
+        about = "Returns the number of connections to other nodes",
+        long_about = Some(include_str!("../../../doc/rpc/getconnectioncount.md")),
+        disable_help_subcommand = true
+    )]
+    GetConnectionCount,
 
     /// Returns the value associated with a UTXO, if it's still not spent.
     /// This function only works properly if we have the compact block filters
@@ -299,11 +354,13 @@ pub enum Methods {
     #[command(name = "gettxout")]
     GetTxOut { txid: Txid, vout: u32 },
 
-    /// Request a graceful shutdown of Floresta.
-    ///
-    /// Result:
-    /// "str"    (string) A string with the content 'Floresta stopping'
-    #[command(name = "stop")]
+    #[doc = include_str!("../../../doc/rpc/stop.md")]
+    #[command(
+        name = "stop",
+        about = "Request a graceful shutdown of Floresta.",
+        long_about = Some(include_str!("../../../doc/rpc/stop.md")),
+        disable_help_subcommand = true
+    )]
     Stop,
 
     #[doc = include_str!("../../../doc/rpc/addnode.md")]
@@ -360,17 +417,34 @@ pub enum Methods {
     #[command(name = "getrpcinfo")]
     GetRpcInfo,
 
-    /// Returns for how long the node has been running, in seconds
-    #[command(name = "uptime")]
+    #[doc = include_str!("../../../doc/rpc/uptime.md")]
+    #[command(
+        name = "uptime",
+        about = "Returns for how long the node has been running, in seconds",
+        long_about = Some(include_str!("../../../doc/rpc/uptime.md")),
+        disable_help_subcommand = true
+    )]
     Uptime,
 
     /// Returns a list of all descriptors currently loaded in the wallet
     #[command(name = "listdescriptors")]
     ListDescriptors,
 
-    /// Sends a ping to all peers, checking if they are still alive
-    ///
-    /// Result: json null
-    #[command(name = "ping")]
+    #[doc = include_str!("../../../doc/rpc/ping.md")]
+    #[command(
+        name = "ping",
+        about = "Sends a ping to all peers, checking if they are still alive",
+        long_about = Some(include_str!("../../../doc/rpc/ping.md")),
+        disable_help_subcommand = true
+    )]
     Ping,
+
+    #[doc = include_str!("../../../doc/rpc/getnetworkinfo.md")]
+    #[command(
+        name = "getnetworkinfo",
+        about = "Returns information about the network and connected peers",
+        long_about = Some(include_str!("../../../doc/rpc/getnetworkinfo.md")),
+        disable_help_subcommand = true
+    )]
+    GetNetworkInfo,
 }

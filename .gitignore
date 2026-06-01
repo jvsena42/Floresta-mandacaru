@@ -2,6 +2,7 @@
 /target
 /builds
 /result
+/testdata
 
 # Man-pages
 doc/rpc_man/*.gz
@@ -23,6 +24,7 @@ utreexod/
 # Configuration files
 config.toml
 .pre-commit-config.yaml
+.env
 
 # direnv cache
 .direnv/
@@ -37,6 +39,3 @@ config.toml
 
 # tests pycache
 tests/**/__pycache__/*
-
-# commitizen under nixdevshell
-.cz.toml

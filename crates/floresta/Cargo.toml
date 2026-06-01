@@ -2,7 +2,8 @@
 name = "floresta"
 version = "0.5.1"
 authors = ["Floresta Developers <contact@getfloresta.org>"]
-edition = "2021"
+rust-version.workspace = true
+edition.workspace = true
 description = """
     A modular and extensible framework for building Utreexo based Bitcoin nodes.
 
@@ -17,7 +18,7 @@ description = """
     each crate's documentation for more information on how to use each module.
 """
 repository = "https://github.com/getfloresta/Floresta"
-license = "MIT"
+license.workspace = true
 readme.workspace = true # Floresta/README.md
 keywords = ["bitcoin", "utreexo", "node", "blockchain", "rust"]
 categories = ["cryptography::cryptocurrencies"]

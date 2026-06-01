@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use core::fmt;
 #[cfg(feature = "metrics")]
 use core::net::IpAddr;
 #[cfg(feature = "metrics")]
 use core::net::Ipv4Addr;
 use core::net::SocketAddr;
-use core::fmt;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+use bitcoin::Address;
 pub use bitcoin::Network;
-use floresta_chain::pruned_utreexo::BlockchainInterface;
+use bitcoin::ScriptBuf;
 pub use floresta_chain::AssumeUtreexoValue;
 pub use floresta_chain::AssumeValidArg;
 use floresta_chain::BlockchainError;
@@ -24,20 +26,23 @@ use floresta_chain::FlatChainStore as ChainStore;
 use floresta_chain::FlatChainStoreConfig;
 pub use floresta_chain::SnapshotError;
 pub use floresta_chain::UtreexoSnapshot;
+use floresta_chain::pruned_utreexo::BlockchainInterface;
+use floresta_common::try_and_log;
 #[cfg(feature = "compact-filters")]
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 #[cfg(feature = "compact-filters")]
 use floresta_compact_filters::network_filters::NetworkFilters;
-use floresta_electrum::electrum_protocol::client_accept_loop;
 use floresta_electrum::electrum_protocol::ElectrumServer;
+use floresta_electrum::electrum_protocol::client_accept_loop;
 use floresta_mempool::Mempool;
-use floresta_watch_only::kv_database::KvDatabase;
 use floresta_watch_only::AddressCache;
-use floresta_wire::address_man::AddressMan;
-use floresta_wire::address_man::SUPPORTED_NETWORKS;
-use floresta_wire::node::running_ctx::RunningNode;
-use floresta_wire::node::UtreexoNode;
+use floresta_watch_only::WatchOnlyError;
+use floresta_watch_only::kv_database::KvDatabase;
 use floresta_wire::UtreexoNodeConfig;
+use floresta_wire::address_man::AddressMan;
+use floresta_wire::address_man::ReachableNetworks;
+use floresta_wire::node::UtreexoNode;
+use floresta_wire::node::running_ctx::RunningNode;
 use rcgen::BasicConstraints;
 use rcgen::CertificateParams;
 use rcgen::IsCa;
@@ -49,11 +54,11 @@ use tokio::task;
 use tokio::time::Duration;
 #[cfg(feature = "metrics")]
 use tokio::time::{self};
-use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 use tokio_rustls::rustls::pki_types::PrivateKeyDer;
-use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -64,7 +69,6 @@ use crate::error::FlorestadError;
 use crate::florestad::fs::OpenOptions;
 #[cfg(feature = "json-rpc")]
 use crate::json_rpc;
-use crate::wallet_input::InitialWalletSetup;
 #[cfg(feature = "zmq-server")]
 use crate::zmq::ZMQServer;
 
@@ -87,7 +91,7 @@ pub struct Config {
     /// This directory must be readable and writable by our process. We'll use this dir to store
     /// both chain and wallet data, so this should be kept in a non-volatile medium. We are not
     /// particularly aggressive in disk usage, so we don't need a fast disk to work.
-    pub data_dir: String,
+    pub datadir: PathBuf,
 
     /// Assume that all blocks prior to and including this block have valid scripts.
     ///
@@ -120,7 +124,7 @@ pub struct Config {
     /// used:
     ///     - For vectors, we use the combination of both vectors
     ///     - for mutually exclusive options, this struct has precedence over the config file
-    pub config_file: Option<String>,
+    pub config_file: Option<PathBuf>,
 
     /// A proxy that we should use to connect with others
     ///
@@ -197,7 +201,7 @@ pub struct Config {
     /// ```shell
     /// openssl genpkey -algorithm RSA -out key.pem -pkeyopt rsa_keygen_bits:2048
     /// ```
-    pub tls_key_path: Option<String>,
+    pub tls_key_path: Option<PathBuf>,
 
     /// TLS certificate path (defaults to `{data_dir}/tls/cert.pem`).
     /// It must be PKCS#8-encoded. You can use `openssl` to generate it from a PKCS#8-encoded private key:
@@ -205,7 +209,7 @@ pub struct Config {
     /// ```shell
     /// openssl req -x509 -new -key key.pem -out cert.pem -days 365 -subj "/CN=localhost"
     /// ```
-    pub tls_cert_path: Option<String>,
+    pub tls_cert_path: Option<PathBuf>,
 
     /// Whether to create self signed certificate for `tls_key_path` and `tls_cert_path`.
     pub generate_cert: bool,
@@ -222,10 +226,10 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(network: Network, data_dir: String) -> Self {
+    pub fn new(network: Network, datadir: impl AsRef<Path>) -> Self {
         Self {
             disable_dns_seeds: false,
-            data_dir,
+            datadir: datadir.as_ref().into(),
             assume_valid: AssumeValidArg::Hardcoded,
             wallet_xpub: None,
             wallet_descriptor: None,
@@ -298,7 +302,10 @@ impl fmt::Display for DumpError {
         match self {
             DumpError::NotStarted => write!(f, "daemon has not been started yet"),
             DumpError::NotSynced => {
-                write!(f, "initial block download not finished; dump not yet available")
+                write!(
+                    f,
+                    "initial block download not finished; dump not yet available"
+                )
             }
             DumpError::Chain(e) => write!(f, "chain error while dumping accumulator: {e:?}"),
         }
@@ -354,10 +361,7 @@ fn resolve_filter_start_height(value: Option<i32>, chain_tip: u32) -> Option<u32
 /// (they trigger a wipe on mismatch) because their effective absolute height
 /// depends on context this function does not have.
 #[cfg(feature = "compact-filters")]
-fn store_covers_configured_range(
-    configured: Option<i32>,
-    previously_applied: Option<i32>,
-) -> bool {
+fn store_covers_configured_range(configured: Option<i32>, previously_applied: Option<i32>) -> bool {
     if configured == previously_applied {
         return true;
     }
@@ -426,9 +430,7 @@ impl Florestad {
             std::mem::take(&mut *guard)
         };
         if let Some(chan) = chan {
-            if let Err(e) = chan.await {
-                error!("POSSIBLE BUG: unexpected error while shutting down {e:?}");
-            }
+            try_and_log!(chan.await);
         }
     }
 
@@ -485,23 +487,17 @@ impl Florestad {
     /// This function will return an error if the configured data directory path is not an
     /// **existing and writable directory**, or cannot be validated as such.
     pub async fn start(&self) -> Result<(), FlorestadError> {
-        let data_dir = &self.config.data_dir;
+        let datadir: &Path = self.config.datadir.as_ref();
 
         // Check that the directory exists and is writable
-        Florestad::validate_data_dir(data_dir)?;
+        Florestad::validate_data_dir(datadir)?;
 
         info!("Loading watch-only wallet");
-        let mut wallet = Self::load_wallet(data_dir)?;
-        wallet
-            .setup()
-            .map_err(FlorestadError::CouldNotInitializeWallet)?;
-
-        // Try to add more wallets to watch if needed
-        self.setup_wallet(data_dir, &mut wallet)?;
+        let wallet = self.setup_wallet()?;
 
         info!("Loading blockchain database");
         let blockchain_state = Arc::new(Self::load_chain_state(
-            data_dir.clone(),
+            datadir,
             self.config.network,
             self.config.assume_valid,
         )?);
@@ -513,10 +509,9 @@ impl Florestad {
         #[cfg(feature = "compact-filters")]
         let cfilters = if self.config.cfilters {
             // Block Filters
-            let cfilters_path: PathBuf = (data_dir.clone() + "/cfilters").into();
-            let cfilters_index_path: PathBuf = (data_dir.clone() + "/cfilters-index").into();
-            let cfilters_start_path: PathBuf =
-                (data_dir.clone() + "/cfilters-start-height").into();
+            let cfilters_path: PathBuf = datadir.join("cfilters");
+            let cfilters_index_path: PathBuf = datadir.join("cfilters-index");
+            let cfilters_start_path: PathBuf = datadir.join("cfilters-start-height");
 
             // `filters_start_height` is only consumed once, when the on-disk
             // store is empty. When the user moves to an *earlier* start height
@@ -570,7 +565,10 @@ impl Florestad {
         #[cfg(not(feature = "compact-filters"))]
         let cfilters = None;
 
+        // Only consumed by the json-rpc server (see `getblockchaininfo`'s
+        // `filters_start`); unused when that feature is off.
         #[cfg(feature = "compact-filters")]
+        #[cfg_attr(not(feature = "json-rpc"), allow(unused_variables))]
         let cfilters_start_resolved: Option<u32> = if self.config.cfilters {
             let chain_tip = blockchain_state.get_height().unwrap_or(0);
             resolve_filter_start_height(self.config.filters_start_height, chain_tip)
@@ -579,6 +577,7 @@ impl Florestad {
         };
 
         #[cfg(not(feature = "compact-filters"))]
+        #[cfg_attr(not(feature = "json-rpc"), allow(unused_variables))]
         let cfilters_start_resolved: Option<u32> = None;
 
         // If this network already allows pow fraud proofs, we should use it instead of assumeutreexo
@@ -591,15 +590,22 @@ impl Florestad {
         let picked = self.config.assumeutreexo_value.clone().or(assume_utreexo);
         info!(
             "assume_utreexo precedence: user={}, hardcoded={}, picked={}",
-            self.config.assumeutreexo_value.as_ref().map_or("None".to_string(), |v| format!(
-                "Some(height={} roots={})", v.height, v.roots.len()
-            )),
+            self.config
+                .assumeutreexo_value
+                .as_ref()
+                .map_or("None".to_string(), |v| format!(
+                    "Some(height={} roots={})",
+                    v.height,
+                    v.roots.len()
+                )),
             match self.config.assume_utreexo {
                 true => "Some(hardcoded_for_network)",
                 false => "None",
             },
             picked.as_ref().map_or("None".to_string(), |v| format!(
-                "Some(height={} roots={})", v.height, v.roots.len()
+                "Some(height={} roots={})",
+                v.height,
+                v.roots.len()
             )),
         );
 
@@ -615,7 +621,7 @@ impl Florestad {
             network: self.config.network,
             pow_fraud_proofs: false,
             proxy,
-            datadir: data_dir.clone(),
+            datadir: datadir.into(),
             fixed_peer: self.config.connect.clone(),
             compact_filters: self.config.cfilters,
             assume_utreexo: picked,
@@ -637,7 +643,7 @@ impl Florestad {
             ))),
             cfilters.clone(),
             kill_signal.clone(),
-            AddressMan::new(None, SUPPORTED_NETWORKS),
+            AddressMan::new(None, &ReachableNetworks::SUPPORTED),
         )
         .map_err(|e| FlorestadError::CouldNotCreateChainProvider(format!("{e}")))?;
 
@@ -677,7 +683,9 @@ impl Florestad {
                     .as_ref()
                     .map(|x| Self::resolve_hostname(x, 8332))
                     .transpose()?,
-                format!("{data_dir}/debug.log"),
+                datadir.join("debug.log"),
+                self.config.user_agent.clone(),
+                proxy,
             ));
 
             if self.json_rpc.set(server).is_err() {
@@ -746,20 +754,21 @@ impl Florestad {
             // Generate self-signed TLS certificate, if enabled.
             if self.config.generate_cert {
                 // Create TLS directory, if it does not exist.
-                let tls_dir = format!("{data_dir}/tls");
+                let tls_dir = datadir.join("tls");
                 if !Path::new(&tls_dir).exists() {
                     fs::create_dir_all(&tls_dir).map_err(|e| {
                         FlorestadError::CouldNotCreateTLSDataDir(tls_dir.clone(), e)
                     })?;
-                    info!("Created TLS directory at {tls_dir}");
+                    info!("Created TLS directory at path={}", tls_dir.display());
                 }
 
                 // Create information for the self-signed certificate about the current node.
                 let subject_alt_names = vec!["localhost".to_string()];
 
                 // Define file paths
-                let tls_key_path = format!("{data_dir}/tls/key.pem");
-                let tls_cert_path = format!("{data_dir}/tls/cert.pem");
+                let tls_key_path = datadir.join("tls").join("key.pem");
+
+                let tls_cert_path = datadir.join("tls").join("cert.pem");
 
                 // Create the certificate.
                 Self::generate_self_signed_certificate(
@@ -768,12 +777,12 @@ impl Florestad {
                     subject_alt_names,
                 )?;
 
-                info!("TLS private key saved to {tls_key_path}");
-                info!("TLS certificate saved to {tls_cert_path}");
+                info!("TLS private key saved to path={}", tls_key_path.display());
+                info!("TLS certificate saved to path={}", tls_cert_path.display());
             }
 
             // Assemble TLS configuration from file.
-            let tls_config = self.create_tls_config(data_dir)?;
+            let tls_config = self.create_tls_config(datadir)?;
 
             // Electrum TLS accept loop.
             let tls_listener = TcpListener::bind(electrum_addr_tls)
@@ -831,20 +840,20 @@ impl Florestad {
         Self::from(config)
     }
 
-    pub fn new(network: Network, data_dir: String) -> Self {
-        Self::from_config(Config::new(network, data_dir))
+    pub fn new(network: Network, datadir: impl AsRef<Path>) -> Self {
+        Self::from_config(Config::new(network, datadir))
     }
 
-    fn validate_data_dir(path: &str) -> Result<(), FlorestadError> {
-        let p = Path::new(path);
+    fn validate_data_dir(path: impl AsRef<Path>) -> Result<(), FlorestadError> {
+        let path = path.as_ref();
 
-        let md = fs::metadata(p).map_err(|_| FlorestadError::InvalidDataDir(path.into()))?;
+        let md = fs::metadata(path).map_err(|_| FlorestadError::InvalidDataDir(path.into()))?;
         if !md.is_dir() {
-            return Err(FlorestadError::InvalidDataDir(path.into()));
+            return Err(FlorestadError::InvalidDataDir(path.to_path_buf()));
         }
 
         // Reliable cross-platform writability test:
-        let probe = p.join(".perm_probe");
+        let probe = path.join(".perm_probe");
         if OpenOptions::new()
             .create(true)
             .write(true)
@@ -859,9 +868,18 @@ impl Florestad {
         Ok(())
     }
 
-    /// Loads a config file from disk, returns default if it cannot load it
-    fn get_config_file(path: &str) -> ConfigFile {
-        let data = ConfigFile::from_file(path);
+    /// Load config from disk; prefer explicit `config_file`, otherwise use `{data_dir}/config.toml`.
+    /// Returns default if it cannot load it
+    fn get_config_file(&self) -> ConfigFile {
+        let datadir = &self.config.datadir;
+        let config_file = self.config.config_file.as_ref();
+
+        let path = match config_file {
+            Some(path) => path.clone(),
+            None => datadir.join("config.toml"),
+        };
+
+        let data = ConfigFile::from_file(&path);
 
         if let Ok(data) = data {
             data
@@ -895,85 +913,102 @@ impl Florestad {
         None
     }
 
-    fn load_chain_store(data_dir: String) -> Result<ChainStore, FlorestadError> {
-        let config = FlatChainStoreConfig::new(data_dir + "/chaindata");
-        ChainStore::new(config).map_err(FlorestadError::CouldNotCreateFlatChainStore)
-    }
-
     fn load_chain_state(
-        data_dir: String,
+        datadir: impl AsRef<Path>,
         network: Network,
         assume_valid: AssumeValidArg,
     ) -> Result<ChainState<ChainStore>, FlorestadError> {
-        let db = Self::load_chain_store(data_dir.clone())?;
+        let chain_store_config = FlatChainStoreConfig::new(datadir.as_ref().join("chaindata"));
 
-        ChainState::<ChainStore>::load_chain_state(db, network, assume_valid).or_else(|e| match e {
-            BlockchainError::ChainNotInitialized => {
-                let db = Self::load_chain_store(data_dir)?;
-                Ok(ChainState::new(db, network, assume_valid))
-            }
-            anyerr => Err(FlorestadError::CouldNotLoadFlatChainStore(anyerr)),
-        })
+        let chain_store = ChainStore::new(chain_store_config)
+            .map_err(|e| FlorestadError::CouldNotLoadFlatChainStore(e.into()))?;
+
+        ChainState::open(chain_store, network, assume_valid)
+            .map_err(FlorestadError::CouldNotLoadFlatChainStore)
     }
 
-    fn load_wallet(data_dir: &String) -> Result<AddressCache<KvDatabase>, FlorestadError> {
-        let database =
-            KvDatabase::new(data_dir.to_owned()).map_err(FlorestadError::CouldNotOpenKvDatabase)?;
-        Ok(AddressCache::new(database))
-    }
+    /// Setup the wallet by initializing the database and adding descriptors, xpubs, and addresses.
+    fn setup_wallet(&self) -> Result<AddressCache<KvDatabase>, FlorestadError> {
+        let database = KvDatabase::new(&self.config.datadir)
+            .map_err(FlorestadError::CouldNotOpenKvDatabase)?;
 
-    fn setup_wallet(
-        &self,
-        data_dir: &str,
-        wallet: &mut AddressCache<KvDatabase>,
-    ) -> Result<(), FlorestadError> {
-        // The config file inside our data directory or inside the specified directory
-        let config_file = match self.config.config_file {
-            Some(ref path) => Self::get_config_file(path),
-            None => {
-                let default_path = format!("{data_dir}/config.toml");
-                Self::get_config_file(&default_path)
-            }
-        };
-        let setup = self.prepare_wallet_setup(config_file)?;
+        let wallet = AddressCache::new(database);
+
+        wallet
+            .setup()
+            .map_err(FlorestadError::CouldNotInitializeWallet)?;
 
         // Add the configured descriptors and addresses to the wallet
-        for descriptor in setup.descriptors {
-            let descriptor = descriptor.to_string();
-            let is_cached = wallet.is_cached(&descriptor)?;
-
-            if !is_cached {
-                wallet.push_descriptor(&descriptor)?;
+        for descriptor in self.get_descriptors() {
+            match wallet.push_descriptor(&descriptor) {
+                Ok(_) => info!("Added descriptor to wallet: {descriptor}"),
+                Err(WatchOnlyError::DuplicateDescriptor(_)) => {
+                    warn!("Descriptor already exists in wallet, skipping: {descriptor}");
+                }
+                Err(e) => {
+                    return Err(FlorestadError::from(e));
+                }
             }
         }
-        for addresses in setup.addresses {
-            wallet.cache_address(addresses.script_pubkey());
+
+        for xpub in self.get_xpubs() {
+            match wallet.push_xpub(&xpub, self.config.network) {
+                Ok(()) => info!("Added xpubs to wallet: {xpub}"),
+                Err(WatchOnlyError::DuplicateDescriptor(_)) => warn!(
+                    "Descriptor for the provided XPUB already exists in the wallet. Skipping: {xpub}"
+                ),
+                Err(e) => return Err(FlorestadError::from(e)),
+            }
+        }
+
+        for address in self.get_addresses()? {
+            wallet.cache_address(address);
         }
 
         info!("Wallet setup completed!");
-        Ok(())
+        Ok(wallet)
     }
 
-    /// Parses the configured list of xpubs, output descriptors and addresses to watch for, and
-    /// returns the constructed `InitialWalletSetup`.
-    fn prepare_wallet_setup(
-        &self,
-        config_file: ConfigFile,
-    ) -> Result<InitialWalletSetup, FlorestadError> {
-        let config = &self.config;
+    /// Get the wallet descriptors from the config file
+    fn get_descriptors(&self) -> Vec<String> {
+        self.config
+            .wallet_descriptor
+            .iter()
+            .flatten()
+            .chain(self.get_config_file().wallet.descriptors.iter().flatten())
+            .cloned()
+            .collect()
+    }
 
-        let mut xpubs = Vec::new();
-        xpubs.extend(config.wallet_xpub.clone().unwrap_or_default());
-        xpubs.extend(config_file.wallet.xpubs.unwrap_or_default());
-        xpubs.extend(Self::get_key_from_env());
+    /// Get the wallet xpubs from the config file and the environment
+    fn get_xpubs(&self) -> Vec<String> {
+        self.config
+            .wallet_xpub
+            .iter()
+            .flatten()
+            .chain(self.get_config_file().wallet.xpubs.iter().flatten())
+            .chain(Self::get_key_from_env().iter())
+            .cloned()
+            .collect()
+    }
 
-        let mut descriptors = Vec::new();
-        descriptors.extend(config.wallet_descriptor.clone().unwrap_or_default());
-        descriptors.extend(config_file.wallet.descriptors.unwrap_or_default());
-
-        let addresses = config_file.wallet.addresses.unwrap_or_default();
-
-        InitialWalletSetup::build(&xpubs, &descriptors, &addresses, config.network, 100)
+    /// Get the wallet addresses from the config file
+    fn get_addresses(&self) -> Result<Vec<ScriptBuf>, FlorestadError> {
+        self.get_config_file()
+            .wallet
+            .addresses
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|addr_str| {
+                Address::from_str(addr_str)
+                    .map(|addr| addr.assume_checked().script_pubkey())
+                    .map_err(|e| {
+                        error!("Invalid address provided: {addr_str} \nReason: {e:?}");
+                        FlorestadError::from(e)
+                    })
+            })
+            .collect()
     }
 
     /// Get the default Electrum port for the Network and TLS combination.
@@ -1001,8 +1036,8 @@ impl Florestad {
 
     /// Generate a self-signed TLS certificate from a random private key.
     pub fn generate_self_signed_certificate(
-        tls_key_path: String,
-        tls_cert_path: String,
+        tls_key_path: impl AsRef<Path>,
+        tls_cert_path: impl AsRef<Path>,
         subject_alt_names: Vec<String>,
     ) -> Result<(), FlorestadError> {
         // Generate a key pair
@@ -1018,41 +1053,35 @@ impl Florestad {
             .map_err(FlorestadError::CouldNotGenerateSelfSignedCert)?;
 
         // Create files
-        fs::write(&tls_key_path, tls_key_pair.serialize_pem())
-            .map_err(|err| FlorestadError::CouldNotWriteFile(tls_key_path, err))?;
+        fs::write(&tls_key_path, tls_key_pair.serialize_pem()).map_err(|err| {
+            FlorestadError::CouldNotWriteFile(tls_key_path.as_ref().to_path_buf(), err)
+        })?;
 
-        fs::write(&tls_cert_path, certificate.pem())
-            .map_err(|err| FlorestadError::CouldNotWriteFile(tls_cert_path, err))?;
+        fs::write(&tls_cert_path, certificate.pem()).map_err(|err| {
+            FlorestadError::CouldNotWriteFile(tls_cert_path.as_ref().to_path_buf(), err)
+        })?;
 
         Ok(())
     }
 
     /// Create the TLS configuration from a PKCS#8 private key and certificate.
-    fn create_tls_config(&self, data_dir: &str) -> Result<Arc<ServerConfig>, FlorestadError> {
-        // Use an agnostic way to build paths for platforms and fix the differences
-        // in how Unix and Windows represent strings, maybe a user could use a weird
-        // string on his/her path.
-        //
-        // See more at https://doc.rust-lang.org/std/ffi/struct.OsStr.html#method.to_string_lossy
-        let tls_cert_path = self.config.tls_cert_path.clone().unwrap_or_else(|| {
-            PathBuf::from(&data_dir)
-                .join("tls")
-                .join("cert.pem")
-                .to_string_lossy()
-                .into_owned()
-        });
+    fn create_tls_config(
+        &self,
+        datadir: impl AsRef<Path>,
+    ) -> Result<Arc<ServerConfig>, FlorestadError> {
+        let datadir = datadir.as_ref();
 
-        let tls_key_path = self.config.tls_key_path.clone().unwrap_or_else(|| {
-            PathBuf::from(&data_dir)
-                .join("tls")
-                .join("key.pem")
-                .to_string_lossy()
-                .into_owned()
-        });
+        let tls_cert_path = self
+            .config
+            .tls_cert_path
+            .clone()
+            .unwrap_or_else(|| datadir.join("tls").join("cert.pem"));
 
-        // Convert paths to a [`Path`] for system-agnostic handling.
-        let tls_cert_path = Path::new(&tls_cert_path);
-        let tls_key_path = Path::new(&tls_key_path);
+        let tls_key_path = self
+            .config
+            .tls_key_path
+            .clone()
+            .unwrap_or_else(|| datadir.join("tls").join("key.pem"));
 
         // Parse the certificate's chain from the file.
         let tls_cert_chain =
@@ -1095,7 +1124,11 @@ mod filter_start_height_sidecar_tests {
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let mut p = env::temp_dir();
-        p.push(format!("floresta-filter-start-{}-{}", std::process::id(), name));
+        p.push(format!(
+            "floresta-filter-start-{}-{}",
+            std::process::id(),
+            name
+        ));
         let _ = std::fs::remove_file(&p);
         p
     }

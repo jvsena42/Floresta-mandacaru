@@ -22,12 +22,12 @@
 //! and the leaf data for UTXOs being spent. You can then use this data to validate the block, and
 //! update your local Utreexo forest.
 
-use bitcoin::consensus::Decodable;
-use bitcoin::consensus::Encodable;
-use bitcoin::hashes::sha256;
-use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use bitcoin::VarInt;
+use bitcoin::consensus::Decodable;
+use bitcoin::consensus::Encodable;
+use bitcoin::hashes::Hash;
+use bitcoin::hashes::sha256;
 use floresta_chain::CompactLeafData;
 use floresta_chain::ScriptPubKeyKind;
 use floresta_common::read_bounded_len;
@@ -281,19 +281,19 @@ impl Decodable for UtreexoProof {
 
 #[cfg(test)]
 mod utreexo_proof_tests {
-    use bitcoin::consensus::encode::deserialize_hex;
-    use bitcoin::hashes::sha256;
-    use bitcoin::hashes::Hash;
     use bitcoin::Block;
     use bitcoin::BlockHash;
     use bitcoin::Network;
     use bitcoin::Transaction;
-    use floresta_chain::proof_util::process_proof;
+    use bitcoin::consensus::encode::deserialize_hex;
+    use bitcoin::hashes::Hash;
+    use bitcoin::hashes::sha256;
     use floresta_chain::AssumeValidArg;
     use floresta_chain::BlockchainError;
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
     use floresta_chain::FlatChainStoreConfig;
+    use floresta_chain::proof_util::process_proof;
     use floresta_common::acchashes;
     use floresta_common::bhash;
     use rustreexo::node_hash::BitcoinNodeHash;
@@ -356,7 +356,7 @@ mod utreexo_proof_tests {
             let datadir = format!("./tmp-db/{}.sync_node", rand::random::<u32>());
             let config = FlatChainStoreConfig::new(datadir);
             let store = FlatChainStore::new(config).expect("Failed to create chain store");
-            ChainState::new(store, network, assume_valid)
+            ChainState::open(store, network, assume_valid).expect("Failed to open chain state")
         }
 
         // STEP 0: Set up the block and utreexo data

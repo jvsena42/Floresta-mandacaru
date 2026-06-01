@@ -2,14 +2,14 @@
 
 //! This example shows how to create a watch-only wallet, and drive it.
 
+use bitcoin::ScriptBuf;
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::hex::FromHex;
-use bitcoin::ScriptBuf;
 use floresta_common::get_spk_hash;
-use floresta_watch_only::memory_database::MemoryDatabase;
 use floresta_watch_only::AddressCache;
-use miniscript::bitcoin::secp256k1::Secp256k1;
+use floresta_watch_only::memory_database::MemoryDatabase;
 use miniscript::Descriptor;
+use miniscript::bitcoin::secp256k1::Secp256k1;
 
 fn main() {
     // First, we need some place to store the wallet data. Here, we use an in-memory database,

@@ -11,7 +11,6 @@ import os
 import time
 
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
 from subprocess import Popen, PIPE
 from typing import List
 from test_framework.rpc import ConfigRPC
@@ -39,6 +38,7 @@ class BaseDaemon(ABC):
         rpc_config: ConfigRPC,
         extra_args: List[str],
         electrum_config: ConfigElectrum,
+        log,
     ):
         self._process: Popen | None = None
         self._name: str = name
@@ -51,17 +51,17 @@ class BaseDaemon(ABC):
             raise ValueError(f"Target path {target} does not exist")
         self._target: str = target
         self._p2p_config: ConfigP2P = p2p_config
+        self._log = log
+
+    @property
+    def log(self):
+        """Getter for `log` property"""
+        return self._log
 
     # pylint: disable=R0801
-    def log(self, message: str):
-        """Log a message to the console"""
-        now = (
-            datetime.now(timezone.utc)
-            .replace(microsecond=0)
-            .strftime("%Y-%m-%d %H:%M:%S")
-        )
-
-        print(f"[{self.__class__.__name__.upper()} {now}] {message}")
+    def log_msg(self, message: str):
+        """Format a log message for the console"""
+        return f"[{self.__class__.__name__.upper()}] {message}"
 
     @property
     def target(self) -> str:
@@ -134,6 +134,13 @@ class BaseDaemon(ABC):
         """Setter for `p2p_config` property"""
         self._p2p_config = value
 
+    def _get_logger_file_path(self) -> str | None:
+        """Extract the file path from the logger's file handler"""
+        for handler in self.log.handlers:
+            if hasattr(handler, "baseFilename"):
+                return handler.baseFilename
+        return None
+
     def settings(self) -> List[str]:
         """Getter for `settings` property"""
         setting: List[str] = self.get_cmd_network()
@@ -166,8 +173,14 @@ class BaseDaemon(ABC):
 
         cmd = [daemon] + self.settings()
 
+        log_file_path = self._get_logger_file_path()
+        if not log_file_path:
+            raise ValueError("Log file path not found")
+
         # pylint: disable=consider-using-with
-        self.process = Popen(cmd, text=True, stderr=PIPE)
+        stdout_file = open(os.path.join(log_file_path), "w", encoding="utf-8")
+        # pylint: disable=consider-using-with
+        self.process = Popen(cmd, text=True, stderr=PIPE, stdout=stdout_file)
 
         # Wait a little to see if the process is running
         time.sleep(1)
@@ -175,10 +188,14 @@ class BaseDaemon(ABC):
             self.process.terminate()
             stderr = self.process.stderr.read()
 
-            self.log(f"Failed to start node '{self.name}'. Command: {' '.join(cmd)} ")
+            self.log.debug(
+                self.log_msg(
+                    f"Failed to start node '{self.name}'. Command: {' '.join(cmd)} "
+                )
+            )
             raise RuntimeError(f"Failed to start node '{self.name}'. {stderr}")
 
-        self.log(f"Starting node '{self.name}': {' '.join(cmd)}")
+        self.log.debug(self.log_msg(f"Starting node '{self.name}': {' '.join(cmd)}"))
 
     @abstractmethod
     def get_cmd_network(self) -> List[str]:

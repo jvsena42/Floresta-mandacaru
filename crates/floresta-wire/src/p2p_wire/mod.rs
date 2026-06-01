@@ -4,6 +4,7 @@
 //! backed by p2p Bitcoin's p2p network.
 
 use core::net::SocketAddr;
+use std::path::PathBuf;
 
 use bitcoin::Network;
 use floresta_chain::AssumeUtreexoValue;
@@ -37,7 +38,7 @@ pub struct UtreexoNodeConfig {
     /// we disconnect from the peer.
     pub max_banscore: u32,
     /// Data directory for the node. Defaults to `.floresta-node`.
-    pub datadir: String,
+    pub datadir: PathBuf,
     /// A SOCKS5 proxy to use. Defaults to None.
     pub proxy: Option<SocketAddr>,
     /// If enabled, the node will assume that the provided Utreexo state is valid, and will
@@ -76,7 +77,7 @@ impl Default for UtreexoNodeConfig {
             compact_filters: false,
             fixed_peer: None,
             max_banscore: 100,
-            datadir: ".floresta-node".to_string(),
+            datadir: ".floresta-node".into(),
             proxy: None,
             backfill: false,
             assume_utreexo: None,

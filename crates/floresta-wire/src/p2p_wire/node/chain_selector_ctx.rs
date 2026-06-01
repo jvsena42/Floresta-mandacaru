@@ -49,37 +49,37 @@ use std::collections::HashSet;
 use std::time::Duration;
 use std::time::Instant;
 
+use bitcoin::Block;
+use bitcoin::BlockHash;
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
 use bitcoin::network::Network;
 use bitcoin::p2p::ServiceFlags;
-use bitcoin::Block;
-use bitcoin::BlockHash;
-use floresta_chain::proof_util;
 use floresta_chain::ChainBackend;
 use floresta_chain::CompactLeafData;
+use floresta_chain::proof_util;
 use floresta_common::service_flags;
-use rand::seq::SliceRandom;
-use rand::thread_rng;
+use floresta_common::try_and_log;
+use rand::rng;
+use rand::seq::IndexedRandom;
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
 use rustreexo::stump::Stump;
 use tokio::time;
-use tokio::time::timeout;
 use tokio::time::MissedTickBehavior;
+use tokio::time::timeout;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 
 use crate::address_man::AddressState;
 use crate::block_proof::Bitmap;
-use crate::node::periodic_job;
-use crate::node::try_and_log;
 use crate::node::InflightBlock;
 use crate::node::InflightRequests;
 use crate::node::NodeNotification;
 use crate::node::NodeRequest;
 use crate::node::UtreexoNode;
+use crate::node::periodic_job;
 use crate::node_context::LoopControl;
 use crate::node_context::NodeContext;
 use crate::node_context::PeerId;
@@ -713,7 +713,7 @@ where
             .ok_or(WireError::NoPeersAvailable)?;
 
         let rand_peer = *peers
-            .choose(&mut thread_rng())
+            .choose(&mut rng())
             .ok_or(WireError::NoPeersAvailable)?;
 
         let block = self.get_block_and_proof(rand_peer, fork).await?;
@@ -1019,7 +1019,7 @@ where
             }
 
             for inflight in self.inflight.clone().iter() {
-                if inflight.1 .1.elapsed().as_secs() > 60 {
+                if inflight.1.1.elapsed().as_secs() > 60 {
                     self.inflight.remove(inflight.0);
                 }
             }

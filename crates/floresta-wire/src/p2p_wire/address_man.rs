@@ -4,6 +4,7 @@
 //! metadata. This module is very important in keeping our node protected against targeted
 //! attacks, like eclipse attacks.
 
+use core::fmt::Display;
 use core::net::IpAddr;
 use core::net::Ipv4Addr;
 use core::net::Ipv6Addr;
@@ -12,15 +13,17 @@ use core::str::FromStr;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::read_to_string;
+use std::path::Path;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use bitcoin::Network;
+use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::AddrV2;
 use bitcoin::p2p::address::AddrV2Message;
-use bitcoin::p2p::ServiceFlags;
-use bitcoin::Network;
 use floresta_chain::DnsSeed;
 use floresta_common::service_flags;
+use rand::Rng;
 use rand::seq::IteratorRandom;
 use serde::Deserialize;
 use serde::Serialize;
@@ -47,10 +50,6 @@ const ASSUME_STALE: u64 = 24 * 60 * 60; // 24 hours
 
 /// How many addresses we keep in our address manager
 const MAX_ADDRESSES: usize = 50_000;
-
-/// The [`ReachableNetworks`] this implementation currently supports.
-pub const SUPPORTED_NETWORKS: &[ReachableNetworks] =
-    &[ReachableNetworks::IPv4, ReachableNetworks::IPv6];
 
 /// A type alias for a list of addresses to send to our peers
 type AddressToSend = Vec<(AddrV2, u64, ServiceFlags, u16)>;
@@ -88,6 +87,26 @@ pub enum ReachableNetworks {
     Cjdns,
 }
 
+impl ReachableNetworks {
+    /// All networks Floresta is aware of.
+    pub const ALL: [Self; 5] = [Self::IPv4, Self::IPv6, Self::TorV3, Self::I2P, Self::Cjdns];
+
+    /// Networks this implementation currently supports.
+    pub const SUPPORTED: [Self; 2] = [Self::IPv4, Self::IPv6];
+}
+
+impl Display for ReachableNetworks {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ReachableNetworks::IPv4 => write!(f, "ipv4"),
+            ReachableNetworks::IPv6 => write!(f, "ipv6"),
+            ReachableNetworks::TorV3 => write!(f, "onion"),
+            ReachableNetworks::I2P => write!(f, "i2p"),
+            ReachableNetworks::Cjdns => write!(f, "cjdns"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 /// How do we store peers locally
 pub struct LocalAddress {
@@ -116,7 +135,7 @@ impl From<AddrV2> for LocalAddress {
             state: AddressState::NeverTried,
             services: ServiceFlags::NONE,
             port: 8333,
-            id: rand::random::<usize>(),
+            id: rand::random::<u64>() as usize,
         }
     }
 }
@@ -129,7 +148,7 @@ impl From<AddrV2Message> for LocalAddress {
             state: AddressState::NeverTried,
             services: value.services,
             port: value.port,
-            id: rand::random::<usize>(),
+            id: rand::random::<u64>() as usize,
         }
     }
 }
@@ -161,7 +180,7 @@ impl TryFrom<&str> for LocalAddress {
             super::address_man::AddressState::NeverTried,
             ServiceFlags::NONE,
             address.port(),
-            rand::random::<usize>(),
+            rand::random::<u64>() as usize,
         ))
     }
 
@@ -544,8 +563,7 @@ impl AddressMan {
     }
 
     pub fn get_addresses_to_send(&self) -> AddressToSend {
-        let addresses = self
-            .good_addresses
+        self.good_addresses
             .iter()
             .filter_map(|id| {
                 let address = self.addresses.get(id)?;
@@ -556,9 +574,7 @@ impl AddressMan {
                     address.port,
                 ))
             })
-            .collect();
-
-        addresses
+            .collect()
     }
 
     fn do_lookup(host: &str, default_port: u16, socks5: Option<SocketAddr>) -> Vec<LocalAddress> {
@@ -682,7 +698,7 @@ impl AddressMan {
         // the features it supports or even if it's a valid peer. The only thing we care about
         // is that we haven't banned it.
         if feeler {
-            let idx = rand::random::<usize>() % self.addresses.len();
+            let idx = rand::rng().random_range(0..self.addresses.len());
             let peer = self.addresses.keys().nth(idx)?;
             let address = self.addresses.get(peer)?.to_owned();
 
@@ -731,7 +747,9 @@ impl AddressMan {
         None
     }
 
-    pub fn dump_peers(&self, datadir: &str) -> std::io::Result<()> {
+    pub fn dump_peers(&self, datadir: impl AsRef<Path>) -> std::io::Result<()> {
+        let datadir = datadir.as_ref();
+
         let peers: Vec<_> = self
             .addresses
             .values()
@@ -740,21 +758,27 @@ impl AddressMan {
             .collect::<Vec<_>>();
         let peers = serde_json::to_string(&peers);
         if let Ok(peers) = peers {
-            std::fs::write(datadir.to_owned() + "/peers.json", peers)?;
+            std::fs::write(datadir.join("peers.json"), peers)?;
         }
         Ok(())
     }
 
     /// Dumps the connected utreexo peers to a file on dir `datadir/anchors.json` in json format `
     /// inputs are the directory to save the file and the list of ids of the connected utreexo peers
-    pub fn dump_utreexo_peers(&self, datadir: &str, peers_id: &[usize]) -> std::io::Result<()> {
+    pub fn dump_utreexo_peers(
+        &self,
+        datadir: impl AsRef<Path>,
+        peers_id: &[usize],
+    ) -> std::io::Result<()> {
+        let datadir = datadir.as_ref();
+
         let addresses: Vec<DiskLocalAddress> = peers_id
             .iter()
             .filter_map(|id| Some(self.addresses.get(id)?.to_owned().into()))
             .collect();
         let addresses: Result<String, serde_json::Error> = serde_json::to_string(&addresses);
         if let Ok(addresses) = addresses {
-            std::fs::write(datadir.to_owned() + "/anchors.json", addresses)?;
+            std::fs::write(datadir.join("anchors.json"), addresses)?;
         }
         Ok(())
     }
@@ -768,12 +792,14 @@ impl AddressMan {
                 let addr = self.addresses.get(id)?;
                 (addr.state != AddressState::Connected).then_some((id, addr))
             })
-            .choose(&mut rand::thread_rng())
+            .choose(&mut rand::rng())
             .map(|(id, addr)| (*id, addr.to_owned()))
     }
 
-    pub fn start_addr_man(&mut self, datadir: String) -> Vec<LocalAddress> {
-        let persisted_peers = read_to_string(format!("{datadir}/peers.json"))
+    pub fn start_addr_man(&mut self, datadir: impl AsRef<Path>) -> Vec<LocalAddress> {
+        let datadir = datadir.as_ref();
+
+        let persisted_peers = read_to_string(datadir.join("peers.json"))
             .map(|seeds| serde_json::from_str::<Vec<DiskLocalAddress>>(&seeds));
 
         if let Ok(Ok(peers)) = persisted_peers {
@@ -785,7 +811,7 @@ impl AddressMan {
             self.push_addresses(&peers);
         }
 
-        let anchors = read_to_string(format!("{datadir}/anchors.json")).and_then(|anchors| {
+        let anchors = read_to_string(datadir.join("anchors.json")).and_then(|anchors| {
             let anchors = serde_json::from_str::<Vec<DiskLocalAddress>>(&anchors)?;
             Ok(anchors
                 .into_iter()
@@ -806,7 +832,7 @@ impl AddressMan {
     pub fn rearrange_buckets(&mut self) {
         let now = Self::time_since_unix();
 
-        for (_, address) in self.addresses.iter_mut() {
+        for address in self.addresses.values_mut() {
             match address.state {
                 AddressState::Banned(ban_time) => {
                     if ban_time < now {
@@ -859,7 +885,7 @@ impl AddressMan {
                 return None;
             }
 
-            let idx = rand::random::<usize>() % peers.len();
+            let idx = rand::rng().random_range(0..peers.len());
             let utreexo_peer = peers.get(idx)?;
             return Some((**utreexo_peer, self.addresses.get(utreexo_peer)?.to_owned()));
         }
@@ -888,7 +914,7 @@ impl AddressMan {
         }
 
         // No service requirement: any peer will do.
-        let idx = rand::random::<usize>() % self.addresses.len();
+        let idx = rand::rng().random_range(0..self.addresses.len());
         let peer = self.addresses.keys().nth(idx)?;
 
         Some((*peer, self.addresses.get(peer)?.to_owned()))
@@ -1114,7 +1140,9 @@ impl From<DiskLocalAddress> for LocalAddress {
             state: value.state,
             services,
             port: value.port,
-            id: value.id.unwrap_or_else(rand::random::<usize>),
+            id: value
+                .id
+                .unwrap_or_else(|| rand::rng().random_range(0..usize::MAX)),
         }
     }
 }
@@ -1157,10 +1185,10 @@ pub mod dns_proxy {
 
     use rustls::crypto;
     use serde::Deserialize;
-    use ureq::tls::TlsConfig;
-    use ureq::tls::TlsProvider;
     use ureq::Agent;
     use ureq::Proxy;
+    use ureq::tls::TlsConfig;
+    use ureq::tls::TlsProvider;
 
     #[derive(Deserialize)]
     /// JSON format from [Google's DoH API](https://developers.google.com/speed/public-dns/docs/doh/json#dns_response_in_json)
@@ -1243,9 +1271,9 @@ mod test {
     use std::io::Read;
     use std::io::{self};
 
-    use bitcoin::p2p::address::AddrV2;
-    use bitcoin::p2p::ServiceFlags;
     use bitcoin::Network;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::p2p::address::AddrV2;
     use floresta_chain::get_chain_dns_seeds;
     use floresta_common::assert_ok;
     use floresta_common::service_flags;
@@ -1253,19 +1281,19 @@ mod test {
 
     use super::AddressState;
     use super::LocalAddress;
+    use super::*;
     use crate::address_man::AddressMan;
     use crate::address_man::DiskLocalAddress;
     use crate::address_man::ReachableNetworks;
-    use crate::address_man::SUPPORTED_NETWORKS;
 
-    fn load_addresses_from_json(file_path: &str) -> io::Result<Vec<LocalAddress>> {
+    fn load_addresses_from_json(file_path: impl AsRef<Path>) -> io::Result<Vec<LocalAddress>> {
         let mut contents = String::new();
         File::open(file_path)?.read_to_string(&mut contents)?;
 
         let seeds: Vec<DiskLocalAddress> =
             serde_json::from_str(&contents).expect("JSON not well-formatted");
         let mut addresses = Vec::new();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         for seed in seeds {
             let state = match seed.state {
@@ -1279,7 +1307,7 @@ mod test {
                 state,
                 services: ServiceFlags::from(seed.services),
                 port: seed.port,
-                id: rng.gen(),
+                id: rng.random::<u64>() as usize,
             };
             addresses.push(local_address);
         }
@@ -1378,7 +1406,7 @@ mod test {
         let signet_address = load_addresses_from_json("./seeds/signet_seeds.json").unwrap();
 
         assert!(!signet_address.is_empty());
-        let random = rand::thread_rng().gen_range(1..=13);
+        let random = rand::rng().random_range(1..=13);
         let loc_adr_1 = LocalAddress::from(signet_address[random].address.clone());
         assert_eq!(loc_adr_1.address, signet_address[random].address);
     }
@@ -1406,21 +1434,29 @@ mod test {
 
         assert!(!address_man.get_addresses_to_send().is_empty());
 
-        assert!(address_man
-            .get_address_to_connect(ServiceFlags::default(), true)
-            .is_some());
+        assert!(
+            address_man
+                .get_address_to_connect(ServiceFlags::default(), true)
+                .is_some()
+        );
 
-        assert!(address_man
-            .get_address_to_connect(ServiceFlags::default(), false)
-            .is_some());
+        assert!(
+            address_man
+                .get_address_to_connect(ServiceFlags::default(), false)
+                .is_some()
+        );
 
-        assert!(address_man
-            .get_address_to_connect(ServiceFlags::NONE, false)
-            .is_some());
+        assert!(
+            address_man
+                .get_address_to_connect(ServiceFlags::NONE, false)
+                .is_some()
+        );
 
-        assert!(address_man
-            .get_address_to_connect(service_flags::UTREEXO.into(), false)
-            .is_some());
+        assert!(
+            address_man
+                .get_address_to_connect(service_flags::UTREEXO.into(), false)
+                .is_some()
+        );
 
         assert!(!AddressMan::get_net_seeds(Network::Signet).is_empty());
         assert!(!AddressMan::get_net_seeds(Network::Bitcoin).is_empty());
@@ -1685,10 +1721,12 @@ mod test {
             address_man.update_set_state(addr.id, AddressState::Banned(0));
         }
 
-        assert!(address_man
-            .addresses
-            .values()
-            .all(|addr| matches!(addr.state, AddressState::Banned(_))));
+        assert!(
+            address_man
+                .addresses
+                .values()
+                .all(|addr| matches!(addr.state, AddressState::Banned(_)))
+        );
     }
 
     #[test]
@@ -1707,15 +1745,17 @@ mod test {
             address_man.update_set_service_flag(addr.id, service_flags::UTREEXO.into());
         }
 
-        assert!(address_man
-            .addresses
-            .values()
-            .all(|addr| addr.services.has(service_flags::UTREEXO.into())));
+        assert!(
+            address_man
+                .addresses
+                .values()
+                .all(|addr| addr.services.has(service_flags::UTREEXO.into()))
+        );
     }
 
     #[test]
     fn test_add_fixed_addresses() {
-        let mut address_man = AddressMan::new(None, SUPPORTED_NETWORKS);
+        let mut address_man = AddressMan::new(None, &ReachableNetworks::SUPPORTED);
         address_man.add_fixed_addresses(Network::Signet);
         assert!(!address_man.addresses.is_empty());
     }
@@ -1740,12 +1780,16 @@ mod test {
 
         // With no CF-advertising peer known, requiring COMPACT_FILTERS must fail
         // cleanly instead of returning the unrelated NETWORK|WITNESS peer.
-        assert!(address_man
-            .get_random_address(ServiceFlags::COMPACT_FILTERS)
-            .is_none());
-        assert!(address_man
-            .get_address_to_connect(ServiceFlags::COMPACT_FILTERS, false)
-            .is_none());
+        assert!(
+            address_man
+                .get_random_address(ServiceFlags::COMPACT_FILTERS)
+                .is_none()
+        );
+        assert!(
+            address_man
+                .get_address_to_connect(ServiceFlags::COMPACT_FILTERS, false)
+                .is_none()
+        );
 
         // Without a service requirement, we still return the one peer we have.
         assert!(address_man.get_random_address(ServiceFlags::NONE).is_some());

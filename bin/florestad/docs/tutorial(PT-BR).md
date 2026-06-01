@@ -46,19 +46,19 @@ Para endereços multisig, uma carteira como Sparrow é recomendada. Basta copiar
 Veja [abaixo](#config_example) um exemplo de arquivo válido.
 
 ```bash
-floresta -c config.toml --network signet run
+florestad -c config.toml --network signet
 ```
 
 ou
 
 ```bash
-./target/release/floresta -c config.toml --network signet run
+./target/release/florestad -c config.toml --network signet
 ```
 
 ou
 
 ```bash
-cargo run --release -- -c config.toml --network signet run
+cargo run --release --bin florestad -- -c config.toml --network signet
 ```
 
 Onde:

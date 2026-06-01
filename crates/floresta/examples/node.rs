@@ -17,10 +17,10 @@ use floresta_chain::AssumeValidArg;
 use floresta_chain::FlatChainStore;
 use floresta_chain::FlatChainStoreConfig;
 use floresta_mempool::Mempool;
-use floresta_wire::address_man::AddressMan;
-use floresta_wire::address_man::SUPPORTED_NETWORKS;
-use floresta_wire::node::running_ctx::RunningNode;
 use floresta_wire::UtreexoNodeConfig;
+use floresta_wire::address_man::AddressMan;
+use floresta_wire::address_man::ReachableNetworks;
+use floresta_wire::node::running_ctx::RunningNode;
 use tokio::sync::Mutex;
 
 /// Where floresta will store all it's data, like the blockchain and wallet
@@ -40,7 +40,7 @@ async fn main() {
     // the block data after we have validated it. This saves a lot of space, but it means that
     // we can't serve blocks to other nodes or rescan the blockchain without downloading
     // it again.
-    let chain_store_config = FlatChainStoreConfig::new(DATA_DIR.into());
+    let chain_store_config = FlatChainStoreConfig::new(DATA_DIR);
     let chain_store =
         FlatChainStore::new(chain_store_config).expect("failed to open the blockchain database");
 
@@ -51,11 +51,9 @@ async fn main() {
     // signatures in the blockchain, just the ones after the assume valid block. We are giving a Disabled
     // value, so we will validate all signatures regardless.
     // We place the chain state in an Arc, so we can share it with other components.
-    let chain = Arc::new(ChainState::new(
-        chain_store,
-        Network::Bitcoin,
-        AssumeValidArg::Disabled,
-    ));
+    let chain = Arc::new(
+        ChainState::open(chain_store, Network::Bitcoin, AssumeValidArg::Disabled).unwrap(),
+    );
 
     // Create a new node. It will connect to the Bitcoin network and start downloading the blockchain.
     // It will also start a mempool, which will keep track of the current mempool state, this
@@ -74,7 +72,7 @@ async fn main() {
         Arc::new(Mutex::new(Mempool::new(MEMPOOL_SIZE))),
         None,
         Arc::new(tokio::sync::RwLock::new(false)),
-        AddressMan::new(None, SUPPORTED_NETWORKS),
+        AddressMan::new(None, &ReachableNetworks::SUPPORTED),
     )
     .unwrap();
     // A handle is a simple way to interact with the node. It implements a queue of requests

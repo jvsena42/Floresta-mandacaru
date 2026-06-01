@@ -8,7 +8,6 @@ Base client to connect to Floresta's Electrum server.
 
 import json
 import socket
-from datetime import datetime, timezone
 from typing import Any, List, Tuple
 from OpenSSL import SSL
 
@@ -21,9 +20,15 @@ class BaseClient:
     Helper class to connect to Floresta's Electrum server.
     """
 
-    def __init__(self, config: ConfigElectrum):
+    def __init__(self, config: ConfigElectrum, log):
         self._conn = None
         self._config = config
+        self._log = log
+
+    @property
+    def log(self):
+        """Getter for `log` property"""
+        return self._log
 
     @property
     def conn(self) -> socket.socket:
@@ -84,12 +89,6 @@ class BaseClient:
         else:
             self._conn = s
 
-    def log(self, msg):
-        """
-        Log a message to the console
-        """
-        print(f"[{self.__class__.__name__.upper()} {datetime.now(timezone.utc)}] {msg}")
-
     def request(self, method, params) -> object:
         """
         Request something to Floresta server
@@ -104,7 +103,7 @@ class BaseClient:
         )
 
         mnt_point = "/".join(method.split("."))
-        self.log(f"GET electrum://{mnt_point}?params={params}")
+        self.log.debug(f"GET electrum://{mnt_point}?params={params}")
         self.conn.sendall(request.encode("utf-8") + b"\n")
 
         response = b""
@@ -116,7 +115,7 @@ class BaseClient:
             if b"\n" in response:
                 break
         response = response.decode("utf-8").strip()
-        self.log(response)
+        self.log.debug(response)
 
         return json.loads(response)
 
@@ -130,7 +129,7 @@ class BaseClient:
         }
 
         request_list = list(request_map.values())
-        self.log(
+        self.log.debug(
             "BATCH "
             + ", ".join(
                 f"electrum://{'/'.join(m.split('.'))}?params={p}" for m, p in calls
@@ -148,5 +147,5 @@ class BaseClient:
                 break
 
         response = response.decode("utf-8").strip()
-        self.log(response)
+        self.log.debug(response)
         return response

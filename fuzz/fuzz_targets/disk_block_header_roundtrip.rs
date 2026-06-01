@@ -6,14 +6,14 @@ use std::io::Cursor;
 
 use arbitrary::Arbitrary;
 use arbitrary::Unstructured;
+use bitcoin::BlockHash;
+use bitcoin::CompactTarget;
+use bitcoin::TxMerkleNode;
 use bitcoin::block::Version;
 use bitcoin::blockdata::block::Header as BlockHeader;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
-use bitcoin::BlockHash;
-use bitcoin::CompactTarget;
-use bitcoin::TxMerkleNode;
 use floresta_chain::DiskBlockHeader;
 use libfuzzer_sys::fuzz_target;
 

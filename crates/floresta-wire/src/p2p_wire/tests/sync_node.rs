@@ -7,11 +7,11 @@ mod tests {
     use bitcoin::Network;
     use floresta_chain::pruned_utreexo::BlockchainInterface;
 
+    use crate::p2p_wire::tests::utils::PeerData;
     use crate::p2p_wire::tests::utils::mutated_block_h7;
     use crate::p2p_wire::tests::utils::setup_node;
     use crate::p2p_wire::tests::utils::signet_blocks;
     use crate::p2p_wire::tests::utils::signet_headers;
-    use crate::p2p_wire::tests::utils::PeerData;
 
     const NUM_BLOCKS: usize = 9;
 
