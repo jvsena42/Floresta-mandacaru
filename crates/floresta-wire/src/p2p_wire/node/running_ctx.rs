@@ -173,9 +173,7 @@ where
                 .address_man
                 .has_address_for_service(ServiceFlags::COMPACT_FILTERS);
 
-            if has_cf_candidate
-                && self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS
-            {
+            if has_cf_candidate && self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
                 self.peers
                     .values()
                     .filter(|peer| peer.is_regular_peer())

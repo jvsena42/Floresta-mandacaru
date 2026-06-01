@@ -878,7 +878,9 @@ pub async fn client_accept_loop(
                     let mut first = [0u8; 1];
                     if let Ok(n) = stream.peek(&mut first).await {
                         if n > 0 && first[0] == 0x16 {
-                            warn!("Client attempted a TLS handshake on the plaintext Electrum port; disable TLS for this server (use the non-SSL / ':t' option).");
+                            warn!(
+                                "Client attempted a TLS handshake on the plaintext Electrum port; disable TLS for this server (use the non-SSL / ':t' option)."
+                            );
                             return;
                         }
                     }

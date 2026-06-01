@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use core::fmt;
 #[cfg(feature = "metrics")]
 use core::net::IpAddr;
 #[cfg(feature = "metrics")]
 use core::net::Ipv4Addr;
 use core::net::SocketAddr;
-use core::fmt;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,17 +16,17 @@ use std::sync::OnceLock;
 
 use bitcoin::Address;
 pub use bitcoin::Network;
-use floresta_chain::pruned_utreexo::BlockchainInterface;
 use bitcoin::ScriptBuf;
 pub use floresta_chain::AssumeUtreexoValue;
 pub use floresta_chain::AssumeValidArg;
-use floresta_chain::ChainParams;
 use floresta_chain::BlockchainError;
+use floresta_chain::ChainParams;
 use floresta_chain::ChainState;
 use floresta_chain::FlatChainStore as ChainStore;
 use floresta_chain::FlatChainStoreConfig;
 pub use floresta_chain::SnapshotError;
 pub use floresta_chain::UtreexoSnapshot;
+use floresta_chain::pruned_utreexo::BlockchainInterface;
 use floresta_common::try_and_log;
 #[cfg(feature = "compact-filters")]
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
@@ -302,7 +302,10 @@ impl fmt::Display for DumpError {
         match self {
             DumpError::NotStarted => write!(f, "daemon has not been started yet"),
             DumpError::NotSynced => {
-                write!(f, "initial block download not finished; dump not yet available")
+                write!(
+                    f,
+                    "initial block download not finished; dump not yet available"
+                )
             }
             DumpError::Chain(e) => write!(f, "chain error while dumping accumulator: {e:?}"),
         }
@@ -358,10 +361,7 @@ fn resolve_filter_start_height(value: Option<i32>, chain_tip: u32) -> Option<u32
 /// (they trigger a wipe on mismatch) because their effective absolute height
 /// depends on context this function does not have.
 #[cfg(feature = "compact-filters")]
-fn store_covers_configured_range(
-    configured: Option<i32>,
-    previously_applied: Option<i32>,
-) -> bool {
+fn store_covers_configured_range(configured: Option<i32>, previously_applied: Option<i32>) -> bool {
     if configured == previously_applied {
         return true;
     }
@@ -586,15 +586,22 @@ impl Florestad {
         let picked = self.config.assumeutreexo_value.clone().or(assume_utreexo);
         info!(
             "assume_utreexo precedence: user={}, hardcoded={}, picked={}",
-            self.config.assumeutreexo_value.as_ref().map_or("None".to_string(), |v| format!(
-                "Some(height={} roots={})", v.height, v.roots.len()
-            )),
+            self.config
+                .assumeutreexo_value
+                .as_ref()
+                .map_or("None".to_string(), |v| format!(
+                    "Some(height={} roots={})",
+                    v.height,
+                    v.roots.len()
+                )),
             match self.config.assume_utreexo {
                 true => "Some(hardcoded_for_network)",
                 false => "None",
             },
             picked.as_ref().map_or("None".to_string(), |v| format!(
-                "Some(height={} roots={})", v.height, v.roots.len()
+                "Some(height={} roots={})",
+                v.height,
+                v.roots.len()
             )),
         );
 
@@ -1113,7 +1120,11 @@ mod filter_start_height_sidecar_tests {
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let mut p = env::temp_dir();
-        p.push(format!("floresta-filter-start-{}-{}", std::process::id(), name));
+        p.push(format!(
+            "floresta-filter-start-{}-{}",
+            std::process::id(),
+            name
+        ));
         let _ = std::fs::remove_file(&p);
         p
     }

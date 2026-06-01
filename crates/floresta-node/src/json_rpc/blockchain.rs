@@ -3,11 +3,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
-use bitcoin::block::Header;
-use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::consensus::Encodable;
-use bitcoin::constants::genesis_block;
-use bitcoin::hashes::Hash;
 use bitcoin::Address;
 use bitcoin::Block;
 use bitcoin::BlockHash;
@@ -17,6 +12,11 @@ use bitcoin::Script;
 use bitcoin::ScriptBuf;
 use bitcoin::Txid;
 use bitcoin::VarInt;
+use bitcoin::block::Header;
+use bitcoin::consensus::Encodable;
+use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::constants::genesis_block;
+use bitcoin::hashes::Hash;
 use corepc_types::ScriptPubkey;
 use corepc_types::v29::GetTxOut;
 use corepc_types::v30::DeploymentInfo;

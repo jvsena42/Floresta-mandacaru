@@ -1780,12 +1780,16 @@ mod test {
 
         // With no CF-advertising peer known, requiring COMPACT_FILTERS must fail
         // cleanly instead of returning the unrelated NETWORK|WITNESS peer.
-        assert!(address_man
-            .get_random_address(ServiceFlags::COMPACT_FILTERS)
-            .is_none());
-        assert!(address_man
-            .get_address_to_connect(ServiceFlags::COMPACT_FILTERS, false)
-            .is_none());
+        assert!(
+            address_man
+                .get_random_address(ServiceFlags::COMPACT_FILTERS)
+                .is_none()
+        );
+        assert!(
+            address_man
+                .get_address_to_connect(ServiceFlags::COMPACT_FILTERS, false)
+                .is_none()
+        );
 
         // Without a service requirement, we still return the one peer we have.
         assert!(address_man.get_random_address(ServiceFlags::NONE).is_some());

@@ -334,7 +334,10 @@ impl Display for JsonRpcError {
                 write!(f, "Could not send transaction to mempool due to {e}")
             }
             JsonRpcError::RescanInProgress => {
-                write!(f, "A rescan is already in progress, please wait for it to finish")
+                write!(
+                    f,
+                    "A rescan is already in progress, please wait for it to finish"
+                )
             }
             JsonRpcError::ConversionOverflow(e) => write!(f, "Numeric conversion overflow: {e}"),
         }

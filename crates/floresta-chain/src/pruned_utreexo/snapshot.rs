@@ -210,7 +210,10 @@ impl Error for SnapshotError {
 /// Convenience: validate a payload against an expected network in one call.
 /// Used by the FFI as a pre-check before triggering a restart-to-import on the
 /// Android side.
-pub fn validate_for_network(payload: &str, expected: Network) -> Result<UtreexoSnapshot, SnapshotError> {
+pub fn validate_for_network(
+    payload: &str,
+    expected: Network,
+) -> Result<UtreexoSnapshot, SnapshotError> {
     let (snap, got) = UtreexoSnapshot::from_json(payload)?;
     if got != expected {
         return Err(SnapshotError::NetworkMismatch { expected, got });
@@ -271,9 +274,16 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        let expected: BTreeSet<&str> = ["version", "network", "block_hash", "height", "leaves", "roots"]
-            .into_iter()
-            .collect();
+        let expected: BTreeSet<&str> = [
+            "version",
+            "network",
+            "block_hash",
+            "height",
+            "leaves",
+            "roots",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(keys, expected);
     }
 

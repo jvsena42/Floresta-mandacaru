@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -746,7 +746,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                         // reorg evicted it. Retrying the fetch won't help, so count
                         // it and move on instead of panicking.
                         Ok(None) => {
-                            warn!("rescan: fetched block {hash} has no height (reorged out?); skipping");
+                            warn!(
+                                "rescan: fetched block {hash} has no height (reorged out?); skipping"
+                            );
                             failed += 1;
                         }
                         Err(e) => {
