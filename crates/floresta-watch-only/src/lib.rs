@@ -507,9 +507,14 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                     txid: transaction.compute_txid(),
                     vout: index as u32,
                 };
-                address.utxos.push(utxo);
-                self.utxo_index.insert(utxo, hash);
-                address.balance += value;
+                // Guard against re-caching the same output (e.g. a block processed by
+                // both forward sync and a rescan), which would duplicate the outpoint
+                // and double-count the balance.
+                if !address.utxos.contains(&utxo) {
+                    address.utxos.push(utxo);
+                    self.utxo_index.insert(utxo, hash);
+                    address.balance += value;
+                }
             }
 
             if !address.transactions.contains(&transaction_to_cache.hash) {
@@ -1065,5 +1070,30 @@ mod test {
 
         assert_eq!(address.transactions.len(), 2);
         assert_eq!(address.utxos.len(), 1);
+    }
+
+    #[test]
+    fn test_reprocess_same_output_is_idempotent() {
+        let block1 = deserialize_from_str(BLOCK_FIRST_UTXO);
+
+        let spk = ScriptBuf::from_hex("00142b6a2924aa9b1b115d1ac3098b0ba0e6ed510f2a")
+            .expect("Valid address");
+        let script_hash = get_spk_hash(&spk);
+        let cache = get_test_cache();
+
+        cache.cache_address(spk);
+
+        cache.block_process(&block1, 118511);
+        let balance_once = cache.get_address_balance(&script_hash);
+
+        // Reprocessing the same block (e.g. a rescan over an already-synced chain)
+        // must not duplicate the UTXO or double-count the balance.
+        cache.block_process(&block1, 118511);
+
+        let address = cache.inner.read().unwrap();
+        let address = address.address_map.get(&script_hash).unwrap();
+
+        assert_eq!(address.utxos.len(), 1);
+        assert_eq!(Some(address.balance), balance_once);
     }
 }

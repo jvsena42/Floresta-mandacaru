@@ -655,7 +655,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 });
 
                 info!("Catching up with addresses {:?}", self.addresses_to_scan);
-                let addresses: Vec<_> = self.addresses_to_scan.drain(..).collect();
+                let addresses = std::mem::take(&mut self.addresses_to_scan);
                 self.rescan_for_addresses(addresses).await?;
             }
         }
