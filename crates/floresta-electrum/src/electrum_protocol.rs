@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use core::error;
+use core::ops::Range;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use bitcoin::ScriptBuf;
 use bitcoin::Transaction;
 use bitcoin::TxOut;
 use bitcoin::Txid;
+use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::hex::FromHex;
@@ -287,18 +289,14 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 let end_height =
                     (chain_height.saturating_add(1)).min(start_height.saturating_add(count));
 
-                let heights = start_height..end_height;
-                let count = heights.len();
-
-                let headers = heights.filter_map(|height| {
-                    let hash = self.chain.get_block_hash(height).ok()?;
-                    let header = self.chain.get_block_header(&hash).ok()?;
-                    Some(serialize_hex(&header))
+                let (count, hex) = build_headers_chunk(start_height..end_height, |height| {
+                    let hash = self.chain.get_block_hash(height)?;
+                    self.chain.get_block_header(&hash)
                 });
 
                 json_rpc_res!(request, {
                     "count": count,
-                    "hex": String::from_iter(headers),
+                    "hex": hex,
                     "max": MAX_COUNT,
                 })
             }
@@ -966,6 +964,31 @@ fn get_status(transactions: Vec<CachedTransaction>) -> sha256::Hash {
     get_hash_from_u8(status_preimage.as_bytes())
 }
 
+/// Serializes a contiguous chunk of block headers, for `blockchain.block.headers`.
+///
+/// Returns how many headers we could serialize, along with their concatenated hex. The protocol
+/// lets us return fewer headers than requested, but clients reject the response as corrupted
+/// unless the chunk is contiguous from the first requested height and holds exactly `count`
+/// headers. So we stop at the first height we can't serve, instead of skipping over it.
+fn build_headers_chunk<Error>(
+    heights: Range<u32>,
+    mut get_header: impl FnMut(u32) -> Result<BlockHeader, Error>,
+) -> (usize, String) {
+    let mut hex = String::new();
+    let mut count = 0;
+
+    for height in heights {
+        let Ok(header) = get_header(height) else {
+            break;
+        };
+
+        hex.push_str(&serialize_hex(&header));
+        count += 1;
+    }
+
+    (count, hex)
+}
+
 #[macro_export]
 /// Builds the response as defined by jsonrpc v2.0. Request should have type [Request] and the
 /// response is always a [json]
@@ -1056,6 +1079,7 @@ mod test {
     use tokio_rustls::rustls::pki_types::pem::PemObject;
 
     use super::ElectrumServer;
+    use super::build_headers_chunk;
     use super::client_accept_loop;
 
     /// A size used for mempool tests, no specific meaning just a randomly
@@ -1299,6 +1323,34 @@ mod test {
         }
 
         json!(batch_request)
+    }
+
+    /// The hex we return must hold exactly `count` headers, or clients bail out with
+    /// `RequestCorrupted('inconsistent chunk hex and count')` and reconnect in a loop
+    #[test]
+    fn test_headers_chunk_is_consistent_with_count() {
+        const HEADER_HEX_LEN: usize = 160;
+
+        let headers = get_test_signet_headers();
+        let get_header = |height: u32| {
+            headers
+                .get(height as usize)
+                .copied()
+                .ok_or("no header at this height")
+        };
+
+        let (count, hex) = build_headers_chunk(0..10, get_header);
+        assert_eq!(count, 10);
+        assert_eq!(hex.len(), count * HEADER_HEX_LEN);
+
+        // A height we can't serve truncates the chunk, it doesn't get skipped over
+        let (count, hex) = build_headers_chunk(0..u32::MAX, get_header);
+        assert_eq!(count, headers.len());
+        assert_eq!(hex.len(), count * HEADER_HEX_LEN);
+
+        let (count, hex) = build_headers_chunk(u32::MAX - 1..u32::MAX, get_header);
+        assert_eq!(count, 0);
+        assert!(hex.is_empty());
     }
 
     /// SENDING MULTIPLE REQUESTS TO THE SERVER AT THE SAME TIME
