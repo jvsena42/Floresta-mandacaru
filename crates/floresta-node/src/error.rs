@@ -126,103 +126,103 @@ pub enum FlorestadError {
 impl Display for FlorestadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            FlorestadError::Encode(err) => write!(f, "Encode error: {err}"),
-            FlorestadError::ParseNum(err) => write!(f, "int parse error: {err}"),
-            FlorestadError::Rustreexo(err) => write!(f, "Rustreexo error: {err}"),
-            FlorestadError::Io(err) => write!(f, "Io error {err}"),
-            FlorestadError::ScriptValidation(err) => {
+            Self::Encode(err) => write!(f, "Encode error: {err}"),
+            Self::ParseNum(err) => write!(f, "int parse error: {err}"),
+            Self::Rustreexo(err) => write!(f, "Rustreexo error: {err}"),
+            Self::Io(err) => write!(f, "Io error {err}"),
+            Self::ScriptValidation(err) => {
                 write!(f, "Error during script evaluation: {err}")
             }
-            FlorestadError::Blockchain(err) => {
+            Self::Blockchain(err) => {
                 write!(f, "Error with our blockchain backend: {err:?}")
             }
-            FlorestadError::SerdeJson(err) => write!(f, "Error serializing object {err}"),
-            FlorestadError::WalletInput(err) => write!(f, "Error while parsing user input {err:?}"),
-            FlorestadError::TomlParsing(err) => write!(f, "Error deserializing toml file {err}"),
-            FlorestadError::AddressParsing(err) => write!(f, "Invalid address {err}"),
-            FlorestadError::Miniscript(err) => write!(f, "Miniscript error: {err}"),
-            FlorestadError::BlockValidation(err) => {
+            Self::SerdeJson(err) => write!(f, "Error serializing object {err}"),
+            Self::WalletInput(err) => write!(f, "Error while parsing user input {err:?}"),
+            Self::TomlParsing(err) => write!(f, "Error deserializing toml file {err}"),
+            Self::AddressParsing(err) => write!(f, "Invalid address {err}"),
+            Self::Miniscript(err) => write!(f, "Miniscript error: {err}"),
+            Self::BlockValidation(err) => {
                 write!(f, "Error while validating block: {err:?}")
             }
-            FlorestadError::CouldNotConfigureTLS(err) => {
+            Self::CouldNotConfigureTLS(err) => {
                 write!(f, "Error while configuring TLS: {err:?}")
             }
-            FlorestadError::InvalidPrivKey(err) => {
+            Self::InvalidPrivKey(err) => {
                 write!(f, "Error while reading PKCS#8 private key {err:?}")
             }
-            FlorestadError::InvalidCert(err) => {
+            Self::InvalidCert(err) => {
                 write!(f, "Error while reading PKCS#8 certificate {err:?}")
             }
-            FlorestadError::CouldNotGenerateKeypair(err) => {
+            Self::CouldNotGenerateKeypair(err) => {
                 write!(f, "Error while generating PKCS#8 keypair: {err}")
             }
-            FlorestadError::CouldNotGenerateCertParam(err) => {
+            Self::CouldNotGenerateCertParam(err) => {
                 write!(f, "Error while generating certificate param: {err}")
             }
-            FlorestadError::CouldNotGenerateSelfSignedCert(err) => {
+            Self::CouldNotGenerateSelfSignedCert(err) => {
                 write!(f, "Error while generating self-signed certificate: {err}")
             }
-            FlorestadError::CouldNotWriteFile(path, err) => {
+            Self::CouldNotWriteFile(path, err) => {
                 write!(
                     f,
                     "Error while creating file at path={}: {err}",
                     path.display()
                 )
             }
-            FlorestadError::InvalidDataDir(path) => {
+            Self::InvalidDataDir(path) => {
                 write!(
                     f,
                     "Data directory at path={} doesn't exist or is not writable",
                     path.display()
                 )
             }
-            FlorestadError::CouldNotOpenKvDatabase(err) => {
+            Self::CouldNotOpenKvDatabase(err) => {
                 write!(f, "Cannot open a key-value database: {err}")
             }
-            FlorestadError::CouldNotInitializeWallet(err) => {
+            Self::CouldNotInitializeWallet(err) => {
                 write!(f, "Could not initialize wallet: {err}")
             }
-            FlorestadError::CouldNotSetupWallet(err) => {
+            Self::CouldNotSetupWallet(err) => {
                 write!(f, "Could not setup wallet: {err}")
             }
 
             #[cfg(feature = "compact-filters")]
-            FlorestadError::CouldNotLoadCompactFiltersStore(err) => {
+            Self::CouldNotLoadCompactFiltersStore(err) => {
                 write!(f, "Could not load compact filters store: {err}")
             }
 
-            FlorestadError::CouldNotCreateChainProvider(err) => {
+            Self::CouldNotCreateChainProvider(err) => {
                 write!(f, "Could not create chain provider: {err}")
             }
-            FlorestadError::CouldNotCreateElectrumServer(err) => {
+            Self::CouldNotCreateElectrumServer(err) => {
                 write!(f, "Could not create Electrum server: {err}")
             }
-            FlorestadError::FailedToBindElectrumServer(err) => {
+            Self::FailedToBindElectrumServer(err) => {
                 write!(f, "Failed to bind Electrum server: {err}")
             }
-            FlorestadError::CouldNotCreateTLSDataDir(path, err) => {
+            Self::CouldNotCreateTLSDataDir(path, err) => {
                 write!(
                     f,
                     "Could not create TLS data directory at path={}: {err}",
                     path.display()
                 )
             }
-            FlorestadError::CouldNotObtainWalletCache(err) => {
+            Self::CouldNotObtainWalletCache(err) => {
                 write!(f, "Could not obtain wallet cache: {err}")
             }
-            FlorestadError::CouldNotPushDescriptor(err) => {
+            Self::CouldNotPushDescriptor(err) => {
                 write!(f, "Could not push descriptor to wallet: {err}")
             }
-            FlorestadError::InvalidIpAddress(err) => {
+            Self::InvalidIpAddress(err) => {
                 write!(f, "Invalid IP address: {err}")
             }
-            FlorestadError::NoIPAddressesFound(hostname) => {
+            Self::NoIPAddressesFound(hostname) => {
                 write!(f, "No IP Addresses found for {hostname}")
             }
-            FlorestadError::CouldNotResolveHostname(host) => {
+            Self::CouldNotResolveHostname(host) => {
                 write!(f, "Could not resolve hostname: {host}")
             }
-            FlorestadError::CouldNotLoadFlatChainStore(err) => {
+            Self::CouldNotLoadFlatChainStore(err) => {
                 write!(f, "Failure while loading flat chainstore: {err:?}")
             }
         }

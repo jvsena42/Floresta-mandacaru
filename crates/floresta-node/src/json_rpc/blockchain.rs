@@ -2,11 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use bitcoin::Address;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::MerkleBlock;
+use bitcoin::Network;
 use bitcoin::OutPoint;
 use bitcoin::Script;
 use bitcoin::ScriptBuf;
@@ -17,15 +20,18 @@ use bitcoin::consensus::Encodable;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::constants::genesis_block;
 use bitcoin::hashes::Hash;
-use corepc_types::ScriptPubkey;
+use bitcoin::hex::DisplayHex;
+use corepc_types::ScriptPubKey;
 use corepc_types::v29::GetTxOut;
 use corepc_types::v30::DeploymentInfo;
 use corepc_types::v30::GetBlockHeaderVerbose;
 use corepc_types::v30::GetBlockVerboseOne;
+use corepc_types::v30::GetBlockchainInfo;
 use corepc_types::v30::GetDeploymentInfo;
 use floresta_chain::buried_deployments_for;
 use floresta_chain::extensions::HeaderExt;
 use floresta_chain::extensions::WorkExt;
+use floresta_wire::node_interface::ChainMethods;
 use miniscript::descriptor::checksum;
 use serde_json::Value;
 use serde_json::json;
@@ -34,19 +40,29 @@ use tracing::debug;
 use super::res::GetBlockHeaderRes;
 use super::res::GetBlockchainInfoRes;
 use super::res::GetTxOutProof;
-use super::res::JsonRpcError;
+use super::res::jsonrpc_interface::JsonRpcError;
 use super::server::RpcChain;
 use super::server::RpcImpl;
 use crate::json_rpc::res::GetBlockRes;
 use crate::json_rpc::res::RescanConfidence;
+use crate::json_rpc::server::SERIALIZATION_EXPECT_MSG;
+use crate::json_rpc::server::to_core_asm_string;
 
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     async fn get_block_inner(&self, hash: BlockHash) -> Result<Block, JsonRpcError> {
-        let is_genesis = self.chain.get_block_hash(0).unwrap().eq(&hash);
+        let is_genesis = self
+            .chain
+            .get_block_hash(0)
+            .map_err(|_| JsonRpcError::Chain)?
+            .eq(&hash);
 
         if is_genesis {
             return Ok(genesis_block(self.network));
         }
+
+        // Verify the block header is known before requesting the full block
+        // from the network, otherwise the request will hang indefinitely.
+        self.get_block_header_inner(hash)?;
 
         self.node
             .get_block(hash)
@@ -61,7 +77,11 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             .wallet
             .get_height(txid)
             .ok_or(JsonRpcError::TxNotFound)?;
-        let blockhash = self.chain.get_block_hash(height).unwrap();
+        let blockhash = self
+            .chain
+            .get_block_hash(height)
+            .map_err(|_| JsonRpcError::BlockNotFound)?;
+
         self.chain
             .get_block(&blockhash)
             .map_err(|_| JsonRpcError::BlockNotFound)
@@ -70,17 +90,11 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     pub fn get_rescan_interval(
         &self,
         use_timestamp: bool,
-        start: Option<u32>,
-        stop: Option<u32>,
-        confidence: Option<RescanConfidence>,
+        start: u32,
+        stop: u32,
+        confidence: RescanConfidence,
     ) -> Result<(u32, u32), JsonRpcError> {
-        let start = start.unwrap_or(0u32);
-        let stop = stop.unwrap_or(0u32);
-
         if use_timestamp {
-            let confidence = confidence.unwrap_or(RescanConfidence::Medium);
-            // `get_block_height_by_timestamp` already does the time validity checks.
-
             let start_height = self.get_block_height_by_timestamp(start, &confidence)?;
 
             let stop_height = self.get_block_height_by_timestamp(stop, &RescanConfidence::Exact)?;
@@ -173,7 +187,11 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
     // getbestblockhash
     pub(super) fn get_best_block_hash(&self) -> Result<BlockHash, JsonRpcError> {
-        Ok(self.chain.get_best_block().unwrap().1)
+        Ok(self
+            .chain
+            .get_best_block()
+            .map_err(|_| JsonRpcError::Chain)?
+            .1)
     }
 
     // getblock
@@ -235,32 +253,59 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 
     // getblockchaininfo
+    //
+    // `headers` tracks the best-known header tip; `blocks` tracks the validated
+    // tip. They can diverge mid-IBD and coincide once sync completes.
     pub(super) fn get_blockchain_info(&self) -> Result<GetBlockchainInfoRes, JsonRpcError> {
-        let (height, hash) = self.chain.get_best_block().unwrap();
-        let validated = self.chain.get_validation_index().unwrap();
-        let ibd = self.chain.is_in_ibd();
-        let latest_header = self.chain.get_block_header(&hash).unwrap();
-        let latest_work = latest_header
+        let (height, hash) = self
+            .chain
+            .get_best_block()
+            .map_err(|_| JsonRpcError::Chain)?;
+        let validated = self
+            .chain
+            .get_validation_index()
+            .map_err(|_| JsonRpcError::Chain)?;
+        let initial_block_download = self.chain.is_in_ibd();
+        let latest_header = self
+            .chain
+            .get_block_header(&hash)
+            .map_err(|_| JsonRpcError::Chain)?;
+        let chain_work = latest_header
             .calculate_chain_work(&self.chain)?
             .to_string_hex();
-        let latest_block_time = latest_header.time;
-        let leaf_count = self.chain.acc().leaves as u32;
-        let root_count = self.chain.acc().roots.len() as u32;
-        let root_hashes = self
+
+        let verification_progress = self.verification_progress(validated, &latest_header)?;
+
+        let blocks = i64::from(validated);
+        let headers = i64::from(height);
+        let best_block_hash = hash.to_string();
+        let bits = latest_header.get_bits_hex();
+        let target = latest_header.get_target_hex();
+        let difficulty = latest_header.get_difficulty();
+        let time = i64::from(latest_header.time);
+        let median_time = i64::from(latest_header.calculate_median_time_past(&self.chain)?);
+        let size_on_disk = self.chain.size_on_disk().map_err(|_| JsonRpcError::Chain)?;
+        let prune_height = Some(blocks + 1);
+        let warnings = self
             .chain
-            .acc()
-            .roots
-            .into_iter()
-            .map(|r| r.to_string())
+            .get_warnings()
+            .iter()
+            .map(ToString::to_string)
             .collect();
 
-        let validated_blocks = self.chain.get_validation_index().unwrap();
+        let chain = match self.network {
+            Network::Bitcoin => "main",
+            Network::Testnet => "test",
+            Network::Testnet4 => "testnet4",
+            Network::Signet => "signet",
+            Network::Regtest => "regtest",
+        }
+        .to_string();
 
-        let validated_percentage = if height != 0 {
-            validated_blocks as f32 / height as f32
-        } else {
-            0.0
-        };
+        let acc = self.chain.acc();
+        let leaf_count = acc.leaves;
+        let root_count = acc.roots.len() as u32;
+        let root_hashes = acc.roots.iter().map(ToString::to_string).collect();
 
         let filters = self
             .block_filter_storage
@@ -278,19 +323,33 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             (None, None)
         };
 
+        let core = GetBlockchainInfo {
+            chain,
+            blocks,
+            headers,
+            best_block_hash,
+            bits,
+            target,
+            difficulty,
+            time,
+            median_time,
+            verification_progress,
+            initial_block_download,
+            chain_work,
+            size_on_disk,
+            pruned: true,
+            prune_height,
+            automatic_pruning: Some(true),
+            prune_target_size: Some(0),
+            signet_challenge: None,
+            warnings,
+        };
+
         Ok(GetBlockchainInfoRes {
-            best_block: hash.to_string(),
-            height,
-            ibd,
-            validated,
-            latest_work,
-            latest_block_time,
+            core,
             leaf_count,
             root_count,
             root_hashes,
-            chain: self.network.to_string(),
-            difficulty: latest_header.difficulty(self.chain.get_params()) as u64,
-            progress: validated_percentage,
             filters,
             filters_start,
             rescan_in_progress,
@@ -301,7 +360,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
     // getblockcount
     pub(super) fn get_block_count(&self) -> Result<u32, JsonRpcError> {
-        Ok(self.chain.get_height().unwrap())
+        self.chain.get_height().map_err(|_| JsonRpcError::Chain)
     }
 
     // getblockfilter
@@ -453,7 +512,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
     /// Returns a label about the scriptPubKey type
     /// (pubkey, pubkeyhash, multisig, nulldata, scripthash, witness_v0_keyhash, witness_v0_scripthash, witness_v1_taproot, anchor, nonstandard)
-    fn get_script_type_label(script: &Script) -> &'static str {
+    pub(super) fn get_script_type_label(script: &Script) -> &'static str {
         if script.is_p2pk() {
             return "pubkey";
         }
@@ -493,20 +552,15 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         "nonstandard"
     }
 
-    fn get_script_type_descriptor(script: &Script, address: &Option<Address>) -> String {
-        let get_addr_str = || {
-            address
-                .as_ref()
-                .expect("address should be Some")
-                .to_string()
-        };
-
-        if script.is_p2pk() {
-            let addr = get_addr_str();
-            return format!("pk({addr}");
-        }
-
+    /// TODO: This function is not compliant with Bitcoin Core.
+    /// See: <https://github.com/getfloresta/Floresta/issues/987>
+    pub(super) fn get_script_type_descriptor(script: &Script, address: &Option<Address>) -> String {
+        // Try script from the address
         if let Some(addr) = address {
+            if script.is_p2pk() {
+                return format!("pk({addr})");
+            }
+
             return format!("addr({addr})");
         }
 
@@ -515,83 +569,8 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             return format!("raw({hex})");
         }
 
-        if Self::is_anchor_type(script) {
-            let addr = get_addr_str();
-            return format!("addr({addr})");
-        }
-
         let hex = script.to_hex_string();
         format!("raw({hex})")
-    }
-
-    /// Parses the serialized opcodes in a [ScriptBuf] as numbers and it's hashes.
-    /// This differs from `ScriptBuf::to_asm_string` in that, `rust-bitcoin` will
-    /// show the the human representation of the opcode. It does not omit the number representations of
-    /// `OP_PUSHDATA_<N>` and `OP_PUSHBYTE<N>`. This method do the opposite: it not show the human
-    /// representation and omit the last opcodes, so it can be compliant with bitcoin-core.
-    /// For reference see <https://en.bitcoin.it/wiki/Script#Opcodes>
-    fn to_core_asm_string(script: &ScriptBuf) -> Result<String, JsonRpcError> {
-        let mut asm = vec![];
-        let bytes = script.as_bytes();
-        let mut i = 0usize;
-
-        // little reused helper to hex string
-        let to_hex_string = |r: &[u8]| r.iter().map(|b| format!("{b:02x}")).collect::<String>();
-
-        while i < bytes.len() {
-            let byte = bytes[i];
-            i += 1;
-
-            match byte {
-                // OP_0
-                0x00 => asm.push(format!("{}", 0)),
-                // OP_PUSHDATA_<N>: The next N bytes is data to be pushed onto the stack
-                0x01..=0x4b => {
-                    let pushed_bytes = byte as usize;
-                    let hex = to_hex_string(&bytes[i..i + pushed_bytes]);
-                    asm.push(hex);
-                    i += pushed_bytes;
-                }
-                // OP_PUSHBYTE1: the next byte contains the number of bytes to be pushed onto the stack.
-                0x4c => {
-                    let pushed_bytes = bytes[i] as usize;
-                    i += 1;
-                    let hex = to_hex_string(&bytes[i..i + pushed_bytes]);
-                    asm.push(hex);
-                    i += pushed_bytes;
-                }
-                // OP_PUSHBYTE2: the next two bytes contain the number of bytes to be pushed onto the stack in little endian order.
-                0x4d => {
-                    let pushed_bytes = u16::from_le_bytes([bytes[i], bytes[i + 1]]) as usize;
-                    i += 2;
-                    let hex = to_hex_string(&bytes[i..i + pushed_bytes]);
-                    asm.push(hex);
-                    i += pushed_bytes;
-                }
-                // OP_PUSHBYTE4: the next four bytes contain the number of bytes to be pushed onto the stack in little endian order.
-                0x4e => {
-                    let pushed_bytes =
-                        u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
-                            as usize;
-                    i += 4;
-                    let hex = to_hex_string(&bytes[i..i + pushed_bytes]);
-                    asm.push(hex);
-                    i += pushed_bytes;
-                }
-                // OP_1 to OP_16
-                0x51..=0x60 => {
-                    // 0x50 is OP_RESERVED
-                    let reserved = 0x50;
-                    asm.push(format!("{}", byte - reserved));
-                }
-                // Any other opcode that should  be pushed
-                another_one => {
-                    asm.push(format!("{another_one:02x}"));
-                }
-            }
-        }
-
-        Ok(asm.join(" "))
     }
 
     /// gettxout: returns details about an unspent transaction output.
@@ -620,13 +599,14 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 let address = Address::from_script(script, network).ok();
 
                 let base_descriptor = Self::get_script_type_descriptor(script, &address);
-                let descriptor: Option<String> = match checksum::desc_checksum(&base_descriptor) {
-                    Ok(checksum) => Some(format!("{base_descriptor}#{checksum}")),
+                let mut checksum_engine = checksum::Engine::new();
+                let descriptor: Option<String> = match checksum_engine.input(&base_descriptor) {
+                    Ok(()) => Some(format!("{base_descriptor}#{}", checksum_engine.checksum())),
                     Err(_) => None,
                 };
 
-                let asm = Self::to_core_asm_string(&txout.script_pubkey)?;
-                let script_pubkey = ScriptPubkey {
+                let asm = to_core_asm_string(&txout.script_pubkey, false);
+                let script_pubkey = ScriptPubKey {
                     asm,
                     hex: txout.script_pubkey.to_hex_string(),
                     descriptor,
@@ -676,7 +656,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         // Before building the merkle block we try to remove all txids
         // that aren't present in the block we found, meaning that
         // at least one of the txids doesn't belong to the block which
-        // in case needs to make the command fails.
+        // in case should make the command fail.
         //
         // this makes the use MerkleBlock::from_block_with_predicate useless.
         let targeted_txids: Vec<Txid> = block
@@ -701,7 +681,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         merkle_block
             .consensus_encode(&mut bytes)
             .expect("This will raise if a writer error happens");
-        Ok(GetTxOutProof(bytes))
+        Ok(GetTxOutProof(bytes.to_lower_hex_string()))
     }
 
     // gettxoutsetinfo
@@ -726,7 +706,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         height: u32,
     ) -> Result<Value, JsonRpcError> {
         if let Some(txout) = self.wallet.get_utxo(&OutPoint { txid, vout }) {
-            return Ok(serde_json::to_value(txout).unwrap());
+            return Ok(serde_json::to_value(txout).expect(SERIALIZATION_EXPECT_MSG));
         }
 
         // if we are on IBD, we don't have any filters to find this txout.
@@ -790,5 +770,44 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             .get_descriptors()
             .map_err(|e| JsonRpcError::Wallet(e.to_string()))?;
         Ok(descriptors)
+    }
+
+    /// Time-based estimate of validated-tip progress in `[0.0, 1.0]`.
+    ///
+    /// Ratio of chain-time elapsed between genesis and the validated block,
+    /// over chain-time between genesis and the later of `now` or the tip
+    /// header's time. Returns `0.0` for cold start, clamps to `1.0` at tip.
+    fn verification_progress(
+        &self,
+        validated: u32,
+        latest_header: &Header,
+    ) -> Result<f64, JsonRpcError> {
+        let header_tip_time = latest_header.time;
+
+        let validated_block_time = self
+            .chain
+            .get_block_hash(validated)
+            .and_then(|hash| self.chain.get_block_header(&hash))
+            .map_err(|_| JsonRpcError::Chain)?
+            .time;
+
+        let genesis_time = genesis_block(self.network).header.time;
+        let now: u32 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| JsonRpcError::InvalidSystemTime)?
+            .as_secs()
+            .try_into()
+            .map_err(|_| JsonRpcError::InvalidSystemTime)?;
+
+        let elapsed_validated = validated_block_time.saturating_sub(genesis_time);
+        let elapsed_total = now.max(header_tip_time).saturating_sub(genesis_time);
+
+        // Cold start: the tip is still genesis and the clock has not reached
+        // genesis time, so there is no span to measure against.
+        if elapsed_total == 0 {
+            return Ok(0.0);
+        }
+
+        Ok((f64::from(elapsed_validated) / f64::from(elapsed_total)).clamp(0.0, 1.0))
     }
 }

@@ -27,11 +27,15 @@ use floresta_chain::FlatChainStoreConfig;
 pub use floresta_chain::SnapshotError;
 pub use floresta_chain::UtreexoSnapshot;
 use floresta_chain::pruned_utreexo::BlockchainInterface;
+use floresta_chain::pruned_utreexo::merkle::ConsensusMerkle;
+#[cfg(feature = "json-rpc")]
+use floresta_common::NetworkExt;
 use floresta_common::try_and_log;
 #[cfg(feature = "compact-filters")]
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 #[cfg(feature = "compact-filters")]
 use floresta_compact_filters::network_filters::NetworkFilters;
+use floresta_domain::mempool::MempoolBase;
 use floresta_electrum::electrum_protocol::ElectrumServer;
 use floresta_electrum::electrum_protocol::client_accept_loop;
 use floresta_mempool::Mempool;
@@ -118,7 +122,7 @@ pub struct Config {
     /// Where should we read from a config file
     ///
     /// This is a toml-encoded file with floresta's configs. For a sample of how this file looks
-    /// like, see config.toml.sample inside floresta's codebase.
+    /// like, see `contrib/config.toml.sample` inside floresta's codebase.
     ///
     /// If a setting is modified by the config file and this config struct, the following logic is
     /// used:
@@ -159,10 +163,10 @@ pub struct Config {
     /// is the address that we'll listen for incoming connections.
     pub zmq_address: Option<String>,
 
-    /// A node to connect to
+    /// Nodes to connect to
     ///
-    /// If this option is provided, we'll connect **only** to this node.
-    pub connect: Option<String>,
+    /// If non-empty, we'll connect **only** to these nodes.
+    pub connect: Vec<String>,
 
     #[cfg(feature = "json-rpc")]
     /// The address our json-rpc should listen to
@@ -240,7 +244,7 @@ impl Config {
             filters_start_height: None,
             #[cfg(feature = "zmq-server")]
             zmq_address: None,
-            connect: None,
+            connect: Vec::new(),
             #[cfg(feature = "json-rpc")]
             json_rpc_address: None,
             log_to_stdout: false,
@@ -300,14 +304,14 @@ pub enum DumpError {
 impl fmt::Display for DumpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DumpError::NotStarted => write!(f, "daemon has not been started yet"),
-            DumpError::NotSynced => {
+            Self::NotStarted => write!(f, "daemon has not been started yet"),
+            Self::NotSynced => {
                 write!(
                     f,
                     "initial block download not finished; dump not yet available"
                 )
             }
-            DumpError::Chain(e) => write!(f, "chain error while dumping accumulator: {e:?}"),
+            Self::Chain(e) => write!(f, "chain error while dumping accumulator: {e:?}"),
         }
     }
 }
@@ -481,20 +485,27 @@ impl Florestad {
         Ok(sock)
     }
 
-    /// Actually runs florestad, spawning all modules and waiting until
-    /// someone asks to stop.
+    /// Initializes the daemon and starts its background services.
     ///
-    /// This function will return an error if the configured data directory path is not an
-    /// **existing and writable directory**, or cannot be validated as such.
+    /// This loads the wallet and chain state, constructs the P2P and Electrum services and spawns
+    /// their asynchronous tasks. The method returns after startup completes and the services continue
+    /// running until a shutdown is requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data directory is invalid or if a required database, service,
+    /// listener or TLS configuration cannot be initialized.
     pub async fn start(&self) -> Result<(), FlorestadError> {
         let datadir: &Path = self.config.datadir.as_ref();
 
         // Check that the directory exists and is writable
-        Florestad::validate_data_dir(datadir)?;
+        Self::validate_data_dir(datadir)?;
 
         info!("Loading watch-only wallet");
         let wallet = self.setup_wallet()?;
 
+        // Restore the validated chainstate from persistent storage.
+        // The `Arc` allows the P2P and API services to share the same chainstate.
         info!("Loading blockchain database");
         let blockchain_state = Arc::new(Self::load_chain_state(
             datadir,
@@ -622,7 +633,7 @@ impl Florestad {
             pow_fraud_proofs: false,
             proxy,
             datadir: datadir.into(),
-            fixed_peer: self.config.connect.clone(),
+            fixed_peers: self.config.connect.clone(),
             compact_filters: self.config.cfilters,
             assume_utreexo: picked,
             backfill: self.config.backfill,
@@ -634,13 +645,19 @@ impl Florestad {
 
         let kill_signal = self.stop_signal.clone();
 
-        // Chain Provider (p2p)
+        // Create a single in-memory mempool shared by the node and its peer tasks.
+        // The asynchronous mutex provides exclusive mutable access,
+        // while the `Arc` provides shared ownership.
+        let mempool: Arc<tokio::sync::Mutex<dyn MempoolBase>> = Arc::new(tokio::sync::Mutex::new(
+            Mempool::new(DEFAULT_MEMPOOL_MAX_SIZE_BYTES),
+        ));
+
+        // Construct the P2P node with shared access to the chain state and mempool so it can
+        // validate blocks and serve or broadcast unconfirmed transactions.
         let chain_provider = UtreexoNode::<_, RunningNode>::new(
             config,
             blockchain_state.clone(),
-            Arc::new(tokio::sync::Mutex::new(Mempool::new(
-                DEFAULT_MEMPOOL_MAX_SIZE_BYTES,
-            ))),
+            mempool,
             cfilters.clone(),
             kill_signal.clone(),
             AddressMan::new(None, &ReachableNetworks::SUPPORTED),
@@ -681,11 +698,12 @@ impl Florestad {
                 self.config
                     .json_rpc_address
                     .as_ref()
-                    .map(|x| Self::resolve_hostname(x, 8332))
+                    .map(|x| Self::resolve_hostname(x, self.config.network.default_rpc_port()))
                     .transpose()?,
                 datadir.join("debug.log"),
                 self.config.user_agent.clone(),
                 proxy,
+                !self.config.allow_v1_fallback,
             ));
 
             if self.json_rpc.set(server).is_err() {
@@ -803,12 +821,13 @@ impl Florestad {
         // Electrum Server's main loop.
         task::spawn(electrum_server.main_loop());
 
-        // Chain provider
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
         let mut recv = self.stop_notify.lock().unwrap();
         *recv = Some(receiver);
 
+        // Spawn the primary node task, which manages peer connections, chain synchronization,
+        // block processing and transaction relay.
         task::spawn(chain_provider.run(sender));
 
         // Metrics
@@ -817,7 +836,7 @@ impl Florestad {
             let metrics_server_address =
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 3333);
 
-            task::spawn(metrics::metrics_server(metrics_server_address));
+            task::spawn(floresta_metrics::metrics_server(metrics_server_address));
             info!("Started metrics server on: {metrics_server_address}",);
 
             // Periodically update memory usage
@@ -827,7 +846,7 @@ impl Florestad {
 
                 loop {
                     ticker.tick().await;
-                    metrics::get_metrics().update_memory_usage();
+                    floresta_metrics::get_metrics().update_memory_usage();
                 }
             });
         }
@@ -932,7 +951,7 @@ impl Florestad {
         let database = KvDatabase::new(&self.config.datadir)
             .map_err(FlorestadError::CouldNotOpenKvDatabase)?;
 
-        let wallet = AddressCache::new(database);
+        let wallet = AddressCache::new(database, ConsensusMerkle);
 
         wallet
             .setup()

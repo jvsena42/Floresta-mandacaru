@@ -77,6 +77,8 @@ use core::fmt::Display;
 use core::fmt::Formatter;
 use core::mem::size_of;
 use core::num::NonZeroUsize;
+use std::collections::HashSet;
+use std::fs;
 use std::fs::DirBuilder;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -101,11 +103,13 @@ use index_impl::Index;
 use lru::LruCache;
 use memmap2::MmapMut;
 use memmap2::MmapOptions;
+use tracing::debug;
 use tracing::info;
 use twox_hash::XxHash3_64;
 
 use crate::BestChain;
 use crate::ChainStore;
+use crate::ChainStoreWarning;
 use crate::DatabaseError;
 use crate::DiskBlockHeader;
 
@@ -186,7 +190,7 @@ pub struct FlatChainStoreConfig {
 impl FlatChainStoreConfig {
     /// Creates a new configuration with the default values
     pub fn new(path: impl AsRef<Path>) -> Self {
-        FlatChainStoreConfig {
+        Self {
             file_permission: Some(0o666),
             fork_file_size: Some(10_000),
             headers_file_size: Some(10_000_000),
@@ -259,7 +263,7 @@ mod index_impl {
                 return Err(FlatChainstoreError::OversizedIndex);
             }
 
-            Ok(Index(index))
+            Ok(Self(index))
         }
 
         /// Create a new fork entry (MSB is set)
@@ -269,7 +273,7 @@ mod index_impl {
                 return Err(FlatChainstoreError::OversizedIndex);
             }
 
-            Ok(Index(index | Self::FORK_BIT))
+            Ok(Self(index | Self::FORK_BIT))
         }
 
         /// Tells if this is a block in our main chain
@@ -440,7 +444,7 @@ impl_error_from!(FlatChainstoreError, std::io::Error, Io);
 
 impl From<PoisonError<MutexGuard<'_, CacheType>>> for FlatChainstoreError {
     fn from(_: PoisonError<MutexGuard<'_, CacheType>>) -> Self {
-        FlatChainstoreError::PoisonedLock
+        Self::PoisonedLock
     }
 }
 
@@ -621,8 +625,13 @@ pub struct FlatChainStore {
     /// The file containing the accumulators for each blocks
     accumulator_file: File,
 
+    /// Backing-file directory; needed by `size_on_disk` since `MmapMut` drops the file handle.
+    datadir: PathBuf,
+
     /// A LRU cache for the last n blocks we've touched
     cache: Mutex<LruCache<BlockHash, DiskBlockHeader>>,
+    /// Warnings accumulated when writes fail; surfaced via [`ChainStore::get_warnings`].
+    pending_warnings: Vec<ChainStoreWarning>,
 }
 
 impl FlatChainStore {
@@ -710,7 +719,9 @@ impl FlatChainStore {
             metadata,
             block_index: BlockIndex::new(index_map, index_size),
             fork_headers,
+            datadir: datadir.to_path_buf(),
             cache: LruCache::new(cache_size).into(),
+            pending_warnings: Vec::new(),
         })
     }
 
@@ -781,7 +792,9 @@ impl FlatChainStore {
             metadata: metadata_file,
             block_index: BlockIndex::new(index_map, metadata.index_capacity),
             fork_headers,
+            datadir: datadir.clone(),
             cache: LruCache::new(cache_size).into(),
+            pending_warnings: Vec::new(),
         })
     }
 
@@ -958,19 +971,63 @@ impl FlatChainStore {
         metadata.depth = best_block.depth;
         metadata.validation_index = best_block.validation_index;
 
-        assert!(best_block.alternative_tips.len() <= 64);
+        Ok(())
+    }
 
-        unsafe {
-            metadata
-                .alternative_tips
-                .as_mut_ptr()
-                .copy_from_nonoverlapping(
-                    best_block.alternative_tips.as_ptr(),
-                    best_block.alternative_tips.len(),
-                );
+    /// Derives the current set of alternative chain tips by scanning stored fork headers.
+    ///
+    /// A fork header is considered a tip if no other fork header references it as its
+    /// parent (`prev_blockhash`). This mirrors how Bitcoin Core computes chain tips from
+    /// its block index rather than maintaining an explicit on-disk list.
+    ///
+    /// Orphan and invalid-chain headers are also stored in the fork headers file, and
+    /// they are included as `alternative_tips` for monitoring purposes being filtered by
+    /// `find_fork_point` so we dont switch into an invalid tip. Finding a main-chain
+    /// header in a fork slot means the database is corrupted.
+    ///
+    /// Blocks that were reorged into the main chain leave stale `InFork` copies in the
+    /// fork headers file, so candidate tips are checked against the block index (which
+    /// reorgs repoint to the main-chain slot) and kept only if still `InFork`.
+    ///
+    /// This is called once on startup (via `get_best_chain`) to populate the in-memory
+    /// `BestChain.alternative_tips` cache. At runtime, tips are maintained incrementally
+    /// by `ChainState::push_alt_tip`.
+    fn derive_alternative_tips(&self) -> Result<Vec<BlockHash>, FlatChainstoreError> {
+        let metadata = unsafe { self.get_metadata()? };
+        let fork_count = metadata.fork_count as usize;
+
+        let mut fork_hashes = HashSet::with_capacity(fork_count);
+        let mut parent_hashes = HashSet::with_capacity(fork_count);
+
+        for i in 0..fork_count {
+            let index = Index::new_fork(i as u32)?;
+            let hdr = unsafe { self.get_disk_header(index)? };
+            match hdr.header {
+                DiskBlockHeader::InFork(..)
+                | DiskBlockHeader::Orphan(..)
+                | DiskBlockHeader::InvalidChain(..) => {
+                    fork_hashes.insert(hdr.hash);
+                    parent_hashes.insert(hdr.header.prev_blockhash);
+                }
+                // These headers are never written to fork slots
+                DiskBlockHeader::FullyValid(..)
+                | DiskBlockHeader::HeadersOnly(..)
+                | DiskBlockHeader::AssumedValid(..) => {
+                    return Err(FlatChainstoreError::CorruptedDatabase);
+                }
+            }
         }
 
-        Ok(())
+        let mut tips = Vec::new();
+        for hash in fork_hashes.difference(&parent_hashes) {
+            // A reorged-in block leaves a stale `InFork` copy in the fork headers file;
+            // the block index is authoritative about its current status.
+            if let Some(DiskBlockHeader::InFork(..)) = unsafe { self.get_header_by_hash(*hash)? } {
+                tips.push(*hash);
+            }
+        }
+
+        Ok(tips)
     }
 
     unsafe fn get_best_chain(&self) -> Result<BestChain, FlatChainstoreError> {
@@ -980,11 +1037,7 @@ impl FlatChainStore {
             best_block: metadata.best_block,
             depth: metadata.depth,
             validation_index: metadata.validation_index,
-            alternative_tips: metadata
-                .alternative_tips
-                .into_iter()
-                .take_while(|tip| *tip != BlockHash::all_zeros())
-                .collect(),
+            alternative_tips: self.derive_alternative_tips()?,
         })
     }
 
@@ -1123,6 +1176,12 @@ impl FlatChainStore {
     ) -> Result<MutexGuard<'_, CacheType>, PoisonError<MutexGuard<'_, CacheType>>> {
         self.cache.lock()
     }
+
+    fn try_push_warning(&mut self, warning: ChainStoreWarning) {
+        if !self.pending_warnings.contains(&warning) {
+            self.pending_warnings.push(warning);
+        }
+    }
 }
 
 impl ChainStore for FlatChainStore {
@@ -1134,6 +1193,29 @@ impl ChainStore for FlatChainStore {
 
     fn flush(&mut self) -> Result<(), Self::Error> {
         unsafe { self.do_flush() }
+    }
+
+    fn size_on_disk(&self) -> Result<u64, Self::Error> {
+        let metadata = unsafe { self.get_metadata() }?;
+        let header_size = size_of::<HashedDiskHeader>() as u64;
+
+        // Fixed-size record files: compute from bookkeeping.
+        let mut total = (u64::from(metadata.depth) + 1) * header_size
+            + u64::from(metadata.fork_count) * header_size;
+
+        // Variable-structure files: report apparent (preallocated) length.
+        for name in ["blocks_index.bin", "metadata.bin", "accumulators.bin"] {
+            let path = self.datadir.join(name);
+            match fs::metadata(&path) {
+                Ok(meta) => total += meta.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!("size_on_disk: {name} not found, skipping");
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(total)
     }
 
     fn save_roots_for_block(&mut self, roots: Vec<u8>, height: u32) -> Result<(), Self::Error> {
@@ -1247,7 +1329,7 @@ impl ChainStore for FlatChainStore {
         let cache = self.get_cache_mut();
         cache?.put(header.block_hash(), *header);
 
-        match header {
+        let result = match header {
             DiskBlockHeader::FullyValid(_, _)
             | DiskBlockHeader::HeadersOnly(_, _)
             | DiskBlockHeader::AssumedValid(_, _) => unsafe {
@@ -1256,7 +1338,13 @@ impl ChainStore for FlatChainStore {
             DiskBlockHeader::InFork(_, _)
             | DiskBlockHeader::Orphan(_)
             | DiskBlockHeader::InvalidChain(_) => unsafe { self.save_fork_block(*header) },
+        };
+
+        if matches!(result, Err(FlatChainstoreError::FullIndex)) {
+            self.try_push_warning(ChainStoreWarning::HeaderStorageFull);
         }
+
+        result
     }
 
     fn get_block_hash(&self, height: u32) -> Result<Option<BlockHash>, Self::Error> {
@@ -1274,7 +1362,17 @@ impl ChainStore for FlatChainStore {
     fn update_block_index(&mut self, height: u32, hash: BlockHash) -> Result<(), Self::Error> {
         let index = Index::new(height)?;
 
-        unsafe { self.add_index_entry(hash, index) }
+        let result = unsafe { self.add_index_entry(hash, index) };
+
+        if matches!(result, Err(FlatChainstoreError::FullIndex)) {
+            self.try_push_warning(ChainStoreWarning::BlockIndexFull);
+        }
+
+        result
+    }
+
+    fn get_warnings(&self) -> Vec<ChainStoreWarning> {
+        self.pending_warnings.clone()
     }
 }
 
@@ -1309,7 +1407,7 @@ pub mod migrate_v0_to_v1 {
 
     impl From<MetadataV0> for Metadata {
         fn from(value: MetadataV0) -> Self {
-            Metadata {
+            Self {
                 magic: value.magic,
                 version: FLAT_CHAINSTORE_VERSION, // bump version
                 best_block: value.best_block,
@@ -1381,13 +1479,19 @@ mod tests {
 
     use bitcoin::Block;
     use bitcoin::BlockHash;
+    use bitcoin::CompactTarget;
     use bitcoin::Network;
+    use bitcoin::TxMerkleNode;
     use bitcoin::block::Header;
+    use bitcoin::block::Version;
     use bitcoin::consensus::Decodable;
     use bitcoin::consensus::deserialize;
     use bitcoin::constants::genesis_block;
     use bitcoin::hashes::Hash;
     use floresta_common::bhash;
+    use rand::RngExt;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
     use tempfile::TempDir;
     use twox_hash::XxHash3_64;
 
@@ -1396,11 +1500,13 @@ mod tests {
     use super::FlatChainStore;
     use super::FlatChainStoreConfig;
     use super::FlatChainstoreError;
+    use super::HashedDiskHeader;
     use super::Index;
     use crate::AssumeValidArg;
     use crate::BestChain;
     use crate::ChainState;
     use crate::ChainStore;
+    use crate::ChainStoreWarning;
     use crate::DbCheckSum;
     use crate::DiskBlockHeader;
     use crate::migrate_v0_to_v1::init_mmap;
@@ -1696,6 +1802,54 @@ mod tests {
         }
     }
 
+    fn make_sized_store(
+        block_index_size: usize,
+        headers_file_size: usize,
+        fork_file_size: usize,
+    ) -> FlatChainStore {
+        let test_id = rand::random::<u64>();
+        let config = FlatChainStoreConfig {
+            block_index_size: Some(block_index_size),
+            headers_file_size: Some(headers_file_size),
+            fork_file_size: Some(fork_file_size),
+            cache_size: Some(10),
+            file_permission: Some(0o660),
+            path: format!("./tmp-db/{test_id}/").into(),
+        };
+        FlatChainStore::new(config).unwrap()
+    }
+
+    #[test]
+    fn test_size_on_disk() {
+        // Size is derived from `depth` and `fork_count` in metadata, plus the
+        // apparent length of the variable-structure files.
+        const BLOCK_INDEX_SIZE: usize = 32_768;
+        const HEADERS_FILE_SIZE: usize = 32_768;
+        const FORK_FILE_SIZE: usize = 16_384;
+
+        let mut store = make_sized_store(BLOCK_INDEX_SIZE, HEADERS_FILE_SIZE, FORK_FILE_SIZE);
+        let header_size = size_of::<HashedDiskHeader>() as u64;
+        let initial = store.size_on_disk().unwrap();
+
+        // Bumping depth from 0 to 1 should add exactly one header record.
+        let genesis = genesis_block(Network::Regtest);
+        store
+            .save_height(&BestChain {
+                best_block: genesis.block_hash(),
+                depth: 1,
+                validation_index: genesis.block_hash(),
+                alternative_tips: vec![],
+            })
+            .unwrap();
+
+        let after = store.size_on_disk().unwrap();
+        assert_eq!(
+            after,
+            initial + header_size,
+            "size should grow by exactly one HashedDiskHeader when depth increments",
+        );
+    }
+
     #[test]
     fn test_save_height() {
         let mut store = get_test_chainstore(None).unwrap();
@@ -1855,5 +2009,286 @@ mod tests {
             Err(e) => panic!("Unexpected err: {e:?}"),
             Ok(_) => panic!("Should not have been able to save roots for a block we don't have"),
         }
+    }
+
+    /// Test helper that wraps a [`FlatChainStore`] with a seeded RNG and a fork slot
+    /// counter, providing ergonomic methods for building fork topologies.
+    struct ForkBuilder {
+        store: FlatChainStore,
+        rng: StdRng,
+        next_slot: u32,
+    }
+
+    impl ForkBuilder {
+        fn new(seed: u64) -> Self {
+            let mut store = get_test_chainstore(None).unwrap();
+            // The open-addressing hash map probes slots via `get_disk_header`.
+            // Position 0 must hold a valid header so probes that land there
+            // don't fail with `HeaderNotFound`.
+            let genesis = genesis_block(Network::Regtest);
+            store
+                .save_header(&DiskBlockHeader::FullyValid(genesis.header, 0))
+                .unwrap();
+            store.update_block_index(0, genesis.block_hash()).unwrap();
+            Self {
+                store,
+                rng: StdRng::seed_from_u64(seed),
+                next_slot: 0,
+            }
+        }
+
+        /// Save a single independent fork header branching off genesis and return its hash.
+        fn add_independent_fork(&mut self) -> BlockHash {
+            let genesis_hash = genesis_block(Network::Regtest).block_hash();
+            self.add_fork_child(genesis_hash)
+        }
+
+        /// Build a random header whose parent is `prev`.
+        fn make_header(&mut self, prev: BlockHash) -> Header {
+            Header {
+                version: Version::from_consensus(2),
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::from_byte_array(self.rng.random()),
+                time: self.rng.random(),
+                bits: CompactTarget::from_consensus(self.rng.random()),
+                nonce: self.rng.random(),
+            }
+        }
+
+        /// Extend a fork chain: save a header whose parent is `prev` and return its hash.
+        fn add_fork_child(&mut self, prev: BlockHash) -> BlockHash {
+            let header = self.make_header(prev);
+            let hash = header.block_hash();
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            self.store
+                .save_header(&DiskBlockHeader::InFork(header, slot))
+                .unwrap();
+            hash
+        }
+
+        /// Build a fork chain of `len` blocks branching off genesis and return the tip hash.
+        fn add_fork_chain(&mut self, len: usize) -> BlockHash {
+            let mut tip = genesis_block(Network::Regtest).block_hash();
+            for _ in 0..len {
+                tip = self.add_fork_child(tip);
+            }
+            tip
+        }
+
+        fn derive_tips(&self) -> std::collections::HashSet<BlockHash> {
+            self.store
+                .derive_alternative_tips()
+                .unwrap()
+                .into_iter()
+                .collect()
+        }
+    }
+
+    #[test]
+    fn derive_alternative_tips_no_forks() {
+        let fb = ForkBuilder::new(0x0f10_e57a_0000);
+        assert!(fb.derive_tips().is_empty());
+    }
+
+    #[test]
+    fn derive_alternative_tips_independent_forks() {
+        let mut fb = ForkBuilder::new(0x0f10_e57a_0001);
+
+        let expected: std::collections::HashSet<_> =
+            (0..5).map(|_| fb.add_independent_fork()).collect();
+
+        assert_eq!(fb.derive_tips(), expected);
+    }
+
+    #[test]
+    fn derive_alternative_tips_fork_chain() {
+        let mut fb = ForkBuilder::new(0x0f10_e57a_0002);
+
+        // Chain of 3: only the tip should be returned.
+        let tip = fb.add_fork_chain(3);
+
+        let tips = fb.derive_tips();
+        assert_eq!(tips.len(), 1);
+        assert!(tips.contains(&tip));
+    }
+
+    #[test]
+    fn derive_many_alternative_tips() {
+        let mut fb = ForkBuilder::new(0x0f10_e57a_0003);
+
+        // 300 tips, go brr and dont crash.
+        let expected: std::collections::HashSet<_> =
+            (0..300).map(|_| fb.add_independent_fork()).collect();
+
+        assert_eq!(fb.derive_tips(), expected);
+    }
+
+    #[test]
+    fn derive_alternative_tips_mixed_chains_and_independent() {
+        let mut fb = ForkBuilder::new(0x0f10_e57a_0004);
+
+        // Chain A→B (tip: B), independent C (tip: C), chain D→E→F (tip: F)
+        let tip_b = fb.add_fork_chain(2);
+        let tip_c = fb.add_independent_fork();
+        let tip_f = fb.add_fork_chain(3);
+
+        let expected: std::collections::HashSet<_> = [tip_b, tip_c, tip_f].into_iter().collect();
+        assert_eq!(fb.derive_tips(), expected);
+    }
+
+    #[test]
+    fn derive_alternative_tips_ignores_stale_promoted_forks() {
+        let mut fb = ForkBuilder::new(0x0f10_e57a_0007);
+
+        // Losing branch: stays in the fork file as a legit alternative tip.
+        let loser_tip = fb.add_fork_chain(2);
+
+        // Winning branch: two fork headers that later get promoted to the main chain,
+        // as `mark_chain_as_active` does during a reorg. Their stale `InFork` copies
+        // remain in the fork headers file.
+        let genesis_hash = genesis_block(Network::Regtest).block_hash();
+        let f1 = fb.make_header(genesis_hash);
+        let f2 = fb.make_header(f1.block_hash());
+        for (height, header) in [(1u32, f1), (2, f2)] {
+            fb.store
+                .save_header(&DiskBlockHeader::InFork(header, height))
+                .unwrap();
+        }
+
+        // Promote: re-save as main-chain headers and repoint the block index.
+        for (height, header) in [(1u32, f1), (2, f2)] {
+            fb.store
+                .save_header(&DiskBlockHeader::HeadersOnly(header, height))
+                .unwrap();
+            fb.store
+                .update_block_index(height, header.block_hash())
+                .unwrap();
+        }
+
+        let tips = fb.derive_tips();
+        assert_eq!(tips.len(), 1);
+        assert!(tips.contains(&loser_tip));
+    }
+
+    #[test]
+    fn derive_alternative_tips_corrupted_on_main_chain_variant() {
+        let mut fb = ForkBuilder::new(0x0f10_e57a_0006);
+
+        fb.add_independent_fork();
+
+        // `save_header` never routes main-chain variants to the fork headers file, so
+        // write one there directly to simulate a corrupted database.
+        let genesis_hash = genesis_block(Network::Regtest).block_hash();
+        let header = fb.make_header(genesis_hash);
+        unsafe {
+            fb.store
+                .save_fork_block(DiskBlockHeader::FullyValid(header, 1))
+                .unwrap();
+        }
+
+        assert!(matches!(
+            fb.store.derive_alternative_tips(),
+            Err(FlatChainstoreError::CorruptedDatabase)
+        ))
+    }
+
+    #[test]
+    fn test_warnings_block_index_full() {
+        // capacity=2 allows exactly one insert before FullIndex fires
+        // (occupancy 0→1 < 2 succeeds; 1+1=2 >= 2 fails)
+        const FILLS_AFTER_ONE_INSERT: usize = 2;
+        const UNCONSTRAINED_HEADERS: usize = 32_768;
+        const UNCONSTRAINED_FORK: usize = 16_384;
+
+        let mut store = make_sized_store(
+            FILLS_AFTER_ONE_INSERT,
+            UNCONSTRAINED_HEADERS,
+            UNCONSTRAINED_FORK,
+        );
+        let genesis = genesis_block(Network::Regtest);
+
+        // Empty buckets hold Index(0); hash_map_find_pos reads get_disk_header(Index(0)) before
+        // is_empty(). Slot 0 must be pre-populated (as production code always does via save_header).
+        store
+            .save_header(&DiskBlockHeader::FullyValid(genesis.header, 0))
+            .expect("pre-populate headers slot 0");
+
+        // Hash distinct from the genesis header at slot 0 → genuinely new entry, occupancy 0→1.
+        let hash_a = BlockHash::from_byte_array([0x01; 32]);
+        store
+            .update_block_index(1, hash_a)
+            .expect("first insert should succeed");
+
+        // Second insert: occupancy 1 + 1 = 2 >= index_capacity=2, FullIndex fires.
+        let r1 = store.update_block_index(2, BlockHash::from_byte_array([0x02; 32]));
+        assert!(
+            matches!(r1, Err(FlatChainstoreError::FullIndex)),
+            "second insert must fail with FullIndex"
+        );
+
+        let warns = store.get_warnings();
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0], ChainStoreWarning::BlockIndexFull);
+
+        // Third insert: same FullIndex; dedup must keep warnings at exactly one entry.
+        let r2 = store.update_block_index(3, BlockHash::from_byte_array([0x03; 32]));
+        assert!(matches!(r2, Err(FlatChainstoreError::FullIndex)));
+
+        let warns2 = store.get_warnings();
+        assert_eq!(
+            warns2.len(),
+            1,
+            "dedup: same warning must not be appended twice"
+        );
+
+        // Persistence: get_warnings must return the same set on a subsequent call.
+        let warns3 = store.get_warnings();
+        assert_eq!(
+            warns3.len(),
+            1,
+            "persistence: warning must survive get_warnings calls"
+        );
+    }
+
+    #[test]
+    fn test_warnings_header_storage_full() {
+        // only slot 0 (height 0) fits; height 1 is already out of range
+        const ONE_HEADER_SLOT: usize = 1;
+        const UNCONSTRAINED_INDEX: usize = 32_768;
+        const UNCONSTRAINED_FORK: usize = 16_384;
+
+        let mut store = make_sized_store(UNCONSTRAINED_INDEX, ONE_HEADER_SLOT, UNCONSTRAINED_FORK);
+        let header = genesis_block(Network::Regtest).header;
+
+        // Height 1 exceeds the single-slot file; must trigger FullIndex.
+        let r1 = store.save_header(&DiskBlockHeader::FullyValid(header, 1));
+        assert!(
+            matches!(r1, Err(FlatChainstoreError::FullIndex)),
+            "save_header at height 1 must fail with FullIndex when headers_file_size=1"
+        );
+
+        let warns = store.get_warnings();
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0], ChainStoreWarning::HeaderStorageFull);
+
+        // Second failed write: dedup must not grow the warning list.
+        let r2 = store.save_header(&DiskBlockHeader::FullyValid(header, 1));
+        assert!(matches!(r2, Err(FlatChainstoreError::FullIndex)));
+
+        let warns2 = store.get_warnings();
+        assert_eq!(
+            warns2.len(),
+            1,
+            "dedup: same warning must not be appended twice"
+        );
+
+        // Persistence: warning must survive a subsequent get_warnings call.
+        let warns3 = store.get_warnings();
+        assert_eq!(
+            warns3.len(),
+            1,
+            "persistence: warning must survive get_warnings calls"
+        );
     }
 }

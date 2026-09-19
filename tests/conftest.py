@@ -9,21 +9,44 @@ This module provides fixtures for creating and managing test nodes
 
 # pylint: disable=redefined-outer-name
 
-import os
 import logging
+import os
 import time
-from typing import List
-import pytest
+from typing import Callable, List
 
+import pytest
 from test_framework import FlorestaTestFramework
-from test_framework.node import Node, NodeType
-from test_framework.util import Utility
 from test_framework.constants import (
     FLORESTA_TEMP_DIR,
     WALLET_ADDRESS,
     WALLET_DESCRIPTOR_EXTERNAL,
     WALLET_DESCRIPTOR_INTERNAL,
 )
+from test_framework.node import Node, NodeType
+from test_framework.util import Utility
+
+
+def pytest_addoption(parser):
+    """Register custom pytest command-line options used by this test suite."""
+    parser.addoption(
+        "--run-expensive",
+        action="store_true",
+        default=False,
+        help="Run tests marked with the expensive marker",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip expensive-marked tests unless the dedicated opt-in flag is enabled."""
+    if config.getoption("--run-expensive"):
+        return
+
+    skip_expensive = pytest.mark.skip(
+        reason="need --run-expensive to run expensive tests"
+    )
+    for item in items:
+        if "expensive" in item.keywords:
+            item.add_marker(skip_expensive)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -64,29 +87,37 @@ def pytest_runtest_makereport(item, call):
     setattr(item, f"rep_{rep.when}", rep)
 
 
+def _create_logger(test_name):
+    """Create a logger with a file handler for the given test name.
+
+    Shared helper used by both function-scoped and class-scoped logging
+    fixtures to avoid duplicating the setup logic.
+    """
+    logger = logging.getLogger(test_name)
+
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(pathname)s:%(lineno)d - %(message)s"
+    )
+
+    log_path = Utility.get_log_path()
+    log_file = os.path.join(log_path, f"{test_name}", f"{test_name}.log")
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    file_handler = logging.FileHandler(log_file, mode="w")
+    file_handler.setFormatter(formatter)
+
+    if not logger.handlers:
+        logger.addHandler(file_handler)
+
+    return logger, log_file
+
+
 @pytest.fixture(scope="function")
 def setup_logging(request):
     """
     Configure logging for the test, including the file and line number where the log was called.
     """
     test_name = request.node.name
-    logger = logging.getLogger(test_name)
-
-    # Log format to include the file and line
-    formatter = logging.Formatter(
-        "%(asctime)s - %(levelname)s - %(pathname)s:%(lineno)d - %(message)s"
-    )
-
-    # Configure log file
-    git_describe = Utility.get_git_describe()
-    log_file = os.path.join(FLORESTA_TEMP_DIR, "logs", git_describe, f"{test_name}.log")
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    file_handler = logging.FileHandler(log_file, mode="w")
-    file_handler.setFormatter(formatter)
-
-    # Add handlers to the logger
-    if not logger.handlers:
-        logger.addHandler(file_handler)
+    logger, log_file = _create_logger(test_name)
 
     yield logger
 
@@ -175,7 +206,7 @@ def florestad_bitcoind(
 @pytest.fixture
 def florestad_bitcoind_utreexod_with_chain(
     florestad_node, bitcoind_node, utreexod_node, node_manager
-) -> tuple[Node, Node, Node]:
+) -> Callable[..., tuple[Node, Node, Node]]:
     """
     Factory fixture that initializes a three-node network with a populated blockchain.
 
@@ -187,7 +218,7 @@ def florestad_bitcoind_utreexod_with_chain(
     def _create_nodes_with_chain(
         blocks: int = 100,
         floresta_descriptors: List[str] | None = None,
-        addr_coinbase: str = None,
+        addr_coinbase: str | None = None,
     ) -> tuple[Node, Node, Node]:
         if floresta_descriptors is None:
             floresta_descriptors = [
@@ -214,6 +245,48 @@ def florestad_bitcoind_utreexod_with_chain(
     return _create_nodes_with_chain
 
 
+@pytest.fixture(scope="class")
+def shared_florestad_bitcoind_utreexod_with_chain(
+    shared_florestad_node,
+    shared_bitcoind_node,
+    shared_utreexod_node,
+    shared_node_manager,
+) -> Callable[..., tuple[Node, Node, Node]]:
+    """
+    Class-scoped variant of ``florestad_bitcoind_utreexod_with_chain``.
+
+    Returns a factory that initializes a three-node network shared across
+    every method in a test class.
+    """
+
+    def _create_nodes_with_chain(
+        blocks: int = 100,
+        floresta_descriptors: List[str] | None = None,
+    ) -> tuple[Node, Node, Node]:
+        if floresta_descriptors is None:
+            floresta_descriptors = [
+                WALLET_DESCRIPTOR_EXTERNAL,
+                WALLET_DESCRIPTOR_INTERNAL,
+            ]
+
+        for descriptor in floresta_descriptors:
+            shared_florestad_node.rpc.load_descriptor(descriptor)
+
+        shared_utreexod_node.rpc.generate(blocks)
+
+        shared_node_manager.connect_nodes(shared_florestad_node, shared_utreexod_node)
+        time.sleep(3)
+        shared_node_manager.connect_nodes(shared_bitcoind_node, shared_utreexod_node)
+        time.sleep(1)
+        shared_node_manager.connect_nodes(shared_florestad_node, shared_bitcoind_node)
+
+        shared_node_manager.wait_for_sync_nodes(is_finished_ibd=False)
+
+        return shared_florestad_node, shared_bitcoind_node, shared_utreexod_node
+
+    return _create_nodes_with_chain
+
+
 @pytest.fixture
 def add_node_with_tls(node_manager):
     """Creates and starts a node with TLS enabled, based on the specified variant."""
@@ -229,6 +302,63 @@ def add_node_with_tls(node_manager):
         return node
 
     return _create_node
+
+
+@pytest.fixture(scope="class")
+def shared_setup_logging(request):
+    """Class-scoped logging fixture for tests that share a single node."""
+    test_name = request.node.name
+    logger, _log_file = _create_logger(test_name)
+
+    yield logger
+
+    if hasattr(request.node, "rep_call") and request.node.rep_call.failed:
+        logger.error("=" * 80)
+        logger.error("TEST FAILED: %s", test_name)
+        logger.error("=" * 80)
+
+    logger.handlers.clear()
+
+
+@pytest.fixture(scope="class")
+def shared_node_manager(shared_setup_logging, request):
+    """Class-scoped node manager that lives for the entire test class."""
+    manager = FlorestaTestFramework(
+        logger=shared_setup_logging, test_name=request.node.name
+    )
+    yield manager
+    manager.stop()
+
+
+@pytest.fixture(scope="class")
+def shared_florestad_node(shared_node_manager) -> Node:
+    """Single florestad node shared across all methods in a test class."""
+    node = shared_node_manager.add_node_default_args(variant=NodeType.FLORESTAD)
+    shared_node_manager.run_node(node)
+    return node
+
+
+@pytest.fixture(scope="class")
+def shared_bitcoind_node(shared_node_manager) -> Node:
+    """Single bitcoind node shared across all methods in a test class."""
+    node = shared_node_manager.add_node_default_args(variant=NodeType.BITCOIND)
+    shared_node_manager.run_node(node)
+    return node
+
+
+@pytest.fixture(scope="class")
+def shared_utreexod_node(shared_node_manager) -> Node:
+    """Single utreexod node shared across all methods in a test class."""
+    node = shared_node_manager.add_node_extra_args(
+        variant=NodeType.UTREEXOD,
+        extra_args=[
+            f"--miningaddr={WALLET_ADDRESS}",
+            "--utreexoproofindex",
+            "--prune=0",
+        ],
+    )
+    shared_node_manager.run_node(node)
+    return node
 
 
 @pytest.fixture

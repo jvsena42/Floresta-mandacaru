@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::res::JsonRpcError;
+use super::res::jsonrpc_interface::JsonRpcError;
 use super::server::RpcChain;
 use super::server::RpcImpl;
 

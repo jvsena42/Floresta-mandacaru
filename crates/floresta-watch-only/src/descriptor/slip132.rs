@@ -120,11 +120,11 @@ pub enum Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
-            Error::Base58(e) => write!(f, "Base58 error: {e}"),
-            Error::Bip32(e) => write!(f, "BIP32 error: {e}"),
-            Error::UnknownSlip32Prefix => write!(f, "Unknown SLIP-132 prefix"),
-            Error::XprivUnsupported => write!(f, "Extended private keys are unsupported"),
-            Error::XpubMultisigUnsupported => {
+            Self::Base58(e) => write!(f, "Base58 error: {e}"),
+            Self::Bip32(e) => write!(f, "BIP32 error: {e}"),
+            Self::UnknownSlip32Prefix => write!(f, "Unknown SLIP-132 prefix"),
+            Self::XprivUnsupported => write!(f, "Extended private keys are unsupported"),
+            Self::XpubMultisigUnsupported => {
                 write!(
                     f,
                     "Extended public keys for multisig are unsupported. Use descriptors instead"
@@ -193,7 +193,7 @@ impl FromSlip132 for Xpub {
         };
         data[0..4].copy_from_slice(&bip44_prefix);
 
-        let xpub = Xpub::decode(&data)?;
+        let xpub = Self::decode(&data)?;
 
         Ok(xpub)
     }

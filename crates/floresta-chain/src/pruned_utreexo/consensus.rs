@@ -7,8 +7,6 @@
 
 extern crate alloc;
 
-use core::ffi::c_uint;
-
 use bitcoin::Amount;
 use bitcoin::Block;
 use bitcoin::CompactTarget;
@@ -19,16 +17,18 @@ use bitcoin::Target;
 use bitcoin::Transaction;
 use bitcoin::TxIn;
 use bitcoin::Txid;
+use bitcoin::absolute;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::blockdata::Weight;
 #[cfg(feature = "bitcoinkernel")]
 use bitcoin::consensus::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256;
-use bitcoin::merkle_tree;
 use bitcoin::script;
 #[cfg(feature = "bitcoinkernel")]
 use bitcoinkernel::PrecomputedTransactionData;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoinkernel::ScriptVerificationFlags;
 use floresta_common::prelude::*;
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
@@ -94,13 +94,30 @@ pub struct Consensus {
 
 impl From<Network> for Consensus {
     fn from(network: Network) -> Self {
-        Consensus {
+        Self {
             parameters: network.into(),
         }
     }
 }
 
 impl Consensus {
+    /// Returns the block-finality lock-time cutoff for a candidate block.
+    ///
+    /// Before CSV/BIP113 activation this is the block header time. After activation
+    /// it is the previous block's Median Time Past (MTP).
+    pub(crate) fn block_lock_time_cutoff<E>(
+        &self,
+        height: u32,
+        header: &BlockHeader,
+        previous_median_time_past: impl FnOnce() -> Result<u32, E>,
+    ) -> Result<u32, E> {
+        if height >= self.parameters.csv_activation_height {
+            previous_median_time_past()
+        } else {
+            Ok(header.time)
+        }
+    }
+
     /// Returns the amount of block subsidy to be paid in a block, given its height.
     ///
     /// The Bitcoin Core source can be found [here](https://github.com/bitcoin/bitcoin/blob/2b211b41e36f914b8d0487e698b619039cc3c8e2/src/validation.cpp#L1501-L1512).
@@ -164,15 +181,17 @@ impl Consensus {
     /// - The first transaction in the block must be coinbase
     /// - The coinbase transaction must have the correct value (subsidy + fees)
     /// - The block must not create more coins than allowed
+    /// - No output may be spent more than once within the block
     /// - All transactions must be valid, as verified by [`Consensus::verify_transaction`]
     #[allow(unused)]
     pub fn verify_block_transactions(
         height: u32,
+        lock_time_cutoff: u32,
         mut utxos: HashMap<OutPoint, UtxoData>,
         transactions: &[Transaction],
         subsidy: Amount,
         verify_script: bool,
-        flags: c_uint,
+        flags: u32,
     ) -> Result<(), BlockchainError> {
         // Blocks must contain at least one transaction (i.e., the coinbase)
         if transactions.is_empty() {
@@ -183,6 +202,10 @@ impl Consensus {
         let mut fee = Amount::ZERO;
 
         for (n, transaction) in transactions.iter().enumerate() {
+            if !Self::is_final_transaction(transaction, height, lock_time_cutoff) {
+                Err(BlockValidationErrors::NonFinalTransaction)?;
+            }
+
             if n == 0 {
                 if !transaction.is_coinbase() {
                     Err(BlockValidationErrors::FirstTxIsNotCoinbase)?;
@@ -351,22 +374,28 @@ impl Consensus {
     ///   - Doesn't "move" more coins than allowed (at most 21 million)
     ///   - Spends mature coins, in case any input refers to a coinbase transaction
     ///   - Has valid scripts (if we don't assume them), and within the allowed size
+    ///
+    /// Inputs are removed from `utxos` as they are loaded, independently of script validation.
+    /// This makes them unavailable to later transactions in the same block. Callers should treat
+    /// `utxos` as scratch validation state and discard it if this function returns an error.
     pub fn verify_transaction(
         transaction: &Transaction,
         utxos: &mut HashMap<OutPoint, UtxoData>,
         height: u32,
         _verify_script: bool,
-        _flags: c_uint,
+        _flags: u32,
     ) -> Result<(Amount, Amount), BlockchainError> {
         let txid = || transaction.compute_txid();
 
         let out_value = Self::check_transaction_context_free(transaction)?;
 
+        // Take ownership of the inputs so later transactions cannot spend them again.
+        // This vector keeps the UTXOs in tx-input order, as required by bitcoinkernel.
+        let mut spent_utxos = Vec::with_capacity(transaction.input.len());
+
         let mut in_value = Amount::ZERO;
         for input in &transaction.input {
-            // Null PrevOuts already checked in the previous step
-
-            let utxo = Self::get_utxo(input, utxos, txid)?;
+            let utxo = Self::take_utxo(input, utxos, txid)?;
             let txout = &utxo.txout;
 
             // A coinbase output created at height n can only be spent at height >= n + 100
@@ -380,6 +409,8 @@ impl Consensus {
             in_value = in_value
                 .checked_add(txout.value)
                 .ok_or(BlockValidationErrors::TooManyCoins)?;
+
+            spent_utxos.push(utxo);
         }
 
         // Sanity check
@@ -395,17 +426,18 @@ impl Consensus {
         // Verify the tx script
         #[cfg(feature = "bitcoinkernel")]
         if _verify_script {
-            Self::verify_input_scripts(transaction, utxos, _flags)?;
-        };
+            Self::verify_input_scripts(transaction, &spent_utxos, _flags)?;
+        }
 
         Ok((in_value, out_value))
     }
 
     #[cfg(feature = "bitcoinkernel")]
+    /// Verifies each input script against the transaction-local UTXOs, in input order.
     fn verify_input_scripts(
         transaction: &Transaction,
-        utxos: &mut HashMap<OutPoint, UtxoData>,
-        flags: c_uint,
+        spent_utxos: &[UtxoData],
+        flags: ScriptVerificationFlags,
     ) -> Result<(), BlockchainError> {
         let tx = serialize(&transaction);
         let txid = || transaction.compute_txid();
@@ -413,28 +445,25 @@ impl Consensus {
         let tx = bitcoinkernel::Transaction::try_from(tx.as_slice())
             .map_err(|e| tx_err!(txid, ScriptValidationError, e.to_string()))?;
 
-        let mut spent_utxos = Vec::new();
-        let mut spent_scripts = Vec::new();
+        let mut prevouts = Vec::with_capacity(spent_utxos.len());
+        let mut prevout_data = Vec::with_capacity(spent_utxos.len());
 
-        for input in &transaction.input {
-            let spent_output = utxos
-                .remove(&input.previous_output)
-                .ok_or_else(|| tx_err!(txid, UtxoNotFound, input.previous_output))?
-                .txout;
+        for utxo in spent_utxos {
+            let txout = &utxo.txout;
 
-            let value = i64::try_from(spent_output.value.to_sat())
-                .map_err(|_| tx_err!(txid, TooManyCoins))?;
-            let spk = bitcoinkernel::ScriptPubkey::try_from(spent_output.script_pubkey.as_bytes())
+            let value =
+                i64::try_from(txout.value.to_sat()).map_err(|_| tx_err!(txid, TooManyCoins))?;
+            let spk = bitcoinkernel::ScriptPubkey::try_from(txout.script_pubkey.as_bytes())
                 .map_err(|e| tx_err!(txid, ScriptValidationError, e.to_string()))?;
 
-            spent_utxos.push(bitcoinkernel::TxOut::new(&spk, value));
-            spent_scripts.push((spk, value));
+            prevouts.push(bitcoinkernel::TxOut::new(&spk, value));
+            prevout_data.push((spk, value));
         }
 
-        let tx_data = PrecomputedTransactionData::new(&tx, &spent_utxos)
+        let tx_data = PrecomputedTransactionData::new(&tx, &prevouts)
             .map_err(|e| tx_err!(txid, ScriptValidationError, e.to_string()))?;
 
-        for (input_index, (script, amount)) in spent_scripts.iter().enumerate() {
+        for (input_index, (script, amount)) in prevout_data.iter().enumerate() {
             bitcoinkernel::verify(
                 script,
                 Some(*amount),
@@ -447,6 +476,30 @@ impl Consensus {
         }
 
         Ok(())
+    }
+
+    /// Returns `true` if the transaction contains duplicate inputs
+    /// (the same `OutPoint` is spent more than once).
+    ///
+    /// Optimized for the most common cases: over 80% of Bitcoin transactions
+    /// have a single input (see <https://mainnet.observer/charts/transactions-1in/>),
+    /// which is handled with no allocation. Two-input transactions are handled
+    /// with a single equality check. Only transactions with three or more inputs
+    /// fall back to a `HashSet`.
+    fn has_duplicate_inputs(inputs: &[TxIn]) -> bool {
+        match inputs.len() {
+            1 => false,
+            2 => inputs[0].previous_output == inputs[1].previous_output,
+            _ => {
+                let mut seen = HashSet::with_capacity(inputs.len());
+                for input in inputs {
+                    if !seen.insert(&input.previous_output) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
     }
 
     /// Performs consensus checks that are independent of the spent outputs (non-coinbase only).
@@ -469,11 +522,23 @@ impl Consensus {
                 Err(tx_err!(txid, NullPrevOut))?;
             }
 
-            // Check script sizes (current tx scriptsig and TODO witness if present)
+            // Witness size is intentionally not checked here — witness-specific
+            // limits are enforced during script execution, not in context-free checks.
+            // This matches Bitcoin Core's CheckTransaction() which explicitly skips
+            // witness in context-free checks because witness data has not been
+            // checked for malleability at this point.
+            // See: https://github.com/bitcoin/bitcoin/blob/master/src/consensus/tx_check.cpp
             Self::validate_script_size(&input.script_sig, txid)?;
-            // TODO check also witness script size
         }
 
+        // Check for duplicate inputs (CVE-2018-17144).
+        // UpdateCoins does not detect duplicates — a duplicate prevout causes either
+        // a crash or an inflation bug depending on the coins database implementation.
+        // Bitcoin Core catches this explicitly in CheckTransaction() for the same reason.
+        // after:
+        if Self::has_duplicate_inputs(&transaction.input) {
+            Err(tx_err!(txid, DuplicateInput))?;
+        }
         let out_value = Self::total_out_value(transaction)?;
 
         // Sanity check
@@ -512,25 +577,6 @@ impl Consensus {
         }
 
         Ok(txids)
-    }
-
-    /// Checks if the merkle root of the header matches the merkle root of the transaction list.
-    ///
-    /// Unlike [`Block::check_merkle_root`], this function returns the list of computed [`Txid`]s
-    /// if the merkle roots matched, or `None` otherwise.
-    ///
-    /// The merkle root is computed in the same way as [`Block::compute_merkle_root`].
-    pub fn check_merkle_root(block: &Block) -> Option<Vec<Txid>> {
-        let txids: Vec<_> = block.txdata.iter().map(|obj| obj.compute_txid()).collect();
-
-        // Copy the hashes into an iterator, as `calculate_root` requires ownership
-        let hashes_iter = txids.iter().copied().map(|txid| txid.to_raw_hash());
-
-        let calculated = merkle_tree::calculate_root(hashes_iter).map(|h| h.into());
-        match calculated {
-            Some(merkle_root) if block.header.merkle_root == merkle_root => Some(txids),
-            _ => None,
-        }
     }
 
     /// Validates a block under AssumeValid SwiftSync, where previous outputs are unavailable,
@@ -572,33 +618,51 @@ impl Consensus {
     ) -> Result<(SwiftSyncAgg, Amount), BlockchainError> {
         let txids = self.check_block(block, height)?;
 
-        Consensus::verify_block_transactions_swiftsync(height, block, txids, unspent_indexes, salt)
+        Self::verify_block_transactions_swiftsync(height, block, txids, unspent_indexes, salt)
     }
 
-    /// Returns the TxOut being spent by the given input.
+    /// Removes and returns the UTXO spent by `input`.
     ///
-    /// Fails if the UTXO is not present in the given hashmap.
-    fn get_utxo<'a, F: Fn() -> Txid>(
+    /// Removing inputs here is consensus-critical: a later transaction in the same block must not
+    /// be able to spend the same output. Fails if the UTXO is missing or was already spent.
+    fn take_utxo<F: Fn() -> Txid>(
         input: &TxIn,
-        utxos: &'a HashMap<OutPoint, UtxoData>,
+        utxos: &mut HashMap<OutPoint, UtxoData>,
         txid: F,
-    ) -> Result<&'a UtxoData, TransactionError> {
-        match utxos.get(&input.previous_output) {
-            Some(utxo) => Ok(utxo),
-            // This is the case when the spender:
-            // - Spends an UTXO that doesn't exist
-            // - Spends an UTXO that was already spent
-            None => Err(tx_err!(txid, UtxoNotFound, input.previous_output)),
-        }
+    ) -> Result<UtxoData, TransactionError> {
+        utxos
+            .remove(&input.previous_output)
+            .ok_or_else(|| tx_err!(txid, UtxoNotFound, input.previous_output))
     }
 
-    #[allow(unused)]
-    fn validate_locktime(
-        input: &TxIn,
-        transaction: &Transaction,
-        height: u32,
-    ) -> Result<(), BlockValidationErrors> {
-        unimplemented!("validate_locktime")
+    /// Returns whether a transaction's absolute lock time is final for a candidate block.
+    ///
+    /// Zero `nLockTime` is final. Otherwise, height and time locks must be below
+    /// `height` and `lock_time_cutoff`, respectively. `nLockTime` is disabled when
+    /// every input has a final `nSequence`.
+    ///
+    /// The cutoff is the block timestamp before BIP113 and the previous block's
+    /// Median Time Past (MTP) afterward.
+    ///
+    /// Mirrors Bitcoin Core's IsFinalTx:
+    /// <https://github.com/bitcoin/bitcoin/blob/v31.0/src/consensus/tx_verify.cpp#L17-L37>
+    fn is_final_transaction(transaction: &Transaction, height: u32, lock_time_cutoff: u32) -> bool {
+        if transaction.lock_time == absolute::LockTime::ZERO {
+            return true;
+        }
+
+        let lock_time_reached = match transaction.lock_time {
+            absolute::LockTime::Blocks(lock_height) => lock_height.to_consensus_u32() < height,
+            absolute::LockTime::Seconds(lock_time) => {
+                lock_time.to_consensus_u32() < lock_time_cutoff
+            }
+        };
+
+        lock_time_reached
+            || transaction
+                .input
+                .iter()
+                .all(|input| input.sequence.is_final())
     }
 
     /// Validates the script size and the number of sigops in a prevout scriptPubKey or scriptSig.
@@ -687,7 +751,7 @@ impl Consensus {
         first_block: &BlockHeader,
         params: ChainParams,
     ) -> Target {
-        let actual_timespan = last_block.time - first_block.time;
+        let actual_timespan = last_block.time.saturating_sub(first_block.time);
         // from bip 94:
         //  a. The base difficulty value MUST be taken from the first block of the previous
         //     difficulty period
@@ -932,7 +996,6 @@ mod tests {
     use bitcoin::TxIn;
     use bitcoin::TxOut;
     use bitcoin::Txid;
-    use bitcoin::Witness;
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::deserialize;
     use bitcoin::consensus::encode::deserialize_hex;
@@ -943,51 +1006,53 @@ mod tests {
     use bitcoin::transaction::Version;
     use floresta_common::assert_err;
     use floresta_common::assert_ok;
-    use rand::RngCore;
+    use rand::Rng;
     use rand::SeedableRng;
-    use rand::TryRngCore;
     use rand::prelude::IndexedMutRandom;
-    use rand::rngs::OsRng;
+    use rand::rand_core::UnwrapErr;
     use rand::rngs::StdRng;
+    use rand::rngs::SysRng;
     use rand::seq::SliceRandom;
 
     use super::*;
 
+    #[macro_export]
     /// Macro for creating a TxOut
     macro_rules! txout {
         ($sats:expr, $script:expr) => {
-            TxOut {
-                value: Amount::from_sat($sats),
+            bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat($sats),
                 script_pubkey: $script,
             }
         };
     }
 
+    #[macro_export]
     /// Macro for constructing a legacy [`TxIn`] with optional scriptSig and sequence number.
     /// Needs the outpoint and, if not provided, defaults to empty scriptSig and `Sequence::MAX`.
     macro_rules! txin {
         ($outpoint:expr) => {
-            TxIn {
+            bitcoin::TxIn {
                 previous_output: $outpoint,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
             }
         };
         ($outpoint:expr, $script:expr) => {
-            TxIn {
+            bitcoin::TxIn {
                 previous_output: $outpoint,
                 script_sig: $script,
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
             }
         };
         ($outpoint:expr, $script:expr, $sequence:expr) => {
-            TxIn {
+            bitcoin::TxIn {
                 previous_output: $outpoint,
                 script_sig: $script,
                 sequence: $sequence,
-                witness: Witness::new(),
+                witness: bitcoin::Witness::new(),
             }
         };
     }
@@ -1009,6 +1074,104 @@ mod tests {
             txid: Txid::all_zeros(),
             vout: 0,
         }
+    }
+
+    fn tx_with_lock_time(lock_time: LockTime, sequence: Sequence) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time,
+            input: vec![txin!(dummy_outpoint(), ScriptBuf::new(), sequence)],
+            output: vec![txout!(1, ScriptBuf::new())],
+        }
+    }
+
+    const ZERO_HEIGHT: u32 = 0;
+    const ZERO_BLOCK_TIME: u32 = 0;
+
+    #[test]
+    fn final_transaction_accepts_final_sequence() {
+        let height_locked = tx_with_lock_time(LockTime::from_height(101).unwrap(), Sequence::MAX);
+        let time_locked =
+            tx_with_lock_time(LockTime::from_time(500_000_001).unwrap(), Sequence::MAX);
+
+        assert!(Consensus::is_final_transaction(
+            &height_locked,
+            ZERO_HEIGHT,
+            ZERO_BLOCK_TIME
+        ));
+        assert!(Consensus::is_final_transaction(
+            &time_locked,
+            ZERO_HEIGHT,
+            ZERO_BLOCK_TIME
+        ));
+    }
+
+    #[test]
+    fn final_transaction_checks_height_locks_strictly() {
+        let height = 100;
+
+        let below_height = tx_with_lock_time(
+            LockTime::from_height(height - 1).unwrap(),
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+        let at_height = tx_with_lock_time(
+            LockTime::from_height(height).unwrap(),
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+        let above_height = tx_with_lock_time(
+            LockTime::from_height(height + 1).unwrap(),
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+
+        assert!(Consensus::is_final_transaction(
+            &below_height,
+            height,
+            ZERO_BLOCK_TIME
+        ));
+        assert!(!Consensus::is_final_transaction(
+            &at_height,
+            height,
+            ZERO_BLOCK_TIME
+        ));
+        assert!(!Consensus::is_final_transaction(
+            &above_height,
+            height,
+            ZERO_BLOCK_TIME
+        ));
+    }
+
+    #[test]
+    fn final_transaction_checks_time_locks_strictly() {
+        let cutoff = 500_000_100;
+
+        let below_cutoff = tx_with_lock_time(
+            LockTime::from_time(cutoff - 1).unwrap(),
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+        let at_cutoff = tx_with_lock_time(
+            LockTime::from_time(cutoff).unwrap(),
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+        let above_cutoff = tx_with_lock_time(
+            LockTime::from_time(cutoff + 1).unwrap(),
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+
+        assert!(Consensus::is_final_transaction(
+            &below_cutoff,
+            ZERO_HEIGHT,
+            cutoff
+        ));
+        assert!(!Consensus::is_final_transaction(
+            &at_cutoff,
+            ZERO_HEIGHT,
+            cutoff
+        ));
+        assert!(!Consensus::is_final_transaction(
+            &above_cutoff,
+            ZERO_HEIGHT,
+            cutoff
+        ));
     }
 
     #[cfg(feature = "bitcoinkernel")]
@@ -1138,6 +1301,32 @@ mod tests {
                 panic!("merkle roots shouldn't match");
             }
         }
+    }
+
+    #[test]
+    fn rejects_cve_2012_2459_duplicate_subtree_mutation() {
+        let mut block = decode_block("./testdata/block_866342/raw.zst");
+        block.txdata.truncate(6);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(Consensus::check_merkle_root(&block).is_some());
+
+        // CVE-2012-2459:
+        // `[1, 2, 3, 4, 5, 6]` and `[1, 2, 3, 4, 5, 6, 5, 6]` have the same Merkle root.
+        block.txdata.extend_from_within(4..6);
+        assert_eq!(block.txdata.len(), 8);
+
+        // A root-only check accepts it, but consensus mutation detection must reject it.
+        assert!(block.check_merkle_root());
+        assert!(Consensus::check_merkle_root(&block).is_none());
+
+        let consensus = Consensus::from(Network::Bitcoin);
+        assert!(matches!(
+            consensus.check_block(&block, 866_342),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadMerkleRoot
+            ))
+        ));
     }
 
     /// Modifies historical block at height 866,342 by adding one extra transaction so that the
@@ -1310,7 +1499,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "bitcoinkernel")]
-    fn test_consume_utxos() {
+    fn script_verified_transaction_consumes_inputs() {
         // Transaction extracted from https://learnmeabitcoin.com/explorer/tx/0094492b6f010a5e39c2aacc97396ce9b6082dc733a7b4151ccdbd580f789278
         // Mock data for testing
 
@@ -1333,18 +1522,13 @@ mod tests {
                 creation_time: 0,
             },
         );
-        let mut utxos_clone = utxos.clone();
-
-        // Test consuming UTXOs with both high and low-level functions
         let flags = bitcoinkernel::VERIFY_P2SH;
         Consensus::verify_transaction(&tx, &mut utxos, 0, true, flags)
             .expect("Transaction should be valid");
-        Consensus::verify_input_scripts(&tx, &mut utxos_clone, flags)
-            .expect("Transaction should be valid");
 
-        // Check that the UTXO was consumed
+        // Script verification uses the transaction-local UTXOs, while the block-wide map retains
+        // only outputs available to later transactions.
         assert!(utxos.is_empty(), "UTXO should be consumed");
-        assert!(utxos_clone.is_empty(), "UTXO should be consumed");
 
         // Trying to verify again with an empty UTXO map must fail with this error
         let expected = tx_err!(txid, UtxoNotFound, outpoint);
@@ -1353,7 +1537,34 @@ mod tests {
             Err(BlockchainError::TransactionError(e)) => assert_eq!(e, expected),
             other => panic!("Expected TransactionError, got: {other:?}"),
         }
-        match Consensus::verify_input_scripts(&tx, &mut utxos_clone, flags) {
+    }
+
+    #[test]
+    fn rejects_cross_transaction_double_spend_without_script_checks() {
+        let outpoint = dummy_outpoint();
+        let mut utxos = HashMap::from([(
+            outpoint,
+            UtxoData {
+                txout: txout!(1, ScriptBuf::new()),
+                is_coinbase: false,
+                creation_height: 0,
+                creation_time: 0,
+            },
+        )]);
+
+        let first = build_tx(vec![txin!(outpoint)], vec![txout!(1, ScriptBuf::new())]);
+        let second = build_tx(vec![txin!(outpoint)], vec![txout!(0, ScriptBuf::new())]);
+
+        // Block validation carries this scratch map from one transaction to the next, including
+        // when script checks are skipped during AssumeValid validation.
+        Consensus::verify_transaction(&first, &mut utxos, 0, false, 0)
+            .expect("first spend should be valid");
+        assert!(utxos.is_empty(), "spent input must leave the UTXO map");
+
+        // Trying to verify again with an empty UTXO map must fail with this error
+        let expected = tx_err!(|| second.compute_txid(), UtxoNotFound, outpoint);
+
+        match Consensus::verify_transaction(&second, &mut utxos, 0, false, 0) {
             Err(BlockchainError::TransactionError(e)) => assert_eq!(e, expected),
             other => panic!("Expected TransactionError, got: {other:?}"),
         }
@@ -1372,6 +1583,43 @@ mod tests {
             Err(BlockchainError::BlockValidation(BlockValidationErrors::TooManyCoins)) => (),
             other => panic!("Expected TooManyCoins, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_duplicate_inputs_rejected() {
+        let outpoint = dummy_outpoint();
+        let outpoint2 = OutPoint {
+            txid: Txid::all_zeros(),
+            vout: 1,
+        };
+
+        // 2-input fast path
+        let tx = build_tx(
+            vec![txin!(outpoint), txin!(outpoint)],
+            vec![txout!(0, ScriptBuf::new())],
+        );
+
+        assert!(matches!(
+            Consensus::check_transaction_context_free(&tx),
+            Err(BlockchainError::TransactionError(TransactionError {
+                error: BlockValidationErrors::DuplicateInput,
+                ..
+            }))
+        ));
+
+        // 3+-input HashSet path
+        let tx = build_tx(
+            vec![txin!(outpoint), txin!(outpoint2), txin!(outpoint)],
+            vec![txout!(0, ScriptBuf::new())],
+        );
+
+        assert!(matches!(
+            Consensus::check_transaction_context_free(&tx),
+            Err(BlockchainError::TransactionError(TransactionError {
+                error: BlockValidationErrors::DuplicateInput,
+                ..
+            }))
+        ));
     }
 
     #[test]
@@ -1551,7 +1799,7 @@ mod tests {
         // All blocks except 9 and 170 just have a single, unspent TxOut
         let default_unspent_idx = HashSet::from_iter(vec![0]);
 
-        let mut rng = OsRng.unwrap_err();
+        let mut rng = UnwrapErr(SysRng);
         let salt = SipHashKeys::new(
             rng.next_u64(),
             rng.next_u64(),
@@ -1690,7 +1938,7 @@ mod tests {
 
     #[test]
     fn test_swift_sync_hash_midstate() {
-        let mut rng = OsRng.unwrap_err();
+        let mut rng = UnwrapErr(SysRng);
 
         for _ in 0..10_000 {
             let keys = SipHashKeys::new(

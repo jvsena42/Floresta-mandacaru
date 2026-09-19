@@ -57,6 +57,10 @@ test-functional-prepare arg="":
 test-functional-run arg="":
     bash tests/run.sh {{ arg }}
 
+# Execute tests/run.sh -n 1 --run-expensive ./tests/expensive
+test-expensive-functional-run:
+    bash tests/run.sh -n 1 --run-expensive ./tests/expensive
+
 # Format and lint functional tests
 test-functional-uv-fmt:
     @just check-command uv test-functional-uv-fmt "https://docs.astral.sh/uv/getting-started/installation/"
@@ -67,6 +71,7 @@ test-functional-uv-fmt:
 test-functional:
     @just test-functional-prepare
     @just test-functional-run
+    @just test-expensive-functional-run
 
 # Run the benchmarks
 bench:
@@ -74,16 +79,16 @@ bench:
 
 # Generate the public documentation for all crates
 doc:
-    RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --workspace --no-deps --lib --all-features --exclude metrics
+    RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --workspace --no-deps --lib --all-features
 
 # Generate and open the public documentation for all crates
 open-doc:
-    RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --workspace --no-deps --all-features --lib --open --exclude metrics
+    RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --workspace --no-deps --all-features --lib --open
 
 # Generate the documentation for all crates, including private items, and fail on warnings
 doc-check:
     RUSTDOCFLAGS="--cfg docsrs -D warnings" \
-    cargo +nightly doc --workspace --no-deps --all-features --lib --document-private-items --exclude metrics
+    cargo +nightly doc --workspace --no-deps --all-features --lib --document-private-items
 
 # Format code and run configured linters
 lint:

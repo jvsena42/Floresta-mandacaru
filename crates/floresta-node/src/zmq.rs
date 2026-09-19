@@ -49,11 +49,11 @@ unsafe impl Sync for ZMQServer {}
 impl ZMQServer {
     /// Creates a new ZMQ server that listens on `addr` and pushes blocks
     /// to connected peers as they are accepted
-    pub fn new(addr: &str) -> Result<ZMQServer, zmq::Error> {
+    pub fn new(addr: &str) -> Result<Self, zmq::Error> {
         let ctx = Context::new();
         let socket = ctx.socket(zmq::SocketType::PUSH)?;
         socket.bind(addr)?;
-        Ok(ZMQServer { _ctx: ctx, socket })
+        Ok(Self { _ctx: ctx, socket })
     }
 }
 

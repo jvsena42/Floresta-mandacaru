@@ -1,6 +1,6 @@
 # Floresta Docker Setup Guide
 
-You can find a [Dockerfile](../Dockerfile) in the root directory of the project, which you can use to build a
+You can find a [Dockerfile](../contrib/docker/Dockerfile) in the `contrib/docker` directory of the project, which you can use to build a
 docker image for Floresta. We also keep the docker image [dlsz/floresta](https://hub.docker.com/r/dlsz/floresta)
 on Docker Hub, which you can pull and run directly.
 
@@ -44,10 +44,10 @@ docker exec -it Floresta floresta-cli getblockchaininfo
 
 ## Monitoring
 
-Floresta also (optionally) provides [Prometheus](https://prometheus.io/) metrics endpoint, which you can enable at compile time. If you want a quick setup with Grafana, we provide a [docker-compose.yml](../docker-compose.yml) for that as well. Just use:
+Floresta also (optionally) provides [Prometheus](https://prometheus.io/) metrics endpoint, which you can enable at compile time. If you want a quick setup with Grafana, we provide a [docker-compose.yml](../contrib/docker/docker-compose.yml) for that as well. Just use:
 
 ```bash
-docker compose up -d
+docker compose -f contrib/docker/docker-compose.yml up -d
 ```
 
 This will start Floresta on Bitcoin mainnet by default. All blockchain data, metrics, and Grafana configurations are persisted in Docker volumes.
@@ -56,22 +56,22 @@ This will start Floresta on Bitcoin mainnet by default. All blockchain data, met
 
 The provided `docker-compose.yml` supports running Floresta on different Bitcoin networks. To make this easy and avoid port collisions, we provide a sample environment file.
 
-Copy the sample file from `contrib/env.docker.sample`:
+Copy the sample file from `contrib/docker/env.docker.sample`:
 
 ```bash
-cp contrib/env.docker.sample .env
+cp contrib/docker/env.docker.sample .env
 ```
 
 Edit the `.env` file to uncomment the network you want to use (which sets the correct NETWORK, RPC_PORT, and ELECTRUM_PORT), and then run:
 
 ```bash
-docker compose up -d
+docker compose -f contrib/docker/docker-compose.yml up -d
 ```
 
 Alternatively, you can pass the variables directly inline:
 
 ```bash
-NETWORK=signet RPC_PORT=38332 ELECTRUM_PORT=60001 docker compose up -d
+NETWORK=signet RPC_PORT=38332 ELECTRUM_PORT=60001 docker compose -f contrib/docker/docker-compose.yml up -d
 ```
 
 ## Using Local Floresta Data
@@ -80,7 +80,7 @@ If you already have a florestad datadir on your machine (e.g., from a previous r
 
 ```bash
 # Use your existing ~/.floresta directory
-FLORESTA_DATA=$HOME/.floresta docker compose up -d
+FLORESTA_DATA=$HOME/.floresta docker compose -f contrib/docker/docker-compose.yml up -d
 ```
 
 You can also uncomment and set the FLORESTA_DATA variable directly inside your `.env` file:

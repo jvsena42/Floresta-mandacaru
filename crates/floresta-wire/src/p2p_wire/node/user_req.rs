@@ -15,9 +15,9 @@ use super::UtreexoNode;
 use crate::block_proof::Bitmap;
 use crate::node::running_ctx::RunningNode;
 use crate::node_context::NodeContext;
-use crate::node_interface::NodeInterface;
-use crate::node_interface::NodeResponse;
-use crate::node_interface::UserRequest;
+use crate::node_handle::NodeHandle;
+use crate::node_handle::NodeResponse;
+use crate::node_handle::UserRequest;
 use crate::p2p_wire::error::WireError;
 
 impl<T, Chain> UtreexoNode<Chain, T>
@@ -30,8 +30,8 @@ where
     /// node. This struct is thread safe, so we can use it from multiple threads and have
     /// multiple handles. It also doesn't require a mutable reference to the node, or any
     /// synchronization mechanism.
-    pub fn get_handle(&self) -> NodeInterface {
-        NodeInterface::new(self.common.node_tx.clone())
+    pub fn get_handle(&self) -> NodeHandle {
+        NodeHandle::new(self.common.node_tx.clone())
     }
 
     /// Handles getpeerinfo requests, returning a list of all connected peers and some useful
@@ -48,7 +48,7 @@ where
 
     /// Actually perform the user request
     ///
-    /// These are requests made by some consumer of `floresta-wire` using the [`NodeInterface`], and may
+    /// These are requests made by some consumer of `floresta-wire` using the [`NodeHandle`], and may
     /// be a mempool transaction, a block, or a connection request.
     pub(crate) async fn perform_user_request(
         &mut self,
@@ -95,10 +95,10 @@ where
                 return;
             }
 
-            UserRequest::Add((addr, port, v2transport)) => {
-                let node_response = match self.handle_addnode_add_peer(addr, port, v2transport) {
+            UserRequest::Add((addr, v2transport)) => {
+                let node_response = match self.handle_addnode_add_peer(addr.clone(), v2transport) {
                     Ok(_) => {
-                        info!("Added peer {addr}:{port}");
+                        info!("Added peer {addr}");
                         NodeResponse::Add(true)
                     }
                     Err(err) => {
@@ -111,10 +111,10 @@ where
                 return;
             }
 
-            UserRequest::Remove((addr, port)) => {
-                let node_response = match self.handle_addnode_remove_peer(addr, port) {
+            UserRequest::Remove(addr) => {
+                let node_response = match self.handle_addnode_remove_peer(addr.clone()) {
                     Ok(_) => {
-                        info!("Removed peer {addr}:{port}");
+                        info!("Removed peer {addr}");
                         NodeResponse::Remove(true)
                     }
                     Err(err) => {
@@ -127,10 +127,11 @@ where
                 return;
             }
 
-            UserRequest::Onetry((addr, port, v2transport)) => {
-                let node_response = match self.handle_addnode_onetry_peer(addr, port, v2transport) {
+            UserRequest::Onetry((addr, v2transport)) => {
+                let node_response = match self.handle_addnode_onetry_peer(addr.clone(), v2transport)
+                {
                     Ok(_) => {
-                        info!("Connected to peer {addr}:{port}");
+                        info!("Connected to peer {addr}");
                         NodeResponse::Onetry(true)
                     }
                     Err(err) => {
@@ -143,19 +144,25 @@ where
                 return;
             }
 
-            UserRequest::Disconnect((addr, port)) => {
-                let node_response = match self.handle_disconnect_peer(addr, port) {
+            UserRequest::Disconnect(addr) => {
+                let node_response = match self.handle_disconnect_peer(addr.clone()) {
                     Ok(_) => {
-                        info!("Disconnected from peer {addr}:{port}");
+                        info!("Disconnected from peer {addr}");
                         NodeResponse::Disconnect(true)
                     }
                     Err(err) => {
-                        warn!("Failed to disconnect from peer {addr}:{port}: {err:?}");
+                        warn!("Failed to disconnect from peer {addr}: {err:?}");
                         NodeResponse::Disconnect(false)
                     }
                 };
 
                 let _ = responder.send(node_response);
+                return;
+            }
+
+            UserRequest::GetAddrManInfo => {
+                let info = self.address_man.get_connection_stats();
+                let _ = responder.send(NodeResponse::GetAddrManInfo(info));
                 return;
             }
 
@@ -174,6 +181,24 @@ where
                 // Announce the transaction to our peers, broadcast from mempool if requested
                 self.broadcast_to_peers(NodeRequest::BroadcastTransaction(txid));
                 let _ = responder.send(NodeResponse::TransactionBroadcastResult(Ok(txid)));
+                return;
+            }
+
+            UserRequest::GetCFilterHeaders {
+                start_height,
+                stop_hash,
+            } => {
+                let req = NodeRequest::GetCFHeaders {
+                    start_height,
+                    stop_hash,
+                };
+
+                let peer = self.send_to_fast_peer(req, ServiceFlags::COMPACT_FILTERS);
+                if let Ok(peer) = peer {
+                    self.inflight_user_requests
+                        .insert(user_req, (peer, Instant::now(), responder));
+                }
+
                 return;
             }
         };

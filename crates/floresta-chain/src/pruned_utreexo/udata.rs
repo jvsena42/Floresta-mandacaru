@@ -10,9 +10,9 @@ use bitcoin::consensus;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
+use bitcoin::hashes::HashEngine;
 use bitcoin::hashes::sha256;
-use sha2::Digest;
-use sha2::Sha512_256;
+use bitcoin::hashes::sha512_256;
 
 use crate::prelude::Box;
 use crate::prelude::Vec;
@@ -48,17 +48,19 @@ impl LeafData {
             .consensus_encode(&mut ser_utxo)
             .expect("serializing TxOut never fails: Vec<u8>::Write always returns Ok");
 
-        let leaf_hash = Sha512_256::new()
-            .chain_update(UTREEXO_TAG_V1)
-            .chain_update(UTREEXO_TAG_V1)
-            .chain_update(self.block_hash)
-            .chain_update(self.prevout.txid)
-            .chain_update(self.prevout.vout.to_le_bytes())
-            .chain_update(self.header_code.to_le_bytes())
-            .chain_update(ser_utxo)
-            .finalize();
+        let mut engine = sha512_256::Hash::engine();
 
-        sha256::Hash::from_byte_array(leaf_hash.into())
+        engine.input(&UTREEXO_TAG_V1);
+        engine.input(&UTREEXO_TAG_V1);
+        engine.input(&self.block_hash[..]);
+        engine.input(&self.prevout.txid[..]);
+        engine.input(&self.prevout.vout.to_le_bytes());
+        engine.input(&self.header_code.to_le_bytes());
+        engine.input(&ser_utxo);
+
+        let leaf_hash = sha512_256::Hash::from_engine(engine);
+
+        sha256::Hash::from_byte_array(leaf_hash.to_byte_array())
     }
 }
 
@@ -75,7 +77,7 @@ impl Decodable for LeafData {
         let prevout = OutPoint::consensus_decode(reader)?;
         let header_code = u32::consensus_decode(reader)?;
         let utxo = TxOut::consensus_decode(reader)?;
-        Ok(LeafData {
+        Ok(Self {
             block_hash,
             prevout,
             header_code,
@@ -136,11 +138,11 @@ impl Decodable for ScriptPubKeyKind {
     ) -> Result<Self, consensus::encode::Error> {
         let ty = u8::consensus_decode(reader)?;
         match ty {
-            0x00 => Ok(ScriptPubKeyKind::Other(Box::consensus_decode(reader)?)),
-            0x01 => Ok(ScriptPubKeyKind::PubKeyHash),
-            0x02 => Ok(ScriptPubKeyKind::WitnessV0PubKeyHash),
-            0x03 => Ok(ScriptPubKeyKind::ScriptHash),
-            0x04 => Ok(ScriptPubKeyKind::WitnessV0ScriptHash),
+            0x00 => Ok(Self::Other(Box::consensus_decode(reader)?)),
+            0x01 => Ok(Self::PubKeyHash),
+            0x02 => Ok(Self::WitnessV0PubKeyHash),
+            0x03 => Ok(Self::ScriptHash),
+            0x04 => Ok(Self::WitnessV0ScriptHash),
             _ => Err(consensus::encode::Error::ParseFailed("Invalid script type")),
         }
     }
@@ -154,20 +156,20 @@ impl Encodable for ScriptPubKeyKind {
         let mut len = 1;
 
         match self {
-            ScriptPubKeyKind::Other(script) => {
+            Self::Other(script) => {
                 00_u8.consensus_encode(writer)?;
                 len += script.consensus_encode(writer)?;
             }
-            ScriptPubKeyKind::PubKeyHash => {
+            Self::PubKeyHash => {
                 0x01_u8.consensus_encode(writer)?;
             }
-            ScriptPubKeyKind::WitnessV0PubKeyHash => {
+            Self::WitnessV0PubKeyHash => {
                 0x02_u8.consensus_encode(writer)?;
             }
-            ScriptPubKeyKind::ScriptHash => {
+            Self::ScriptHash => {
                 0x03_u8.consensus_encode(writer)?;
             }
-            ScriptPubKeyKind::WitnessV0ScriptHash => {
+            Self::WitnessV0ScriptHash => {
                 0x04_u8.consensus_encode(writer)?;
             }
         }
@@ -202,11 +204,11 @@ pub mod proof_util {
     use bitcoin::blockdata::script::Instruction;
     use bitcoin::consensus::Encodable;
     use bitcoin::hashes::Hash;
+    use bitcoin::hashes::HashEngine;
     use bitcoin::hashes::sha256;
+    use bitcoin::hashes::sha512_256;
     use floresta_common::impl_error_from;
     use rustreexo::node_hash::BitcoinNodeHash;
-    use sha2::Digest;
-    use sha2::Sha512_256;
 
     use super::LeafData;
     use crate::BlockchainError;
@@ -216,6 +218,9 @@ pub mod proof_util {
     use crate::pruned_utreexo::consensus::Consensus;
     use crate::pruned_utreexo::consensus::UTREEXO_TAG_V1;
     use crate::pruned_utreexo::utxo_data::UtxoData;
+
+    /// A leaf can never legitimately claim creation at the genesis block.
+    pub const GENESIS_HEIGHT: u32 = 0;
 
     #[derive(Debug)]
     /// Errors that may occur while reconstructing a leaf's scriptPubKey.
@@ -228,14 +233,21 @@ pub mod proof_util {
 
         /// The last instruction in the scriptsig was not an `OP_PUSHBYTES`.
         NotPushBytes,
+
+        /// The leaf claims the spent UTXO was created by the genesis block (height 0); that can
+        /// never happen, as the genesis coinbase is not part of the UTXO set.
+        GenesisCreationHeight,
     }
 
     impl Display for LeafErrorKind {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
             match self {
-                LeafErrorKind::EmptyStack => write!(f, "Empty stack"),
-                LeafErrorKind::InvalidInstruction(e) => write!(f, "Invalid instruction: {e}"),
-                LeafErrorKind::NotPushBytes => write!(f, "Not push bytes"),
+                Self::EmptyStack => write!(f, "Empty stack"),
+                Self::InvalidInstruction(e) => write!(f, "Invalid instruction: {e}"),
+                Self::NotPushBytes => write!(f, "Not push bytes"),
+                Self::GenesisCreationHeight => {
+                    write!(f, "Leaf claims creation at the genesis block")
+                }
             }
         }
     }
@@ -335,17 +347,19 @@ pub mod proof_util {
             height << 1
         };
 
-        let leaf_hash = Sha512_256::new()
-            .chain_update(UTREEXO_TAG_V1)
-            .chain_update(UTREEXO_TAG_V1)
-            .chain_update(block_hash)
-            .chain_update(txid)
-            .chain_update(vout.to_le_bytes())
-            .chain_update(header_code.to_le_bytes())
-            .chain_update(ser_utxo)
-            .finalize();
+        let mut engine = sha512_256::Hash::engine();
 
-        sha256::Hash::from_byte_array(leaf_hash.into())
+        engine.input(&UTREEXO_TAG_V1);
+        engine.input(&UTREEXO_TAG_V1);
+        engine.input(&block_hash[..]);
+        engine.input(&txid[..]);
+        engine.input(&vout.to_le_bytes());
+        engine.input(&header_code.to_le_bytes());
+        engine.input(&ser_utxo);
+
+        let leaf_hash = sha512_256::Hash::from_engine(engine);
+
+        sha256::Hash::from_byte_array(leaf_hash.to_byte_array())
     }
 
     /// From a block, gets the roots that will be included on the acc, certifying
@@ -440,14 +454,25 @@ pub mod proof_util {
                 if utxos.contains_key(&input.previous_output) {
                     continue;
                 }
-                let leaf = match leaves_iter.next() {
-                    Some(leaf) => leaf,
-                    None => continue,
+                let Some(leaf) = leaves_iter.next() else {
+                    continue;
                 };
 
                 let creation_height = leaf.header_code >> 1;
                 // The coinbase flag is the LSB
                 let is_coinbase = (leaf.header_code & 1) != 0;
+
+                // A leaf can never legitimately claim creation at the
+                // genesis block, so reject height 0 up front.
+                if creation_height == GENESIS_HEIGHT {
+                    return Err(UtreexoLeafError {
+                        leaf,
+                        txid,
+                        vin,
+                        kind: LeafErrorKind::GenesisCreationHeight,
+                    }
+                    .into());
+                }
 
                 let hash = get_block_hash(creation_height)?;
                 let leaf =
@@ -558,18 +583,28 @@ pub mod proof_util {
 mod test {
     use bitcoin::Amount;
     use bitcoin::BlockHash;
+    use bitcoin::OutPoint;
     use bitcoin::ScriptBuf;
+    use bitcoin::Sequence;
     use bitcoin::Transaction;
     use bitcoin::TxIn;
+    use bitcoin::TxOut;
+    use bitcoin::Witness;
+    use bitcoin::absolute::LockTime;
     use bitcoin::blockdata::script;
     use bitcoin::consensus::encode::deserialize_hex;
+    use bitcoin::hashes::Hash;
+    use bitcoin::hashes::sha256;
     use bitcoin::opcodes::all::OP_NOP;
     use bitcoin::opcodes::all::OP_PUSHBYTES_1;
+    use bitcoin::transaction::Version;
     use floresta_common::bhash;
 
     use super::CompactLeafData;
     use super::LeafData;
     use super::ScriptPubKeyKind;
+    use super::proof_util::UtreexoLeafError;
+    use super::proof_util::process_proof;
     use super::proof_util::reconstruct_leaf_data;
     use crate::proof_util::LeafErrorKind;
     use crate::proof_util::reconstruct_script_pubkey;
@@ -732,5 +767,99 @@ mod test {
         )
         .unwrap();
         assert_eq!(leaf, reconstructed);
+    }
+
+    #[test]
+    fn test_process_proof_rejects_genesis_creation_height() {
+        #[derive(Debug)]
+        // Any `E: From<UtreexoLeafError>` works; a local type keeps the test self-contained.
+        enum TestErr {
+            Leaf(UtreexoLeafError),
+        }
+
+        impl From<UtreexoLeafError> for TestErr {
+            fn from(e: UtreexoLeafError) -> Self {
+                Self::Leaf(e)
+            }
+        }
+
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        // A tx spending a prior-block UTXO, so `process_proof` pulls a leaf for it.
+        let spending_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(10),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let txdata = [coinbase, spending_tx];
+
+        let leaves = [CompactLeafData {
+            header_code: 1, // height = 0, coinbase = true.
+            amount: 1,
+            spk_ty: ScriptPubKeyKind::Other(Box::new([0x51])),
+        }];
+
+        // The leaf must be rejected before any block-hash lookup happens.
+        let get_block_hash = |_height| -> Result<BlockHash, TestErr> {
+            panic!("get_block_hash must not be called for a rejected genesis leaf")
+        };
+
+        let TestErr::Leaf(err) =
+            process_proof(&leaves, &txdata, 100, get_block_hash).expect_err("must be rejected");
+
+        assert!(
+            matches!(err.kind, LeafErrorKind::GenesisCreationHeight),
+            "expected GenesisCreationHeight, got {:?}",
+            err.kind
+        );
+    }
+
+    #[test]
+    fn test_leaf_hash_known_vector() {
+        // Precomputed reference hash generated from the original sha2::Sha512_256 implementation
+        // using deterministic test inputs to ensure backwards compatibility.
+        let block_hash = BlockHash::from_byte_array([0xAA; 32]);
+        let txid = bitcoin::Txid::from_byte_array([0xBB; 32]);
+        let outpoint = OutPoint::new(txid, 42);
+        let header_code = 0xDEADBEEF;
+        let utxo = TxOut {
+            value: Amount::from_sat(100_000_000),
+            script_pubkey: ScriptBuf::new(),
+        };
+        let leaf = LeafData {
+            block_hash,
+            prevout: outpoint,
+            header_code,
+            utxo,
+        };
+
+        let hash = leaf._get_leaf_hashes();
+        // Precomputed reference hash generated from the original sha2::Sha512_256 implementation
+        // using deterministic test inputs to ensure backwards compatibility.
+        let expected: sha256::Hash =
+            "faa30cef15141c86d3066850efdbc4c67690c513c465fb97c67a0ed56f4b05ec"
+                .parse()
+                .unwrap();
+
+        assert_eq!(hash, expected, "Leaf hash changed unexpectedly!");
     }
 }

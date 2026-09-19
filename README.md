@@ -75,6 +75,10 @@ wrapper around [`libbitcoinkernel`](https://github.com/bitcoin/bitcoin/issues/24
 a C++ library that exposes Bitcoin Core's validation engine. It allows validating blocks,
 transaction outputs and reading block data with the same API as Bitcoin Core.
 
+## Security Policy
+
+To report a security issue, please refer to the [security policy](SECURITY.md).
+
 ## Developing
 
 Detailed documentation for [`libfloresta`](https://github.com/getfloresta/Floresta/tree/master/crates)
@@ -107,7 +111,6 @@ Active workstreams are tracked on the [Project Board](https://github.com/orgs/ge
 ## Community
 
 If you want to discuss this project, you can join the [Discord Server](https://discord.gg/5Wj8fjjS93).
-To report security vulnerabilities, please see the [Security Policy](SECURITY.md).
 
 ## License
 

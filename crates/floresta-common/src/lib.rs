@@ -18,6 +18,7 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
+use bitcoin::Network;
 use bitcoin::ScriptBuf;
 use bitcoin::VarInt;
 use bitcoin::consensus::Decodable;
@@ -25,23 +26,22 @@ use bitcoin::consensus::encode;
 use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256;
 use bitcoin::p2p::ServiceFlags;
-use sha2::Digest;
-
 #[cfg(feature = "std")]
 mod ema;
 pub mod macros;
+pub mod merkle;
 pub mod spsc;
 
 #[cfg(feature = "std")]
 pub use ema::Ema;
+pub use merkle::MerkleBackend;
 pub use spsc::Channel;
 
 /// Computes the SHA-256 digest of the byte slice data and returns a [Hash] from `bitcoin_hashes`.
 ///
 /// [Hash]: https://docs.rs/bitcoin_hashes/latest/bitcoin_hashes/sha256/struct.Hash.html
 pub fn get_hash_from_u8(data: &[u8]) -> sha256::Hash {
-    let hash = sha2::Sha256::new().chain_update(data).finalize();
-    sha256::Hash::from_byte_array(hash.into())
+    sha256::Hash::hash(data)
 }
 
 /// Computes the SHA-256 digest of a script, reverses its bytes, and returns a [Hash] from
@@ -54,11 +54,10 @@ pub fn get_hash_from_u8(data: &[u8]) -> sha256::Hash {
 /// [Hash]: https://docs.rs/bitcoin_hashes/latest/bitcoin_hashes/sha256/struct.Hash.html
 pub fn get_spk_hash(spk: &ScriptBuf) -> sha256::Hash {
     let data = spk.as_bytes();
-    let mut hash = sha2::Sha256::new().chain_update(data).finalize();
-    hash.reverse();
-    sha256::Hash::from_byte_array(hash.into())
+    let mut bytes = sha256::Hash::hash(data).to_byte_array();
+    bytes.reverse();
+    sha256::Hash::from_byte_array(bytes)
 }
-
 /// Reads a VarInt from the given reader and ensures it is less than or equal to `max`.
 ///
 /// Returns an error if the VarInt is larger than `max`.
@@ -87,6 +86,27 @@ pub mod service_flags {
     /// `UTREEXO_ARCHIVE`: the node is capable of serving historical
     /// inclusion proofs for all blocks, but not necessarily historical blocks.
     pub const UTREEXO_ARCHIVE: u64 = 1 << 13;
+}
+
+/// Extension trait for [`bitcoin::Network`] providing network-specific defaults.
+// TODO(@luisschwab): get rid of this once
+// https://github.com/rust-bitcoin/rust-bitcoin/pull/6502 makes it into a release.
+// TODO: move to a dedicated network utilities crate if needed.
+pub trait NetworkExt {
+    /// Returns the default RPC port for the given network.
+    fn default_rpc_port(&self) -> u16;
+}
+
+impl NetworkExt for Network {
+    fn default_rpc_port(&self) -> u16 {
+        match self {
+            Self::Bitcoin => 8332,
+            Self::Signet => 38332,
+            Self::Testnet => 18332,
+            Self::Testnet4 => 48332,
+            Self::Regtest => 18442,
+        }
+    }
 }
 
 /// The P2P protocol version Floresta speaks.
@@ -181,10 +201,12 @@ pub mod prelude {
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::Network;
     use bitcoin::ScriptBuf;
     use bitcoin::hashes::Hash;
     use bitcoin::hex::DisplayHex;
 
+    use super::NetworkExt;
     use super::prelude::*;
 
     #[test]
@@ -208,5 +230,14 @@ mod tests {
             String::from("8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5c39161");
 
         assert_eq!(hash.as_byte_array().to_lower_hex_string(), expected);
+    }
+
+    #[test]
+    fn test_default_rpc_port() {
+        assert_eq!(Network::Bitcoin.default_rpc_port(), 8332);
+        assert_eq!(Network::Testnet.default_rpc_port(), 18332);
+        assert_eq!(Network::Testnet4.default_rpc_port(), 48332);
+        assert_eq!(Network::Signet.default_rpc_port(), 38332);
+        assert_eq!(Network::Regtest.default_rpc_port(), 18442);
     }
 }

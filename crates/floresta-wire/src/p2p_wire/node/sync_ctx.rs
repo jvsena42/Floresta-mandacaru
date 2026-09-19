@@ -8,10 +8,9 @@ use std::time::Instant;
 use bitcoin::p2p::ServiceFlags;
 use floresta_chain::ThreadSafeChain;
 use floresta_chain::proof_util;
+use floresta_chain::pruned_utreexo::IBDState;
 use floresta_common::service_flags;
 use floresta_common::try_and_log;
-use rand::rng;
-use rand::seq::IteratorRandom;
 use tokio::time;
 use tokio::time::MissedTickBehavior;
 use tracing::debug;
@@ -20,7 +19,6 @@ use tracing::info;
 use crate::node::ConnectionKind;
 use crate::node::InflightRequests;
 use crate::node::NodeNotification;
-use crate::node::NodeRequest;
 use crate::node::UtreexoNode;
 use crate::node::periodic_job;
 use crate::node_context::LoopControl;
@@ -139,30 +137,33 @@ where
     /// This function will periodically check our connections, to ensure that:
     ///   - we have enough utreexo peers to download proofs from (at least 2)
     ///   - we have enough peers to download blocks from (at most `MAX_OUTGOING_PEERS`)
-    ///   - if some of peers are too slow, and potentially stalling our block download (TODO)
+    ///   - we disconnect from peers that are too slow, which could otherwise slow down our IBD
     fn check_connections(&mut self) -> Result<(), WireError> {
-        let total_peers = self.connected_peers();
+        // With `--connect`, the user pins us to a specific peer set; don't search
+        // for extra utreexo or network peers. `maybe_open_connection` still
+        // reconnects any fixed peer that has dropped.
+        if self.has_fixed_peers() {
+            return self.maybe_open_connection(service_flags::UTREEXO.into());
+        }
+
         let utreexo_peers = self
             .peer_by_service
             .get(&service_flags::UTREEXO.into())
             .map_or(0, |peers| peers.len());
 
-        if utreexo_peers < 2 && total_peers >= SyncNode::MAX_OUTGOING_PEERS {
-            // if we have more than the maximum number of outgoing peers, disconnect
-            // some non-utreexo peers.
-            //
-            // FIXME: We should actually disconnect the slowest non-utreexo peer, to
-            // make sure we can download blocks faster.
-            self.peers
-                .values()
-                .filter(|peer| {
-                    peer.is_regular_peer() && !peer.services.has(service_flags::UTREEXO.into())
-                })
-                .choose(&mut rng())
-                .and_then(|p| p.channel.send(NodeRequest::Shutdown).ok());
+        // We are looking for at least two utreexo peers to diversify our requests
+        let needs_utreexo = utreexo_peers < 2;
+
+        if self.connected_peers() >= SyncNode::MAX_OUTGOING_PEERS {
+            // If we need more utreexo peers, always disconnect the slowest peer
+            let always_disconnect = needs_utreexo;
+            // Don't disconnect from utreexo peers in any case
+            let protected_services = &[service_flags::UTREEXO.into()];
+
+            self.maybe_disconnect_slowest_peer(protected_services, always_disconnect)?;
         }
 
-        if utreexo_peers < 2 {
+        if needs_utreexo {
             info!("Not enough utreexo peers (we have {utreexo_peers}), opening a new connection");
             self.maybe_open_connection(service_flags::UTREEXO.into())?;
         }
@@ -242,7 +243,7 @@ where
 
         if validation_index == best_block {
             info!("IBD is finished, switching to normal operation mode");
-            self.chain.toggle_ibd(false);
+            self.chain.update_ibd(IBDState::Done);
             return LoopControl::Break;
         }
 

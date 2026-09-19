@@ -5,9 +5,8 @@ rust-version.workspace = true
 edition.workspace = true
 authors = ["Floresta Developers <contact@getfloresta.org>"]
 description = """
-    A policy-driven, stateful transaction mempool for Floresta,
-    responsible for transaction relay decisions, fee estimation, and
-    block template construction.
+    An in-memory transaction mempool for Floresta, with dependency
+    tracking and block template construction.
 """
 repository = "https://github.com/getfloresta/Floresta"
 license.workspace = true
@@ -15,7 +14,8 @@ readme.workspace = true
 keywords = ["bitcoin", "mempool", "transactions"]
 
 [dependencies]
-ahash = { version = "0.8", default-features = false }
+# All dependencies MUST be pinned precisely with `X.Y.z`
+ahash = { version = "=0.8.12", default-features = false }
 bitcoin = { workspace = true }
 rand = { workspace = true }
 rustreexo = { workspace = true }
@@ -23,6 +23,7 @@ tracing = { workspace = true }
 
 # Local dependencies
 floresta-chain = { workspace = true }
+floresta-domain = { workspace = true }
 
 [dev-dependencies]
 floresta-common = { workspace = true }

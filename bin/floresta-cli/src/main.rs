@@ -2,7 +2,6 @@
 
 use core::fmt::Debug;
 use std::path::PathBuf;
-mod parsers;
 
 use anyhow::Ok;
 use bitcoin::BlockHash;
@@ -10,6 +9,7 @@ use bitcoin::Network;
 use bitcoin::Txid;
 use clap::Parser;
 use clap::Subcommand;
+use floresta_common::NetworkExt;
 use floresta_rpc::jsonrpc_client::Client;
 use floresta_rpc::rpc::FlorestaRPC;
 use floresta_rpc::rpc_types::AddNodeCommand;
@@ -41,16 +41,7 @@ fn get_host(cmd: &Cli) -> String {
     }
 
     // Otherwise, use the default host based on the network type
-    //
-    // TODO(@luisschwab): use `NetworkExt` to append the correct port
-    // once https://github.com/rust-bitcoin/rust-bitcoin/pull/4639 makes it into a release.
-    match cmd.network {
-        Network::Bitcoin => "http://127.0.0.1:8332".into(),
-        Network::Signet => "http://127.0.0.1:38332".into(),
-        Network::Testnet => "http://127.0.0.1:18332".into(),
-        Network::Testnet4 => "http://127.0.0.1:48332".into(),
-        Network::Regtest => "http://127.0.0.1:18442".into(),
-    }
+    format!("http://127.0.0.1:{}", cmd.network.default_rpc_port())
 }
 
 // Function to perform the requested RPC call based on CLI arguments
@@ -68,11 +59,12 @@ fn do_request(cmd: &Cli, client: Client) -> anyhow::Result<String> {
             serde_json::to_string_pretty(&client.get_tx_out(txid, vout)?)?
         }
         Methods::GetTxOutProof { txids, blockhash } => {
-            serde_json::to_string_pretty(&client.get_txout_proof(txids, blockhash))?
+            serde_json::to_string_pretty(&client.get_txout_proof(txids, blockhash)?)?
         }
-        Methods::GetTransaction { txid, .. } => {
-            serde_json::to_string_pretty(&client.get_transaction(txid, Some(true))?)?
-        }
+        Methods::GetRawTransaction {
+            txid,
+            verbosity: verbose,
+        } => serde_json::to_string_pretty(&client.get_raw_transaction(txid, verbose)?)?,
         Methods::RescanBlockchain {
             start_block,
             stop_block,
@@ -106,10 +98,7 @@ fn do_request(cmd: &Cli, client: Client) -> anyhow::Result<String> {
             node,
             command,
             v2transport,
-        } => {
-            let transport = v2transport.unwrap_or(false);
-            serde_json::to_string_pretty(&client.add_node(node, command, transport)?)?
-        }
+        } => serde_json::to_string_pretty(&client.add_node(node, command, v2transport)?)?,
         Methods::DisconnectNode {
             node_address,
             node_id,
@@ -119,14 +108,8 @@ fn do_request(cmd: &Cli, client: Client) -> anyhow::Result<String> {
             vout,
             script,
             height_hint,
-        } => serde_json::to_string_pretty(&client.find_tx_out(
-            txid,
-            vout,
-            script,
-            height_hint.unwrap_or(0),
-        )?)?,
+        } => serde_json::to_string_pretty(&client.find_tx_out(txid, vout, script, height_hint)?)?,
         Methods::GetMemoryInfo { mode } => {
-            let mode = mode.unwrap_or("stats".to_string());
             serde_json::to_string_pretty(&client.get_memory_info(mode)?)?
         }
         Methods::GetRpcInfo => serde_json::to_string_pretty(&client.get_rpc_info()?)?,
@@ -137,6 +120,7 @@ fn do_request(cmd: &Cli, client: Client) -> anyhow::Result<String> {
         Methods::GetDeploymentInfo { blockhash } => {
             serde_json::to_string_pretty(&client.get_deployment_info(blockhash)?)?
         }
+        Methods::GetAddrManInfo => serde_json::to_string_pretty(&client.get_addrman_info()?)?,
     })
 }
 
@@ -215,11 +199,16 @@ pub enum Methods {
     )]
     GetDifficulty,
 
-    /// Returns the proof that one or more transactions were included in a block
-    #[command(name = "gettxoutproof")]
+    #[doc = include_str!("../../../doc/rpc/gettxoutproof.md")]
+    #[command(
+        name = "gettxoutproof",
+        about = "Returns a hex-encoded Merkle proof showing that one or more transactions were included in a block.",
+        long_about = Some(include_str!("../../../doc/rpc/gettxoutproof.md")),
+        disable_help_subcommand = true
+    )]
     GetTxOutProof {
         /// The transaction IDs to prove
-        #[arg(required = true, value_parser = crate::parsers::parse_json_array::<Txid>)]
+        #[arg(required = true, value_parser = |s: &str| serde_json::from_str::<Vec<Txid>>(s).map_err(|e| e.to_string()))]
         txids: std::vec::Vec<Txid>, // you need to specify the path of Vec https://github.com/clap-rs/clap/discussions/4695
 
         /// The block in which to look for the transactions
@@ -228,8 +217,14 @@ pub enum Methods {
     },
 
     /// Returns the transaction, assuming it is cached by our watch only wallet
-    #[command(name = "gettransaction")]
-    GetTransaction { txid: Txid, verbose: Option<bool> },
+    #[doc = include_str!("../../../doc/rpc/getrawtransaction.md")]
+    #[command(
+        name = "getrawtransaction",
+        about = "Returns raw transaction data for a given txid from wallet cache (controlled by verbosity level)",
+        long_about = Some(include_str!("../../../doc/rpc/getrawtransaction.md")),
+        disable_help_subcommand = true
+    )]
+    GetRawTransaction { txid: Txid, verbosity: Option<u8> },
 
     #[doc = include_str!("../../../doc/rpc/rescanblockchain.md")]
     #[command(
@@ -348,10 +343,13 @@ pub enum Methods {
     )]
     GetConnectionCount,
 
-    /// Returns the value associated with a UTXO, if it's still not spent.
-    /// This function only works properly if we have the compact block filters
-    /// feature enabled
-    #[command(name = "gettxout")]
+    #[doc = include_str!("../../../doc/rpc/gettxout.md")]
+    #[command(
+        name = "gettxout",
+        about = "Returns details about an unspent transaction output.",
+        long_about = Some(include_str!("../../../doc/rpc/gettxout.md")),
+        disable_help_subcommand = true
+    )]
     GetTxOut { txid: Txid, vout: u32 },
 
     #[doc = include_str!("../../../doc/rpc/stop.md")]
@@ -385,7 +383,7 @@ pub enum Methods {
     )]
     DisconnectNode {
         node_address: String,
-        node_id: Option<usize>,
+        node_id: Option<u32>,
     },
 
     #[command(name = "findtxout")]
@@ -396,25 +394,22 @@ pub enum Methods {
         height_hint: Option<u32>,
     },
 
-    /// Returns statistics about Floresta's memory usage.
-    ///
-    /// Returns zeroed values for all runtimes that are not *-gnu or MacOS.
-    #[command(name = "getmemoryinfo")]
+    #[doc = include_str!("../../../doc/rpc/getmemoryinfo.md")]
+    #[command(
+        name = "getmemoryinfo",
+        about = "Returns statistics about Floresta's memory usage.",
+        long_about = Some(include_str!("../../../doc/rpc/getmemoryinfo.md")),
+        disable_help_subcommand = true
+    )]
     GetMemoryInfo { mode: Option<String> },
 
-    /// Returns information about the RPC server
-    ///
-    /// Result: {                  (json object)
-    ///   "active_commands" : [    (json array) All active commands
-    ///     {                      (json object) Information about an active command
-    ///       "method" : "str",    (string) The name of the RPC command
-    ///       "duration" : n       (numeric) The running time in microseconds
-    ///     },
-    ///     ...
-    ///   ],
-    ///   "logpath" : "str"        (string) The complete file path to the debug log
-    /// }
-    #[command(name = "getrpcinfo")]
+    #[doc = include_str!("../../../doc/rpc/getrpcinfo.md")]
+    #[command(
+        name = "getrpcinfo",
+        about = "Returns information about the RPC server",
+        long_about = Some(include_str!("../../../doc/rpc/getrpcinfo.md")),
+        disable_help_subcommand = true
+    )]
     GetRpcInfo,
 
     #[doc = include_str!("../../../doc/rpc/uptime.md")]
@@ -426,8 +421,13 @@ pub enum Methods {
     )]
     Uptime,
 
-    /// Returns a list of all descriptors currently loaded in the wallet
-    #[command(name = "listdescriptors")]
+    #[doc = include_str!("../../../doc/rpc/listdescriptors.md")]
+    #[command(
+        name = "listdescriptors",
+        about = "Returns a list of all descriptors currently loaded in the wallet",
+        long_about = Some(include_str!("../../../doc/rpc/listdescriptors.md")),
+        disable_help_subcommand = true
+    )]
     ListDescriptors,
 
     #[doc = include_str!("../../../doc/rpc/ping.md")]
@@ -447,4 +447,12 @@ pub enum Methods {
         disable_help_subcommand = true
     )]
     GetNetworkInfo,
+    #[doc = include_str!("../../../doc/rpc/getaddrmaninfo.md")]
+    #[command(
+        name = "getaddrmaninfo",
+        about = "Returns address manager statistics broken down by network type",
+        long_about = Some(include_str!("../../../doc/rpc/getaddrmaninfo.md")),
+        disable_help_subcommand = true
+    )]
+    GetAddrManInfo,
 }

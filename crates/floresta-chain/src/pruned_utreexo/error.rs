@@ -105,7 +105,7 @@ impl Error for BlockchainError {}
 
 impl<T: DatabaseError> From<T> for BlockchainError {
     fn from(value: T) -> Self {
-        BlockchainError::Database(Box::new(value))
+        Self::Database(Box::new(value))
     }
 }
 
@@ -143,8 +143,10 @@ pub enum BlockValidationErrors {
     BadBip34,
     InvalidUtreexoProof,
     CoinbaseNotMatured,
+    NonFinalTransaction,
     UnspendableUTXO,
     BIP94TimeWarp,
+    DuplicateInput,
 }
 
 // Helpful macro for generating a TransactionError
@@ -172,71 +174,77 @@ impl Display for TransactionError {
 impl Display for BlockValidationErrors {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            BlockValidationErrors::BlockDoesntExtendTip => {
+            Self::BlockDoesntExtendTip => {
                 write!(f, "This block doesn't build directly on the tip")
             }
-            BlockValidationErrors::ScriptValidationError(e) => {
+            Self::ScriptValidationError(e) => {
                 write!(f, "{e}")
             }
-            BlockValidationErrors::UtxoNotFound(outpoint) => {
+            Self::UtxoNotFound(outpoint) => {
                 write!(f, "Utxo referenced by {outpoint:?} not found")
             }
-            BlockValidationErrors::NullPrevOut => {
+            Self::NullPrevOut => {
                 write!(
                     f,
                     "This transaction has a null PrevOut but it's not coinbase"
                 )
             }
-            BlockValidationErrors::EmptyInputs => {
+            Self::EmptyInputs => {
                 write!(f, "This transaction has no inputs")
             }
-            BlockValidationErrors::EmptyOutputs => {
+            Self::EmptyOutputs => {
                 write!(f, "This transaction has no outputs")
             }
-            BlockValidationErrors::BlockTooBig => write!(f, "Block too big"),
-            BlockValidationErrors::InvalidCoinbase(e) => {
+            Self::BlockTooBig => write!(f, "Block too big"),
+            Self::InvalidCoinbase(e) => {
                 write!(f, "Invalid coinbase: {e:?}")
             }
-            BlockValidationErrors::TooManyCoins => write!(f, "Moving more coins that exists"),
-            BlockValidationErrors::ScriptError => {
+            Self::TooManyCoins => write!(f, "Moving more coins that exists"),
+            Self::ScriptError => {
                 write!(
                     f,
                     "Script does not follow size requirements of 2>= and <=520"
                 )
             }
-            BlockValidationErrors::NotEnoughPow => {
+            Self::NotEnoughPow => {
                 write!(f, "This block doesn't have enough proof-of-work")
             }
-            BlockValidationErrors::BadMerkleRoot => write!(f, "Wrong merkle root"),
-            BlockValidationErrors::BadWitnessCommitment => write!(f, "Wrong witness commitment"),
-            BlockValidationErrors::NotEnoughMoney => {
+            Self::BadMerkleRoot => write!(f, "Wrong merkle root"),
+            Self::BadWitnessCommitment => write!(f, "Wrong witness commitment"),
+            Self::NotEnoughMoney => {
                 write!(f, "A transaction spends more than it should")
             }
-            BlockValidationErrors::FirstTxIsNotCoinbase => {
+            Self::FirstTxIsNotCoinbase => {
                 write!(f, "The first transaction in a block isn't a coinbase")
             }
-            BlockValidationErrors::BadCoinbaseOutValue => {
+            Self::BadCoinbaseOutValue => {
                 write!(f, "Coinbase claims more bitcoins than it should")
             }
-            BlockValidationErrors::EmptyBlock => {
+            Self::EmptyBlock => {
                 write!(f, "This block is empty (doesn't have a coinbase tx)")
             }
-            BlockValidationErrors::BlockExtendsAnOrphanChain => {
+            Self::BlockExtendsAnOrphanChain => {
                 write!(f, "This block extends a chain we don't have the ancestors")
             }
-            BlockValidationErrors::BadBip34 => write!(f, "BIP34 commitment mismatch"),
-            BlockValidationErrors::InvalidUtreexoProof => write!(f, "Invalid proof"),
-            BlockValidationErrors::CoinbaseNotMatured => {
+            Self::BadBip34 => write!(f, "BIP34 commitment mismatch"),
+            Self::InvalidUtreexoProof => write!(f, "Invalid proof"),
+            Self::CoinbaseNotMatured => {
                 write!(f, "Coinbase not matured yet")
             }
-            BlockValidationErrors::UnspendableUTXO => {
+            Self::NonFinalTransaction => {
+                write!(f, "Block contains a non-final transaction")
+            }
+            Self::UnspendableUTXO => {
                 write!(
                     f,
                     "Attempts to spend unspendable UTXO that was overwritten by the historical BIP30 violation"
                 )
             }
-            BlockValidationErrors::BIP94TimeWarp => {
+            Self::BIP94TimeWarp => {
                 write!(f, "BIP94 time warp detected")
+            }
+            Self::DuplicateInput => {
+                write!(f, "This transaction has duplicate inputs")
             }
         }
     }
@@ -244,7 +252,7 @@ impl Display for BlockValidationErrors {
 
 impl<T: DatabaseError> From<T> for BlockchainBuilderError {
     fn from(value: T) -> Self {
-        BlockchainBuilderError::Database(Box::new(value))
+        Self::Database(Box::new(value))
     }
 }
 

@@ -4,7 +4,8 @@ services:
   floresta:
     container_name: floresta
     build:
-      context: .
+      context: ../..
+      dockerfile: contrib/docker/Dockerfile
       args:
         BUILD_FEATURES: "metrics"
     command: >-
@@ -29,7 +30,7 @@ services:
       - 9090:9090
     restart: unless-stopped
     volumes:
-      - ./metrics/prometheus:/etc/prometheus
+      - ../../crates/floresta-metrics/prometheus:/etc/prometheus
       - prometheus_data:/prometheus
   grafana:
     image: grafana/grafana
@@ -41,7 +42,7 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=grafana
     volumes:
-      - ./metrics/grafana:/etc/grafana/provisioning/datasources
+      - ../../crates/floresta-metrics/grafana:/etc/grafana/provisioning/datasources
       - grafana_data:/var/lib/grafana
 
 volumes:

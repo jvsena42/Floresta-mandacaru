@@ -208,19 +208,11 @@ which python
 * Install module dependencies:
 
 ```bash
-# installs dependencies listed in pyproject.toml.
-# in local development environment
-# it do not remove existing packages.
+# Install Python test dependencies declared
+# on `pyproject.toml` on a virtual environment
 uv pip install -r pyproject.toml
 
-# if you're a old-school pythonist,
-# install from requirements.txt
-# without remove existing packages.
-uv pip install -r tests/requirements.txt
-
-# Alternatively, you can synchronize it
-# uses the uv.lock file to enforce
-# reproducible installations.
+# Alternatively, synchronize dependencies from `pyproject.toml` and `uv.lock`
 uv sync
 ```
 

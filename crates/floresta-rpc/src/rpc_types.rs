@@ -8,56 +8,26 @@ use std::path::PathBuf;
 
 use corepc_types::v30::GetBlockHeaderVerbose;
 use corepc_types::v30::GetBlockVerboseOne;
+use corepc_types::v30::GetBlockchainInfo;
 pub use corepc_types::v30::GetNetworkInfo;
+use corepc_types::v31::GetRawTransactionVerbose;
 use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Debug, Deserialize, Serialize)]
-/// Return type for the `gettxoutproof` rpc command, the internal is
-/// just the hex representation of the Merkle Block, which was defined
-/// by btc core.
-pub struct GetTxOutProof(pub Vec<u8>);
-
+/// Return type for `getblockchaininfo`: Bitcoin Core's fields plus Floresta's extensions.
+///
+/// Mirrors the handler's `GetBlockchainInfoRes` in floresta-node, which tests that this type
+/// round-trips what it serves.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct GetBlockchainInfoRes {
-    /// The best block we know about
-    ///
-    /// This should be the hash of the latest block in the most PoW chain we know about. We may
-    /// or may not have fully-validated it yet
-    pub best_block: String,
-    /// The depth of the most-PoW chain we know about
-    pub height: u32,
-    /// Whether we are on Initial Block Download
-    pub ibd: bool,
-    /// How many blocks we have fully-validated so far? This number will be smaller than
-    /// height during IBD, and should be equal to height otherwise
-    pub validated: u32,
-    /// The work performed by the last block
-    ///
-    /// This is the estimated amount of hashes the miner of this block had to perform
-    /// before mining that block, on average
-    pub latest_work: String,
-    /// The UNIX timestamp for the latest block, as reported by the block's header
-    pub latest_block_time: u32,
+    #[serde(flatten)]
+    pub core: GetBlockchainInfo,
     /// How many leaves we have in the utreexo accumulator so far
-    ///
-    /// This should be equal to the number of UTXOs returned by core's `gettxoutsetinfo`
-    pub leaf_count: u32,
-    /// How many roots we have in the acc
+    pub leaf_count: u64,
+    /// How many roots we have in the utreexo accumulator
     pub root_count: u32,
-    /// The actual hex-encoded roots
+    /// The hex-encoded utreexo accumulator roots
     pub root_hashes: Vec<String>,
-    /// A short string representing the chain we're in
-    pub chain: String,
-    /// The validation progress
-    ///
-    /// 0 means we didn't validate any block. 1 means we've validated all blocks. so validated == height.
-    pub progress: f32,
-    /// Current network "difficulty"
-    ///
-    /// On average, miners needs to make `difficulty` hashes before finding one that
-    /// solves a block's PoW
-    pub difficulty: u64,
     /// Height up to which compact block filters have been downloaded.
     ///
     /// Absent when the node was started without compact-filter support.
@@ -66,10 +36,10 @@ pub struct GetBlockchainInfoRes {
     /// Resolved absolute height at which compact filter download started for
     /// the current on-disk store.
     ///
-    /// Use this together with `filters` and `height` to compute filter sync
-    /// progress: `(filters - filters_start) / (height - filters_start)`.
-    /// Absent when filters were started from genesis (no birthday set) or
-    /// when compact filters are disabled.
+    /// Use together with `filters` and `headers` to compute filter sync
+    /// progress: `(filters - filters_start) / (headers - filters_start)`.
+    /// Absent when filters were started from genesis or compact filters are
+    /// disabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub filters_start: Option<u32>,
     /// Whether a wallet rescan is currently running.
@@ -89,107 +59,18 @@ pub struct GetBlockchainInfoRes {
     pub rescan_blocks_total: Option<u32>,
 }
 
-/// The information returned by a get_raw_tx
-#[derive(Deserialize, Serialize)]
-pub struct RawTx {
-    /// Whether this tx is in our best known chain
-    pub in_active_chain: bool,
-    /// The hex-encoded tx
-    pub hex: String,
-    /// The sha256d of the serialized transaction without witness
-    pub txid: String,
-    /// The sha256d of the serialized transaction including witness
-    pub hash: String,
-    /// The size this transaction occupies on disk
-    pub size: u32,
-    /// The virtual size of this transaction, as define by the segwit soft-fork
-    pub vsize: u32,
-    /// The weight of this transaction, as defined by the segwit soft-fork
-    pub weight: u32,
-    /// This transaction's version. The current bigger version is 2
-    pub version: u32,
-    /// This transaction's locktime
-    pub locktime: u32,
-    /// A list of inputs being spent by this transaction
-    ///
-    /// See [TxIn] for more information about the contents of this
-    pub vin: Vec<TxIn>,
-    /// A list of outputs being created by this tx
-    ///
-    /// Se [TxOut] for more information
-    pub vout: Vec<TxOut>,
-    /// The hash of the block that included this tx, if any
-    pub blockhash: String,
-    /// How many blocks have been mined after this transaction's confirmation
-    /// including the block that confirms it. A zero value means this tx is unconfirmed
-    pub confirmations: u32,
-    /// The timestamp for the block confirming this tx, if confirmed
-    pub blocktime: u32,
-    /// Same as blocktime
-    pub time: u32,
-}
+#[derive(Debug, Deserialize, Serialize)]
+/// Return type for the `gettxoutproof` rpc command, the internal is
+/// the hex-encoded representation of the Merkle Block, as defined
+/// by Bitcoin Core.
+pub struct GetTxOutProof(pub String);
 
-/// A transaction output returned by some RPCs like gettransaction and getblock
-#[derive(Deserialize, Serialize)]
-pub struct TxOut {
-    /// The amount in sats locked in this UTXO
-    pub value: u64,
-    /// This utxo's index inside the transaction
-    pub n: u32,
-    /// The locking script of this utxo
-    pub script_pub_key: ScriptPubKey,
-}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum GetRawTransactionRes {
+    Zero(String),
 
-/// The locking script inside a txout
-#[derive(Deserialize, Serialize)]
-pub struct ScriptPubKey {
-    /// A ASM representation for this script
-    ///
-    /// Assembly is a high-level representation of a lower level code. Instructions
-    /// are turned into OP_XXXXX and data is hex-encoded.
-    /// E.g: OP_DUP OP_HASH160 <0000000000000000000000000000000000000000> OP_EQUALVERIFY OP_CHECKSIG
-    pub asm: String,
-    /// The hex-encoded raw script
-    pub hex: String,
-    /// How many signatures are required to spend this UTXO.
-    ///
-    /// This field is deprecated and is here for compatibility with Core
-    pub req_sigs: u32,
-    #[serde(rename = "type")]
-    /// The type of this spk. E.g: PKH, SH, WSH, WPKH, TR, non-standard...
-    pub type_: String,
-    /// Encode this script using one of the standard address types, if possible
-    pub address: String,
-}
-
-/// A transaction input returned by some rpcs, like gettransaction and getblock
-#[derive(Deserialize, Serialize)]
-pub struct TxIn {
-    /// The txid that created this UTXO
-    pub txid: String,
-    /// The index of this UTXO inside the tx that created it
-    pub vout: u32,
-    /// Unlocking script that should solve the challenge and prove ownership over
-    /// that UTXO
-    pub script_sig: ScriptSigJson,
-    /// The nSequence field, used in relative and absolute lock-times
-    pub sequence: u32,
-    /// A vector of witness elements for this input
-    pub witness: Vec<String>,
-}
-
-/// A representation for the transaction ScriptSig, returned by some rpcs
-/// like gettransaction and getblock
-#[derive(Deserialize, Serialize)]
-pub struct ScriptSigJson {
-    /// A ASM representation for this scriptSig
-    ///
-    /// Assembly is a high-level representation of a lower level code. Instructions
-    /// are turned into OP_XXXXX and data is hex-encoded.
-    /// E.g: OP_PUSHBYTES32 <000000000000000000000000000000000000000000000000000000000000000000>
-    pub asm: String,
-    /// The hex-encoded script sig
-    pub hex: String,
+    One(Box<GetRawTransactionVerbose>),
 }
 
 /// General information about our peers. Returned by get_peer_info
@@ -199,13 +80,28 @@ pub struct PeerInfo {
     pub id: u32,
     /// The network address for this peer.
     pub address: String,
-    /// A string with the services this peer advertises. E.g. NODE_NETWORK, UTREEXO, WITNESS...
+    /// Hex-encoded bitfield with the services this peer advertises.
     pub services: String,
+    /// Human-readable names for the recognized services this peer advertises.
+    #[serde(rename = "servicesnames")]
+    pub services_names: Vec<String>,
+    /// Whether this peer requested mempool transaction relay from us.
+    #[serde(rename = "relaytxes")]
+    pub relay_txs: bool,
     /// User agent is a string that represents the client being used by our peer. E.g.
     /// /Satoshi-26.0/ for bitcoin core version 26
     pub user_agent: String,
+    /// Whether this peer connection is inbound.
+    pub inbound: bool,
+    /// Whether we selected this peer as a BIP152 high-bandwidth compact block relay peer.
+    pub bip152_hb_to: bool,
+    /// Whether this peer selected us as a BIP152 high-bandwidth compact block relay peer.
+    pub bip152_hb_from: bool,
     /// This peer's height at the time we've opened a connection with them
     pub initial_height: u32,
+    /// The peer time offset in seconds.
+    #[serde(rename = "timeoffset")]
+    pub time_offset: i64,
     /// The connection type of this peer
     ///
     /// We can connect with peers for different reasons. E.g. we can connect to a peer to
@@ -216,6 +112,8 @@ pub struct PeerInfo {
     ///
     /// Can be either Ready, Connecting or Banned
     pub state: String,
+    /// Special permissions granted to this peer.
+    pub permissions: Vec<String>,
     /// The transport protocol used with peer.
     pub transport_protocol: String,
 }
@@ -293,14 +191,14 @@ pub enum Error {
 
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
-        Error::Serde(value)
+        Self::Serde(value)
     }
 }
 
 #[cfg(feature = "with-jsonrpc")]
 impl From<jsonrpc::Error> for Error {
     fn from(value: jsonrpc::Error) -> Self {
-        Error::JsonRpc(value)
+        Self::JsonRpc(value)
     }
 }
 
@@ -308,13 +206,13 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             #[cfg(feature = "with-jsonrpc")]
-            Error::JsonRpc(e) => write!(f, "JsonRpc returned an error {e}"),
-            Error::Api(e) => write!(f, "general jsonrpc error: {e}"),
-            Error::Serde(e) => write!(f, "error while deserializing the response: {e}"),
-            Error::EmptyResponse => write!(f, "got an empty response from server"),
-            Error::InvalidVerbosity => write!(f, "invalid verbosity level"),
-            Error::InvalidRescanVal => write!(f, "Invalid rescan values"),
-            Error::TxOutNotFound => write!(f, "Transaction output was not found"),
+            Self::JsonRpc(e) => write!(f, "JsonRpc returned an error {e}"),
+            Self::Api(e) => write!(f, "general jsonrpc error: {e}"),
+            Self::Serde(e) => write!(f, "error while deserializing the response: {e}"),
+            Self::EmptyResponse => write!(f, "got an empty response from server"),
+            Self::InvalidVerbosity => write!(f, "invalid verbosity level"),
+            Self::InvalidRescanVal => write!(f, "Invalid rescan values"),
+            Self::TxOutNotFound => write!(f, "Transaction output was not found"),
         }
     }
 }
@@ -383,9 +281,9 @@ pub enum AddNodeCommand {
 impl Display for AddNodeCommand {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let cmd = match self {
-            AddNodeCommand::Add => "add",
-            AddNodeCommand::Remove => "remove",
-            AddNodeCommand::Onetry => "onetry",
+            Self::Add => "add",
+            Self::Remove => "remove",
+            Self::Onetry => "onetry",
         };
         write!(f, "{cmd}")
     }

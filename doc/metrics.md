@@ -6,12 +6,12 @@ This project uses [`Prometheus`](https://prometheus.io/) as a monitoring system.
 cargo build --release --features metrics
 ```
 
-The easiest way to visualize those metrics is by using some observability graphic tool like [Grafana](https://grafana.com/). To make it easier, you can also straight away use the `docker-compose.yml` file to spin up an infrastructure that will run the project with Prometheus and Grafana.
+The easiest way to visualize those metrics is by using some observability graphic tool like [Grafana](https://grafana.com/). To make it easier, you can also straight away use the `contrib/docker/docker-compose.yml` file to spin up an infrastructure that will run the project with Prometheus and Grafana.
 
 To run it, first make sure you have [Docker Compose](https://docs.docker.com/compose/) installed and then:
 
 ```sh
-docker-compose up -d --build
+docker compose -f contrib/docker/docker-compose.yml up -d --build
 ```
 
-Grafana should now be available to you at http://localhost:3000. To log in, please check the credentials defined in the `docker-compose.yml` file.
+Grafana should now be available to you at http://localhost:3000. To log in, please check the credentials defined in the `contrib/docker/docker-compose.yml` file.

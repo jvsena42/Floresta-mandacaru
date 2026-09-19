@@ -96,7 +96,7 @@ impl UtreexoSnapshot {
         }
 
         Ok((
-            UtreexoSnapshot {
+            Self {
                 block_hash,
                 height: wire.height,
                 leaves: wire.leaves,
@@ -181,14 +181,14 @@ pub enum SnapshotError {
 impl fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SnapshotError::InvalidJson(e) => write!(f, "invalid snapshot JSON: {e}"),
-            SnapshotError::UnsupportedVersion(v) => write!(
+            Self::InvalidJson(e) => write!(f, "invalid snapshot JSON: {e}"),
+            Self::UnsupportedVersion(v) => write!(
                 f,
                 "unsupported snapshot version {v} (this build expects {SNAPSHOT_VERSION})"
             ),
-            SnapshotError::UnknownNetwork(s) => write!(f, "unknown network tag {s:?}"),
-            SnapshotError::InvalidHex(field) => write!(f, "invalid hex in field {field:?}"),
-            SnapshotError::NetworkMismatch { expected, got } => write!(
+            Self::UnknownNetwork(s) => write!(f, "unknown network tag {s:?}"),
+            Self::InvalidHex(field) => write!(f, "invalid hex in field {field:?}"),
+            Self::NetworkMismatch { expected, got } => write!(
                 f,
                 "snapshot is for {} but node is configured for {}",
                 network_tag(*got),
@@ -201,7 +201,7 @@ impl fmt::Display for SnapshotError {
 impl Error for SnapshotError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            SnapshotError::InvalidJson(e) => Some(e),
+            Self::InvalidJson(e) => Some(e),
             _ => None,
         }
     }

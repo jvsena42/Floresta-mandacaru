@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use core::net::IpAddr;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -16,7 +15,6 @@ use bitcoin::consensus::encode;
 use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::hex::FromHex;
 use bitcoin::p2p::ServiceFlags;
-use bitcoin::p2p::address::AddrV2;
 use derive_more::Constructor;
 use floresta_chain::AssumeValidArg;
 use floresta_chain::ChainState;
@@ -26,9 +24,9 @@ use floresta_chain::pruned_utreexo::UpdatableChainstate;
 use floresta_common::Ema;
 use floresta_common::service_flags;
 use floresta_mempool::Mempool;
-use rand::RngCore;
-use rand::TryRngCore;
-use rand::rngs::OsRng;
+use rand::Rng;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -61,6 +59,9 @@ pub struct UtreexoRoots {
     numleaves: usize,
 }
 
+// Nightly Clippy false positive in `Constructor`-generated code:
+// https://github.com/rust-lang/rust-clippy/issues/17525
+#[allow(clippy::redundant_field_names)]
 #[derive(Debug, Constructor)]
 pub struct SimulatedPeer {
     headers: Vec<Header>,
@@ -84,6 +85,7 @@ impl SimulatedPeer {
                 | service_flags::UTREEXO_ARCHIVE.into()
                 | ServiceFlags::WITNESS
                 | ServiceFlags::COMPACT_FILTERS,
+            time_offset: 0,
             kind: ConnectionKind::Regular(service_flags::UTREEXO.into()),
             transport_protocol: TransportProtocol::V2,
         };
@@ -177,16 +179,15 @@ pub fn create_peer(
 
     LocalPeerView {
         message_times: Ema::with_half_life_50(),
-        address: "127.0.0.1".parse().unwrap(),
+        address: "127.0.0.1:8333".parse().unwrap(),
         services: service_flags::UTREEXO.into(),
         user_agent: "/utreexo:0.1.0/".to_string(),
         height: 0,
+        time_offset: 0,
         state: PeerStatus::Ready,
         channel: sender,
-        port: 8333,
         kind: ConnectionKind::Regular(service_flags::UTREEXO.into()),
         banscore: 0,
-        address_id: 0,
         _last_message: Instant::now(),
         transport_protocol: TransportProtocol::V2,
     }
@@ -220,7 +221,7 @@ pub fn serialize(root: UtreexoRoots) -> Vec<u8> {
 
 pub fn create_false_acc(tip: usize) -> Vec<u8> {
     let mut bytes = [0u8; 32];
-    let mut rng = OsRng.unwrap_err();
+    let mut rng = UnwrapErr(SysRng);
     rng.fill_bytes(&mut bytes);
     let node_hash = encode::serialize_hex(&bytes);
 
@@ -288,6 +289,9 @@ pub fn mutated_block_h7() -> Block {
     ).unwrap()
 }
 
+// Nightly Clippy false positive in `Constructor`-generated code:
+// https://github.com/rust-lang/rust-clippy/issues/17525
+#[allow(clippy::redundant_field_names)]
 #[derive(Clone, Constructor)]
 /// The chain data that our simulated peer will have
 pub struct PeerData {
@@ -345,7 +349,7 @@ pub async fn setup_node(
 
         // Add a fixed peer to avoid opening real P2P connections
         if i == 0 {
-            node.fixed_peer = Some(to_addr_v2(peer.address).into());
+            node.fixed_peers = vec![peer.address.clone()];
         }
 
         node.peers.insert(peer_id, peer);
@@ -373,14 +377,6 @@ pub async fn setup_node(
         .unwrap();
 
     chain
-}
-
-// TODO: remove this after bitcoin-0.33.0
-fn to_addr_v2(addr: IpAddr) -> AddrV2 {
-    match addr {
-        IpAddr::V4(addr) => AddrV2::Ipv4(addr),
-        IpAddr::V6(addr) => AddrV2::Ipv6(addr),
-    }
 }
 
 #[cfg(test)]

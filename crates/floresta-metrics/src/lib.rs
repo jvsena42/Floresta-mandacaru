@@ -28,7 +28,7 @@ impl AppMetrics {
         let block_height = Gauge::default();
         let peer_count = Gauge::<f64, AtomicU64>::default();
         let avg_block_processing_time = Gauge::<f64, AtomicU64>::default();
-        let message_times = Histogram::new([0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0].into_iter());
+        let message_times = Histogram::new([0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]);
 
         registry.register("block_height", "Current block height", block_height.clone());
         registry.register(

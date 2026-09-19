@@ -98,11 +98,11 @@ pub struct Cli {
     pub zmq_address: Option<String>,
 
     #[arg(long, value_name = "address[:<port>]")]
-    /// A node to connect to
+    /// A node to connect to. May be specified multiple times.
     ///
-    /// If this option is provided, we'll connect **only** to this node. It should be an ipv4
-    /// address in the format `<address>[:<port>]`.
-    pub connect: Option<String>,
+    /// If this option is provided, we'll connect **only** to the listed nodes. Each value
+    /// should be an ipv4/ipv6/hostname address in the format `<address>[:<port>]`.
+    pub connect: Vec<String>,
 
     #[arg(long, value_name = "address[:<port>]")]
     /// The address where our json-rpc server should listen to, in the format `<address>[:<port>]`
@@ -200,7 +200,7 @@ impl Cli {
     pub fn validate(&self) {
         #[cfg(unix)]
         if self.pid_file.is_some() && !self.daemon {
-            Cli::command()
+            Self::command()
                 .error(
                     clap::error::ErrorKind::MissingRequiredArgument,
                     "--pid-file requires that --daemon be set",

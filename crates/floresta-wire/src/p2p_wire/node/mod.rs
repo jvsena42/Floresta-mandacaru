@@ -13,8 +13,8 @@ pub mod sync_ctx;
 mod user_req;
 
 use core::fmt::Debug;
-use core::net::IpAddr;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ use floresta_common::try_and_log;
 use floresta_common::try_and_warn;
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
 use floresta_compact_filters::network_filters::NetworkFilters;
-use floresta_mempool::Mempool;
+use floresta_domain::mempool::MempoolBase;
 pub use peer_man::AddedPeerInfo;
 use running_ctx::RunningNode;
 use serde::Deserialize;
@@ -51,11 +51,13 @@ use super::address_man::LocalAddress;
 use super::block_proof::Bitmap;
 use super::error::WireError;
 use super::node_context::NodeContext;
-use super::node_interface::NodeResponse;
-use super::node_interface::UserRequest;
+use super::node_handle::NodeResponse;
+use super::node_handle::UserRequest;
 use super::peer::PeerMessages;
 use super::socks::Socks5StreamBuilder;
 use super::transport::TransportProtocol;
+use crate::bitcoin_socket_addr::BitcoinSocketAddr;
+use crate::bitcoin_socket_addr::SystemResolver;
 use crate::node_context::PeerId;
 
 /// As per BIP 155, limit the number of addresses to 1,000
@@ -110,6 +112,12 @@ pub enum NodeRequest {
     /// Proof hashes are the hashes needed to reconstruct the proof, while
     /// leaf data are the actual data of the leaves (i.e., the txouts).
     GetBlockProof((BlockHash, Bitmap, Bitmap)),
+
+    /// Ask for a Compact Block Filters Header
+    GetCFHeaders {
+        start_height: u32,
+        stop_hash: BlockHash,
+    },
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -169,10 +177,10 @@ impl Serialize for ConnectionKind {
         S: serde::Serializer,
     {
         match self {
-            ConnectionKind::Feeler => serializer.serialize_str("feeler"),
-            ConnectionKind::Regular(_) => serializer.serialize_str("regular"),
-            ConnectionKind::Extra => serializer.serialize_str("extra"),
-            ConnectionKind::Manual => serializer.serialize_str("manual"),
+            Self::Feeler => serializer.serialize_str("feeler"),
+            Self::Regular(_) => serializer.serialize_str("regular"),
+            Self::Extra => serializer.serialize_str("extra"),
+            Self::Manual => serializer.serialize_str("manual"),
         }
     }
 }
@@ -189,9 +197,6 @@ pub struct LocalPeerView {
     /// The state in which this peer is, e.g., awaiting handshake, ready, banned, etc.
     pub(crate) state: PeerStatus,
 
-    /// An id identifying this peer's address in our address manager
-    pub(crate) address_id: u32,
-
     /// A channel used to send requests to this peer
     pub(crate) channel: UnboundedSender<NodeRequest>,
 
@@ -202,10 +207,7 @@ pub struct LocalPeerView {
     pub(crate) user_agent: String,
 
     /// This peer's IP address
-    pub(crate) address: IpAddr,
-
-    /// The port we used to connect to this peer
-    pub(crate) port: u16,
+    pub(crate) address: LocalAddress,
 
     /// The last time we received a message from this peer
     pub(crate) _last_message: Instant,
@@ -219,6 +221,9 @@ pub struct LocalPeerView {
     /// The latest height this peer has announced to us
     pub(crate) height: u32,
 
+    /// The peer time offset in seconds, computed from its version message timestamp
+    pub(crate) time_offset: i64,
+
     /// The banscore of this peer
     ///
     /// This is a score kept for each peer, every time this peer misbehaves, we
@@ -231,6 +236,11 @@ pub struct LocalPeerView {
 }
 
 impl LocalPeerView {
+    /// Whether this peer advertises any service in `services`.
+    pub(crate) fn has_any_service(&self, services: &[ServiceFlags]) -> bool {
+        services.iter().any(|service| self.services.has(*service))
+    }
+
     /// Whether this is a manually added peer
     pub(crate) const fn is_manual_peer(&self) -> bool {
         matches!(self.kind, ConnectionKind::Manual)
@@ -251,7 +261,7 @@ pub struct NodeCommon<Chain: ChainBackend> {
     // 1. Core Blockchain and Transient Data
     pub(crate) chain: Chain,
     pub(crate) blocks: HashMap<BlockHash, InflightBlock>,
-    pub(crate) mempool: Arc<tokio::sync::Mutex<Mempool>>,
+    pub(crate) mempool: Arc<tokio::sync::Mutex<dyn MempoolBase>>,
     pub(crate) block_filters: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
     pub(crate) last_filter: BlockHash,
 
@@ -270,7 +280,7 @@ pub struct NodeCommon<Chain: ChainBackend> {
 
     // 4. Networking Configuration
     pub(crate) socks5: Option<Socks5StreamBuilder>,
-    pub(crate) fixed_peer: Option<LocalAddress>,
+    pub(crate) fixed_peers: Vec<LocalAddress>,
 
     // 5. Time and Event Tracking
     pub(crate) inflight: HashMap<InflightRequests, (u32, Instant)>,
@@ -340,7 +350,7 @@ where
     pub fn new(
         config: UtreexoNodeConfig,
         chain: Chain,
-        mempool: Arc<Mutex<Mempool>>,
+        mempool: Arc<Mutex<dyn MempoolBase>>,
         block_filters: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
         kill_signal: Arc<tokio::sync::RwLock<bool>>,
         address_man: AddressMan,
@@ -348,13 +358,18 @@ where
         let (node_tx, node_rx) = unbounded_channel();
         let socks5 = config.proxy.map(Socks5StreamBuilder::new);
 
-        let fixed_peer = config
-            .fixed_peer
-            .as_ref()
-            .map(|address| Self::resolve_connect_host(address, Self::get_port(config.network)))
-            .transpose()?;
+        // Dedup the resolved fixed peers so we don't open multiple connections to the same host.
+        let mut seen = HashSet::new();
+        let mut fixed_peers = Vec::with_capacity(config.fixed_peers.len());
+        for address in &config.fixed_peers {
+            let resolved =
+                BitcoinSocketAddr::parse_address(address, Some(config.network), SystemResolver)?;
+            if seen.insert(resolved.clone()) {
+                fixed_peers.push(LocalAddress::from(resolved));
+            }
+        }
 
-        Ok(UtreexoNode {
+        Ok(Self {
             common: NodeCommon {
                 last_dns_seed_call: Instant::now(),
                 startup_time: Instant::now(),
@@ -386,7 +401,7 @@ where
                 datadir: config.datadir.clone(),
                 max_banscore: config.max_banscore,
                 socks5,
-                fixed_peer,
+                fixed_peers,
                 config,
                 kill_signal,
                 added_peers: Vec::new(),

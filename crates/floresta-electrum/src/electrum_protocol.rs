@@ -4,6 +4,7 @@ use core::error;
 use core::ops::Range;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -27,7 +28,9 @@ use floresta_compact_filters::network_filters::NetworkFilters;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::CachedTransaction;
 use floresta_watch_only::kv_database::KvDatabase;
-use floresta_wire::node_interface::NodeInterface;
+use floresta_wire::node_handle::NodeHandle;
+use floresta_wire::node_interface::ChainMethods;
+use floresta_wire::node_interface::MempoolMethods;
 use serde_json::Value;
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
@@ -108,12 +111,15 @@ impl<S: AsyncStream> TcpActor<S> {
                             break;
                         }
                         Err(e) => {
-                            // A non-UTF-8 read is almost always a client speaking
-                            // a non-line-protocol (most commonly a TLS handshake
-                            // on the plaintext port). It's a client-side
-                            // misconfiguration, not a server fault, so don't log
-                            // it at ERROR — just drop the connection.
-                            warn!("Dropping client {}: non-text input ({e:?}). If this was a wallet, it likely tried TLS on the plaintext Electrum port — disable TLS for this server.", self.client_id);
+                            if e.kind() == std::io::ErrorKind::InvalidData {
+                                warn!(
+                                    "Error reading from client: {e:?}. Perhaps you are sending \
+                                     TLS traffic on a cleartext stream? Disable TLS in your \
+                                     wallet, or connect to the SSL Electrum port instead."
+                                );
+                            } else {
+                                warn!("Error reading from client: {e:?}");
+                            }
                             self.message_transmitter
                                 .send(Message::Disconnect(self.client_id))
                                 .expect("Main loop is broken");
@@ -161,7 +167,7 @@ impl Client {
         tokio::spawn(async move {
             actor.run().await;
         });
-        Client {
+        Self {
             client_id,
             _addresses: HashSet::new(),
             sender,
@@ -209,7 +215,7 @@ pub struct ElectrumServer<Blockchain: BlockchainInterface> {
 
     /// An interface to a running node, used to broadcast transactions and request
     /// blocks.
-    node_interface: NodeInterface,
+    node_interface: NodeHandle,
 
     /// A list of addresses that we've just learned about and need to rescan for
     /// transactions.
@@ -230,11 +236,11 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         address_cache: Arc<AddressCache<KvDatabase>>,
         chain: Arc<Blockchain>,
         block_filters: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
-        node_interface: NodeInterface,
-    ) -> Result<ElectrumServer<Blockchain>, Box<dyn error::Error>> {
+        node_interface: NodeHandle,
+    ) -> Result<Self, Box<dyn error::Error>> {
         let (tx, rx) = unbounded_channel();
 
-        Ok(ElectrumServer {
+        Ok(Self {
             last_rebroadcast: None,
             chain,
             address_cache,
@@ -653,7 +659,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 });
 
                 info!("Catching up with addresses {:?}", self.addresses_to_scan);
-                let addresses = std::mem::take(&mut self.addresses_to_scan);
+                let addresses: Vec<_> = mem::take(&mut self.addresses_to_scan);
                 self.rescan_for_addresses(addresses).await?;
             }
         }
@@ -1048,6 +1054,7 @@ mod test {
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
     use floresta_chain::FlatChainStoreConfig;
+    use floresta_chain::pruned_utreexo::merkle::ConsensusMerkle;
     use floresta_common::assert_ok;
     use floresta_common::get_spk_hash;
     use floresta_mempool::Mempool;
@@ -1118,7 +1125,7 @@ mod test {
     fn get_test_cache() -> Arc<AddressCache<KvDatabase>> {
         let test_id: u32 = rand::random();
         let cache = KvDatabase::new(format!("./tmp-db/{test_id}.floresta")).unwrap();
-        let cache = AddressCache::new(cache);
+        let cache = AddressCache::new(cache, ConsensusMerkle);
 
         // Inserting test transactions in the wallet
         let (transaction, proof) = get_test_transaction();

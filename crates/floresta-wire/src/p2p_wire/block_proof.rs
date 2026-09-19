@@ -270,7 +270,7 @@ impl Decodable for UtreexoProof {
             leaf_data.push(leaf);
         }
 
-        Ok(UtreexoProof {
+        Ok(Self {
             block_hash,
             proof_hashes,
             targets,

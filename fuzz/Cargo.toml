@@ -10,9 +10,10 @@ edition.workspace = true
 cargo-fuzz = true
 
 [dependencies]
-arbitrary = { version = "1.4", features = ["derive"] }
+# All dependencies MUST be pinned precisely with `X.Y.z`
+arbitrary = { version = "=1.4.2", features = ["derive"] }
 bitcoin = { workspace = true }
-libfuzzer-sys = "0.4"
+libfuzzer-sys = { version = "=0.4.13" }
 tempfile = { workspace = true }
 
 # Local dependencies
@@ -22,6 +23,13 @@ floresta-wire = { workspace = true }
 [[bin]]
 name = "local_address_str"
 path = "fuzz_targets/local_address_str.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "merkle_root"
+path = "fuzz_targets/merkle_root.rs"
 test = false
 doc = false
 bench = false
@@ -71,6 +79,34 @@ bench = false
 [[bin]]
 name = "disk_block_header_roundtrip"
 path = "fuzz_targets/disk_block_header_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bitcoin_socket_addr"
+path = "fuzz_targets/bitcoin_socket_addr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onion_address_rtt"
+path = "fuzz_targets/onion_address_rtt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onion_address_str_parse"
+path = "fuzz_targets/onion_address_str_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_v2_message"
+path = "fuzz_targets/p2p_v2_message.rs"
 test = false
 doc = false
 bench = false

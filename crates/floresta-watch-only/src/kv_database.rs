@@ -27,13 +27,13 @@ pub struct KvDatabase(Store, Bucket<'static, String, Vec<u8>>);
 
 impl KvDatabase {
     /// Create a new [`KvDatabase`] inside the `datadir`.
-    pub fn new(datadir: impl AsRef<Path>) -> Result<KvDatabase> {
+    pub fn new(datadir: impl AsRef<Path>) -> Result<Self> {
         let kv_db_config = Config::new(datadir);
 
         let kv_db_store = Store::new(kv_db_config)?;
         let kv_db_bucket = kv_db_store.bucket::<String, Vec<u8>>(Some("addresses"))?;
 
-        Ok(KvDatabase(kv_db_store, kv_db_bucket))
+        Ok(Self(kv_db_store, kv_db_bucket))
     }
 }
 
@@ -59,11 +59,11 @@ pub enum KvDatabaseError {
 impl Display for KvDatabaseError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            KvDatabaseError::KvError(e) => write!(f, "kv error: {e}"),
-            KvDatabaseError::SerdeJsonError(e) => write!(f, "JSON error: {e}"),
-            KvDatabaseError::WalletNotInitialized => write!(f, "The wallet is not initialized"),
-            KvDatabaseError::DeserializeError(e) => write!(f, "Error whilst deserilializing: {e}"),
-            KvDatabaseError::TransactionNotFound => {
+            Self::KvError(e) => write!(f, "kv error: {e}"),
+            Self::SerdeJsonError(e) => write!(f, "JSON error: {e}"),
+            Self::WalletNotInitialized => write!(f, "The wallet is not initialized"),
+            Self::DeserializeError(e) => write!(f, "Error whilst deserilializing: {e}"),
+            Self::TransactionNotFound => {
                 write!(f, "The requested transaction was not found in the database")
             }
         }

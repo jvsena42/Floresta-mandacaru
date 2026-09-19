@@ -9,10 +9,8 @@ This functional test cli utility to interact with a Floresta node with `getblock
 import time
 import random
 from typing import Any
-
 import pytest
-
-TIMEOUT_SECONDS = 20
+from test_framework.util import compare_fields
 
 
 class TestGetBlock:
@@ -37,21 +35,15 @@ class TestGetBlock:
         self.log = setup_logging
         self.node_manager = node_manager
 
-        self.bitcoind.rpc.generate_block(2017)
+        self.bitcoind.rpc.generate(2017)
         time.sleep(1)
-        self.bitcoind.rpc.generate_block(6)
+        self.bitcoind.rpc.generate(6)
 
         self.node_manager.connect_nodes(self.florestad, self.bitcoind)
 
         block_count = self.bitcoind.rpc.get_block_count()
-        end = time.time() + TIMEOUT_SECONDS
-        while time.time() < end:
-            floresta_count = self.florestad.rpc.get_block_count()
-            if floresta_count == block_count:
-                break
-            time.sleep(0.5)
 
-        assert floresta_count == block_count
+        self.node_manager.wait_for_sync_nodes(is_finished_ibd=False)
 
         self.log.info("Testing getblock RPC in the genesis block")
         self.compare_block(0)
@@ -80,12 +72,7 @@ class TestGetBlock:
         floresta_block = self.florestad.rpc.get_block(block_hash, 1)
         bitcoind_block = self.bitcoind.rpc.get_block(block_hash, 1)
 
-        for key, bval in bitcoind_block.items():
-            fval = floresta_block[key]
-
-            self.log.info(f"Comparing {key} field: floresta={fval} bitcoind={bval}")
-            if key == "difficulty":
-                # Allow small differences in floating point representation
-                assert round(fval, 3) == round(bval, 3)
-            else:
-                assert fval == bval
+        compare_fields(
+            floresta_block,
+            bitcoind_block,
+        )

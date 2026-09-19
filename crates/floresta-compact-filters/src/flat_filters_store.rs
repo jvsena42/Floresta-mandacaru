@@ -58,7 +58,7 @@ struct FlatFiltersStoreInner {
 
 impl From<PoisonError<MutexGuard<'_, FlatFiltersStoreInner>>> for IterableFilterStoreError {
     fn from(_: PoisonError<MutexGuard<'_, FlatFiltersStoreInner>>) -> Self {
-        IterableFilterStoreError::PoisonedLock
+        Self::PoisonedLock
     }
 }
 

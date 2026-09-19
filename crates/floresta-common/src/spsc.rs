@@ -46,7 +46,7 @@ impl<T> Channel<T> {
     /// assert_eq!(channel.recv().next(), Some(1));
     /// ```
     pub fn new() -> Self {
-        Channel {
+        Self {
             content: spin::Mutex::new(Vec::new()),
         }
     }

@@ -7,8 +7,9 @@ use core::fmt::Formatter;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use bip324::serde::CommandString;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Transaction;
@@ -21,11 +22,14 @@ use bitcoin::hashes::Hash;
 use bitcoin::p2p::PROTOCOL_VERSION;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::AddrV2Message;
+use bitcoin::p2p::message::CommandString;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
+use bitcoin::p2p::message_filter::CFHeaders;
+use bitcoin::p2p::message_filter::GetCFHeaders;
 use bitcoin::p2p::message_network::VersionMessage;
 use floresta_common::impl_error_from;
-use floresta_mempool::Mempool;
+use floresta_domain::mempool::MempoolBase;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::spawn;
@@ -82,6 +86,12 @@ const INV_MESSAGE_INTERVAL: Duration = Duration::from_secs(30); // 30 seconds
 /// If a peer sends more than this, we disconnect it.
 const MAX_MSGS_PER_SEC: u64 = 10_000;
 
+/// The version for BIP158 basic filter type.
+const BASIC_FILTER_VERSION: u8 = 0;
+
+/// How many filter (or filter headers) are allowed in a single message.
+const MAX_FILTERS_PER_MESSAGE: usize = 2_000;
+
 #[derive(Debug, PartialEq)]
 enum State {
     None,
@@ -124,9 +134,10 @@ pub fn create_actors<R: AsyncRead + Unpin + Send>(
 }
 
 pub struct Peer<T: AsyncWrite + Unpin + Send + Sync> {
-    mempool: Arc<Mutex<Mempool>>,
+    mempool: Arc<Mutex<dyn MempoolBase>>,
     blocks_only: bool,
     services: ServiceFlags,
+    time_offset: i64,
     user_agent: String,
     messages: u64,
     start_time: Instant,
@@ -190,25 +201,25 @@ pub enum PeerError {
 impl Display for PeerError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            PeerError::Send => write!(f, "Error while sending to peer"),
-            PeerError::Read(err) => write!(f, "Error while reading from peer: {err:?}"),
-            PeerError::Parse(err) => write!(f, "Error while parsing message: {err:?}"),
-            PeerError::UnexpectedMessage => {
+            Self::Send => write!(f, "Error while sending to peer"),
+            Self::Read(err) => write!(f, "Error while reading from peer: {err:?}"),
+            Self::Parse(err) => write!(f, "Error while parsing message: {err:?}"),
+            Self::UnexpectedMessage => {
                 write!(f, "Peer sent us a message that we aren't expecting")
             }
-            PeerError::MessageTooBig => write!(f, "Peer sent us a message that is too big"),
-            PeerError::MagicBitsMismatch => {
+            Self::MessageTooBig => write!(f, "Peer sent us a message that is too big"),
+            Self::MagicBitsMismatch => {
                 write!(f, "Peer sent us a message with the wrong magic bits")
             }
-            PeerError::TooManyMessages => {
+            Self::TooManyMessages => {
                 write!(
                     f,
                     "Peer sent us too many messages in a short period of time"
                 )
             }
-            PeerError::PingTimeout => write!(f, "Peer timed out a ping"),
-            PeerError::Channel => write!(f, "Channel error with empty data"),
-            PeerError::Transport(err) => write!(f, "Transport error: {err:?}"),
+            Self::PingTimeout => write!(f, "Peer timed out a ping"),
+            Self::Channel => write!(f, "Channel error with empty data"),
+            Self::Transport(err) => write!(f, "Transport error: {err:?}"),
         }
     }
 }
@@ -219,7 +230,7 @@ impl_error_from!(PeerError, encode::Error, Parse);
 
 impl From<SendError<ReaderMessage>> for PeerError {
     fn from(_: SendError<ReaderMessage>) -> Self {
-        PeerError::Channel
+        Self::Channel
     }
 }
 
@@ -404,7 +415,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
             }
             NodeRequest::GetFilter((stop_hash, start_height)) => {
                 let get_filter = bitcoin::p2p::message_filter::GetCFilters {
-                    filter_type: 0,
+                    filter_type: BASIC_FILTER_VERSION,
                     start_height,
                     stop_hash,
                 };
@@ -430,6 +441,20 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     payload: serialize(&get_block_proof),
                 })
                 .await?;
+            }
+
+            NodeRequest::GetCFHeaders {
+                start_height,
+                stop_hash,
+            } => {
+                let get_cfheaders = GetCFHeaders {
+                    filter_type: BASIC_FILTER_VERSION,
+                    start_height,
+                    stop_hash,
+                };
+
+                self.write(NetworkMessage::GetCFHeaders(get_cfheaders))
+                    .await?;
             }
         }
         Ok(())
@@ -517,7 +542,11 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     self.write(NetworkMessage::Inv(Vec::new())).await?;
                 }
                 NetworkMessage::GetAddr => {
-                    self.write(NetworkMessage::AddrV2(Vec::new())).await?;
+                    if self.wants_addrv2 {
+                        self.write(NetworkMessage::AddrV2(Vec::new())).await?;
+                        return Ok(());
+                    }
+                    self.write(NetworkMessage::Addr(Vec::new())).await?;
                 }
                 NetworkMessage::GetData(inv) => {
                     for inv_el in inv {
@@ -533,8 +562,8 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     }
                 }
                 NetworkMessage::SendAddrV2 => {
-                    self.wants_addrv2 = true;
-                    self.write(NetworkMessage::SendAddrV2).await?;
+                    warn!("Peer {} sent SendAddrV2 after handshake completed", self.id);
+                    return Err(PeerError::UnexpectedMessage);
                 }
                 NetworkMessage::Pong(_) => {
                     self.last_ping = None;
@@ -571,6 +600,20 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     }
                     _ => {}
                 },
+
+                NetworkMessage::CFHeaders(cfheaders) => {
+                    if cfheaders.filter_hashes.len() > MAX_FILTERS_PER_MESSAGE {
+                        return Err(PeerError::MessageTooBig);
+                    }
+
+                    if cfheaders.filter_type != BASIC_FILTER_VERSION {
+                        warn!("Unknown filter header type {}", cfheaders.filter_type);
+                        return Err(PeerError::UnexpectedMessage);
+                    }
+
+                    self.send_to_node(PeerMessages::CFHeaders(cfheaders), time);
+                }
+
                 // Explicitly ignore these messages, if something changes in the future
                 // this would cause a compile error.
                 NetworkMessage::Verack
@@ -580,7 +623,6 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                 | NetworkMessage::Alert(_)
                 | NetworkMessage::BlockTxn(_)
                 | NetworkMessage::CFCheckpt(_)
-                | NetworkMessage::CFHeaders(_)
                 | NetworkMessage::CmpctBlock(_)
                 | NetworkMessage::FilterAdd(_)
                 | NetworkMessage::FilterClear
@@ -614,6 +656,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                             blocks: self.current_best_block.unsigned_abs(),
                             address_id: self.address.id,
                             services: self.services,
+                            time_offset: self.time_offset,
                             kind: self.kind,
                             transport_protocol: self.transport_protocol,
                         }),
@@ -647,13 +690,13 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
     pub async fn handle_get_data(&mut self, inv: Inventory) -> Result<()> {
         match inv {
             Inventory::WitnessTransaction(txid) => {
-                let tx = self.mempool.lock().await.get_from_mempool(&txid).cloned();
+                let tx = self.mempool.lock().await.get_from_mempool(txid).cloned();
                 if let Some(tx) = tx {
                     self.write(NetworkMessage::Tx(tx)).await?;
                 }
             }
             Inventory::Transaction(txid) => {
-                let tx = self.mempool.lock().await.get_from_mempool(&txid).cloned();
+                let tx = self.mempool.lock().await.get_from_mempool(txid).cloned();
                 if let Some(tx) = tx {
                     self.write(NetworkMessage::Tx(tx)).await?;
                 }
@@ -667,7 +710,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
     pub fn create_peer<W: AsyncWrite + Unpin + Send + Sync + 'static>(
         id: u32,
         address: LocalAddress,
-        mempool: Arc<Mutex<Mempool>>,
+        mempool: Arc<Mutex<dyn MempoolBase>>,
         node_tx: UnboundedSender<NodeNotification>,
         node_requests: UnboundedReceiver<NodeRequest>,
         kind: ConnectionKind,
@@ -690,6 +733,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
             last_addrv2: Instant::now() - ADDRV2_MESSAGE_INTERVAL,
             node_tx,
             services: ServiceFlags::NONE,
+            time_offset: 0,
             messages: 0,
             start_time: Instant::now(),
             user_agent: "".into(),
@@ -716,6 +760,11 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
     }
 
     async fn handle_version(&mut self, version: VersionMessage) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should not be before UNIX epoch")
+            .as_secs() as i64;
+        self.time_offset = version.timestamp.saturating_sub(now);
         self.user_agent = version.user_agent;
         self.blocks_only = !version.relay;
         self.current_best_block = version.start_height;
@@ -747,7 +796,7 @@ pub(super) mod peer_utils {
     use bitcoin::p2p::message_network::VersionMessage;
     use floresta_common::PROTOCOL_VERSION;
     use floresta_common::advertised_services;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::rng;
 
     use crate::address_man::LocalAddress;
@@ -780,10 +829,8 @@ pub(super) mod peer_utils {
         let sender_address = Address::new(&fake_socket, services);
 
         // The remote peer's `Address`.
-        let receiver_address = Address::new(
-            &peer_address.get_socket_address(),
-            peer_address.get_services(),
-        );
+        let peer_addr = peer_address.get_socket_addr().unwrap_or(fake_socket);
+        let receiver_address = Address::new(&peer_addr, peer_address.get_services());
 
         // Generate a per-message nonce.
         let mut prng = rng();
@@ -817,6 +864,7 @@ pub struct Version {
     pub id: u32,
     pub address_id: usize,
     pub services: ServiceFlags,
+    pub time_offset: i64,
     pub kind: ConnectionKind,
     pub transport_protocol: TransportProtocol,
 }
@@ -858,6 +906,9 @@ pub enum PeerMessages {
 
     /// Remote peer sent us a Utreexo proof,
     UtreexoProof(UtreexoProof),
+
+    /// Remote peer sent us compact block filter headers
+    CFHeaders(CFHeaders),
 }
 
 #[cfg(test)]
@@ -867,10 +918,10 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
-    use bip324::serde::NetworkMessage;
     use bitcoin::Network;
     use bitcoin::p2p::ServiceFlags;
     use bitcoin::p2p::address::AddrV2;
+    use bitcoin::p2p::message::NetworkMessage;
     use floresta_mempool::Mempool;
     use tokio::sync::Mutex;
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -881,6 +932,7 @@ mod tests {
     use crate::TransportProtocol;
     use crate::address_man::AddressState;
     use crate::address_man::LocalAddress;
+    use crate::bitcoin_socket_addr::BitcoinSocketAddr;
     use crate::node::ConnectionKind;
     use crate::node::NodeNotification;
     use crate::node::NodeRequest;
@@ -916,11 +968,10 @@ mod tests {
         let (cancellation_sender, _) = oneshot::channel();
 
         let address = LocalAddress::new(
-            AddrV2::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+            BitcoinSocketAddr::new(AddrV2::Ipv4(Ipv4Addr::new(127, 0, 0, 1)), 8333),
             0,
             AddressState::NeverTried,
             ServiceFlags::NONE,
-            18444,
             0,
         );
 
@@ -934,6 +985,7 @@ mod tests {
             mempool: Arc::new(Mutex::new(Mempool::new(1000))),
             node_tx,
             services: ServiceFlags::NONE,
+            time_offset: 0,
             messages: 0,
             shutdown: false,
             last_ping: Some(Instant::now()),

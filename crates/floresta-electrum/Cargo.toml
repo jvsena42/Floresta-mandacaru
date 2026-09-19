@@ -16,11 +16,11 @@ keywords = ["bitcoin", "utreexo", "node", "blockchain", "rust"]
 categories = ["cryptography::cryptocurrencies"]
 
 [dependencies]
+# All dependencies MUST be pinned precisely with `X.Y.z`
 bitcoin = { workspace = true }
 rustreexo = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = "2.0"
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }

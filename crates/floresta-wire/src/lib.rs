@@ -26,16 +26,21 @@ mod p2p_wire;
 pub use p2p_wire::UtreexoNodeConfig;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::address_man;
+pub use p2p_wire::bitcoin_socket_addr;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::block_proof;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::error;
 #[cfg(not(target_arch = "wasm32"))]
+pub use p2p_wire::network_message_ext;
+#[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::node;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::node_context;
+pub use p2p_wire::node_handle;
 #[cfg(not(target_arch = "wasm32"))]
 pub use p2p_wire::node_interface;
+pub use p2p_wire::onion;
 pub use p2p_wire::transport::TransportProtocol;
 
 /// NodeHooks is a trait that defines the hooks that a node can use to interact with the network

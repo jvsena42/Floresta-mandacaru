@@ -101,13 +101,22 @@ class AddNodeTest:
         self.verify_peer_connection_state(is_connected=True)
 
         self.log.info(
-            "===== Verify Floresta does not add the same persistent peer twice"
+            "===== Verify Floresta reports an error when re-adding the same persistent peer"
         )
-        self.floresta_addnode_with_command("add")
+        self.florestad.rpc.ensure_rpc_call_error(
+            method="addnode",
+            params=[self.bitcoind.p2p_url, "add", self.is_v2],
+        )
         # This function expects 1 peer connected to florestad
         self.verify_peer_connection_state(is_connected=True)
 
-        self.floresta_addnode_with_command("onetry")
+        self.log.info(
+            "===== Verify Floresta reports an error on a redundant 'onetry' connection"
+        )
+        self.florestad.rpc.ensure_rpc_call_error(
+            method="addnode",
+            params=[self.bitcoind.p2p_url, "onetry", self.is_v2],
+        )
         # This function expects 1 peer connected to florestad
         self.verify_peer_connection_state(is_connected=True)
 

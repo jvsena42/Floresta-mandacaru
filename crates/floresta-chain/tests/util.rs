@@ -161,12 +161,12 @@ mod script_asm {
     impl fmt::Display for ParseScriptError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                ParseScriptError::BadDecimal(tok) => write!(f, "bad decimal literal `{tok}`"),
-                ParseScriptError::DecimalOutOfRange(n) => write!(
+                Self::BadDecimal(tok) => write!(f, "bad decimal literal `{tok}`"),
+                Self::DecimalOutOfRange(n) => write!(
                     f,
                     "decimal out of range: {n} (allowed: -0xffffffff..=0xffffffff)"
                 ),
-                ParseScriptError::BadOpcode(tok) => write!(f, "unknown opcode `{tok}`"),
+                Self::BadOpcode(tok) => write!(f, "unknown opcode `{tok}`"),
             }
         }
     }

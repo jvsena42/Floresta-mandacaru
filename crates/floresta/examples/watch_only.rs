@@ -5,9 +5,10 @@
 use bitcoin::ScriptBuf;
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::hex::FromHex;
-use floresta_common::get_spk_hash;
-use floresta_watch_only::AddressCache;
-use floresta_watch_only::memory_database::MemoryDatabase;
+use floresta::chain::pruned_utreexo::merkle::ConsensusMerkle;
+use floresta::common::get_spk_hash;
+use floresta::watch_only::AddressCache;
+use floresta::watch_only::memory_database::MemoryDatabase;
 use miniscript::Descriptor;
 use miniscript::bitcoin::secp256k1::Secp256k1;
 
@@ -17,7 +18,7 @@ fn main() {
     // the `AddressCacheDatabase` trait.
     let wallet_data = MemoryDatabase::new();
     // Then, we create the wallet itself.
-    let wallet = AddressCache::new(wallet_data);
+    let wallet = AddressCache::new(wallet_data, ConsensusMerkle);
     // Now, we need to add the addresses we want to watch. We can add them one by one, or
     // we can add a descriptor that will generate the addresses for us. Here, we use a
     // descriptor that generates P2WPKH addresses. The descriptor is parsed using the
