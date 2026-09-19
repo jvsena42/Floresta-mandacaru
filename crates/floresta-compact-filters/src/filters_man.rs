@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
 use std::time::Duration;
+use std::time::Instant;
 
 use bitcoin::Block;
 use bitcoin::BlockHash;
@@ -51,6 +52,11 @@ const DEFAULT_RESCAN_PAGE_SIZE: usize = 50;
 const MAX_RESCAN_PAGE_SIZE: usize = 10_000;
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const RESCAN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// After a failed synchronization, connected blocks don't trigger another one for this long.
+/// Blocks connect by the dozen per second during IBD, and without a compact-filters peer each
+/// of them would otherwise start a synchronization that fails right away.
+const SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Bits a BIP158 basic filter spends on each element, at the very least: a Golomb-Rice code with
 /// `P = 19` is a unary quotient of one bit or more followed by a 19-bit remainder.
@@ -438,6 +444,8 @@ pub struct FiltersMan<Store, Chain, Node> {
     rescans: HashMap<RescanTicket, RescanState>,
     next_ticket: u64,
     checkpoints: Vec<FilterHeader>,
+    /// When the last synchronization failed, if the last one did.
+    last_sync_failure: Option<Instant>,
 }
 
 impl<Store, Chain, Node> FiltersMan<Store, Chain, Node>
@@ -463,6 +471,7 @@ where
             rescans: HashMap::new(),
             next_ticket: 0,
             checkpoints: Vec::new(),
+            last_sync_failure: None,
         }
     }
 
@@ -855,6 +864,12 @@ where
             None => height > 0,
         };
         if needs_sync {
+            // The headers below this block are missing. If we just failed to fetch them, the
+            // periodic synchronization will, and this block's header comes with them.
+            if self.synced_recently_failed() {
+                debug!(height, "not building a filter: header sync is failing");
+                return Ok(());
+            }
             self.sync().await?;
         }
 
@@ -912,8 +927,19 @@ where
         Ok(())
     }
 
+    fn synced_recently_failed(&self) -> bool {
+        self.last_sync_failure
+            .is_some_and(|failed_at| failed_at.elapsed() < SYNC_RETRY_INTERVAL)
+    }
+
     /// Synchronizes filter headers and BIP157 checkpoints to the current best-chain tip.
     pub async fn sync(&mut self) -> Result<(), FilterManError> {
+        let result = self.sync_inner().await;
+        self.last_sync_failure = result.is_err().then(Instant::now);
+        result
+    }
+
+    async fn sync_inner(&mut self) -> Result<(), FilterManError> {
         self.reconcile_store()?;
         let tip = self.chain.get_height().map_err(FilterManError::chain)?;
         self.sync_checkpoints(tip).await?;
@@ -1693,6 +1719,32 @@ mod tests {
             store.get_filter_header(0).unwrap(),
             expected.filter_header(&FilterHeader::all_zeros())
         );
+    }
+
+    #[tokio::test]
+    async fn connected_blocks_do_not_retry_a_sync_that_just_failed() {
+        let (_file, store, mut chain, node, block, _filter) = setup();
+        // The chain is well ahead of the store and the node can't serve filter headers, as
+        // when no peer offers compact filters.
+        for height in 1..=5 {
+            Arc::make_mut(&mut chain.hashes).push(mock_block_hash(height));
+        }
+        let header_requests = node.header_requests.clone();
+        let mut manager = FiltersMan::new(store, node, chain);
+        let connected = || ConnectedBlock {
+            block: block.clone(),
+            height: 4,
+            spent_utxos: HashMap::new(),
+        };
+
+        assert!(manager.process_connected_block(connected()).await.is_err());
+        assert_eq!(header_requests.load(Ordering::Relaxed), 1);
+
+        // IBD connects blocks by the dozen per second; they must not each start a sync.
+        for _ in 0..50 {
+            manager.process_connected_block(connected()).await.unwrap();
+        }
+        assert_eq!(header_requests.load(Ordering::Relaxed), 1);
     }
 
     #[test]
