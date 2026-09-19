@@ -732,6 +732,9 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
                 self.rescan_failures += 1;
                 self.rescan_retry_at = Some(Instant::now() + delay);
                 error!(%error, ?delay, "Electrum script rescan failed; will retry");
+                // The retry scans the whole range again and hands us blocks we already
+                // processed. That is fine only because the wallet ignores transactions and
+                // outputs it has already cached.
                 self.addresses_to_scan.extend(rescan.addresses);
             }
         }
@@ -759,8 +762,12 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             return;
         }
         let Some(filters) = self.filter_handle.clone() else {
+            // No history without filters, but the scripts are still watched from now on:
+            // the scriptpubkey endpoints rely on this function to cache what they queue.
             error!("Can't rescan for new Electrum scripts: compact filters are disabled");
-            self.addresses_to_scan.clear();
+            for address in std::mem::take(&mut self.addresses_to_scan) {
+                self.address_cache.cache_address(address);
+            }
             return;
         };
         if !self.filters_ready(&filters) {

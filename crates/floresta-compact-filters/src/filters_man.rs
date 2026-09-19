@@ -446,7 +446,8 @@ struct RescanState {
     page_size: usize,
     first_status: bool,
     start: u32,
-    end: u32,
+    /// Moves up while a rescan without an explicit end follows the tip.
+    end: Arc<AtomicU32>,
     scanned: Arc<AtomicU32>,
 }
 
@@ -750,6 +751,7 @@ where
         let (sender, blocks) = mpsc::channel(page_size);
         let (outcome_sender, outcome) = oneshot::channel();
         let scanned = Arc::new(AtomicU32::new(0));
+        let end = Arc::new(AtomicU32::new(end));
         self.rescans.insert(
             ticket,
             RescanState {
@@ -760,7 +762,7 @@ where
                 page_size,
                 first_status: true,
                 start,
-                end,
+                end: end.clone(),
                 scanned: scanned.clone(),
             },
         );
@@ -771,7 +773,7 @@ where
         let manager = self.request_sender.clone();
         tokio::spawn(async move {
             let result = Self::run_rescan(
-                store, node, chain, request, start, end, &sender, &scanned, &manager,
+                store, node, chain, request, start, &end, &sender, &scanned, &manager,
             )
             .await;
             // After the last block, so an `Ok` outcome means every match is already queued.
@@ -798,7 +800,7 @@ where
                 page_size: 1,
                 first_status: true,
                 start: tip,
-                end: tip,
+                end: Arc::new(AtomicU32::new(tip)),
                 scanned: Arc::new(AtomicU32::new(1)),
             },
         );
@@ -841,7 +843,7 @@ where
 
         Ok(RescanProgress {
             start_height: state.start,
-            end_height: state.end,
+            end_height: state.end.load(Ordering::Relaxed),
             scanned: state.scanned.load(Ordering::Relaxed),
         })
     }
@@ -904,11 +906,18 @@ where
         chain: Chain,
         request: RescanRequest,
         start: u32,
-        end: u32,
+        end_height: &AtomicU32,
         blocks: &mpsc::Sender<Block>,
         scanned: &AtomicU32,
         manager: &mpsc::Sender<ManagerRequest>,
     ) -> Result<(), FilterManError> {
+        // The consumer keeps feeding its wallet the blocks that connect while we scan, and a
+        // wallet only sees a spend if it already knows the output being spent. A block that
+        // connected during the scan and spends an output we deliver later would leave that
+        // output looking unspent forever. So a rescan that wasn't given an end isn't over until
+        // it caught up with the tip: those blocks are delivered again, after the historical ones.
+        let follows_tip = request.end_height.is_none();
+        let mut end = end_height.load(Ordering::Relaxed);
         let mut batch_start = start;
         let mut matching_blocks = tracing::enabled!(tracing::Level::DEBUG).then(Vec::new);
         loop {
@@ -1009,6 +1018,18 @@ where
             }
 
             scanned.store(batch_end - start + 1, Ordering::Relaxed);
+
+            if batch_end == end && follows_tip {
+                let tip = chain.get_height().map_err(FilterManError::chain)?;
+                if tip > end {
+                    debug!(
+                        end,
+                        tip, "compact-filter rescan is catching up with the tip"
+                    );
+                    end = tip;
+                    end_height.store(tip, Ordering::Relaxed);
+                }
+            }
 
             if batch_end == end {
                 if let Some(matching_blocks) = matching_blocks {
@@ -2431,6 +2452,92 @@ mod tests {
         );
     }
 
+    /// A chain whose tip the test can move while a rescan runs.
+    #[derive(Clone)]
+    struct GrowingChain {
+        hashes: Arc<Mutex<Vec<BlockHash>>>,
+    }
+
+    impl FilterChain for GrowingChain {
+        type Error = MockError;
+
+        fn get_height(&self) -> Result<u32, Self::Error> {
+            Ok(self.hashes.lock().unwrap().len() as u32 - 1)
+        }
+
+        fn get_block_hash(&self, height: u32) -> Result<BlockHash, Self::Error> {
+            self.hashes
+                .lock()
+                .unwrap()
+                .get(height as usize)
+                .copied()
+                .ok_or(MockError("unknown height"))
+        }
+    }
+
+    #[tokio::test]
+    async fn rescan_without_an_end_catches_up_with_blocks_connected_meanwhile() {
+        let (_file, store, first_chain, mut node, block, _filter) = setup();
+        let script = block.txdata[0].output[0].script_pubkey.clone();
+        // A child of the stored block, paying to the same script.
+        let mut second_block = block.clone();
+        second_block.header.prev_blockhash = block.block_hash();
+        let second_hash = second_block.block_hash();
+        let second_filter = BlockFilter::new_script_filter(&second_block, |outpoint| {
+            Err::<ScriptBuf, _>(bitcoin::bip158::Error::UtxoMissing(*outpoint))
+        })
+        .unwrap();
+        Arc::make_mut(&mut node.blocks).insert(second_hash, second_block.clone());
+        Arc::make_mut(&mut node.filters).insert(second_hash, second_filter);
+
+        // The rescan starts with the tip at height 0. Its first request fails, which holds it
+        // for a second: enough for the second block to connect.
+        node.filter_failures.store(1, Ordering::Relaxed);
+        let chain = GrowingChain {
+            hashes: Arc::new(Mutex::new(vec![first_chain.hashes[0]])),
+        };
+        let manager = FiltersMan::new(store, node, chain.clone());
+        let handle = manager.get_handle();
+        let new_blocks = manager.block_consumer();
+        let task = tokio::spawn(manager.main_loop());
+
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script.clone()]))
+            .await
+            .unwrap();
+        // The second block connects: the chain moves and the manager is told, as in production.
+        chain.hashes.lock().unwrap().push(second_hash);
+        new_blocks.on_block(&second_block, 1, Some(&HashMap::new()));
+
+        let (matched, progress) = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut matched = Vec::new();
+            loop {
+                matched.extend(handle.get_blocks(ticket).await.unwrap());
+                let progress = handle.get_progress(ticket).await.unwrap();
+                if handle.get_info(ticket).await.unwrap() == RescanStatus::Finished {
+                    break (matched, progress);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Delivered in chain order, the late block after the historical one.
+        assert_eq!(matched.len(), 2);
+        assert_eq!(matched[1], second_block);
+        assert_eq!(progress.end_height, 1);
+
+        // A rescan that names its end stays within it.
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script]).with_range(None, Some(0)))
+            .await
+            .unwrap();
+        assert_eq!(drain_rescan(&handle, ticket).await.0.len(), 1);
+
+        task.abort();
+    }
+
     #[tokio::test]
     async fn finished_and_cancelled_rescans_are_forgotten() {
         let (_file, store, chain, node, second_block) = setup_two_blocks();
@@ -2477,7 +2584,7 @@ mod tests {
                 page_size: 1,
                 first_status: true,
                 start: 0,
-                end: 0,
+                end: Arc::new(AtomicU32::new(0)),
                 scanned: Arc::new(AtomicU32::new(0)),
             }
         };
