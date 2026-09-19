@@ -67,6 +67,18 @@ florestad --no-backfill
 
 Floresta synchronizes and persists the compact-filter header chain, then fetches and validates full filters on demand for wallet rescans. Only a bounded cache of recent full filters is retained, so enabling rescans does not require storing every filter.
 
+Because filters are not kept, every rescan downloads the filters of its whole range from peers again. If you know when your wallet was created, tell the node with `--filters-start-height` (the wallet birthday) so rescans skip the blocks before it:
+
+```bash
+# Rescans start at block 800,000 unless told otherwise
+florestad --filters-start-height 800000
+
+# Negative values are relative to the tip at the time of each rescan (note the `=`)
+florestad --filters-start-height=-50000
+```
+
+This is the default start of every rescan that doesn't name one: `loaddescriptor`, `rescanblockchain` without a start height, and the rescans the Electrum server runs for scripts it hasn't seen before. History older than the birthday is not found, and nothing reports that it was skipped; an explicit `rescanblockchain <start_block>` reaches further back without a restart. The flag no longer affects what is stored, since filter headers are always synchronized from genesis.
+
 To disable compact-filter synchronization and historical rescans, start the node with the `--no-cfilters` flag.
 
 ```bash
