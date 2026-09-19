@@ -1097,6 +1097,7 @@ dependencies = [
  "floresta-electrum",
  "floresta-mempool",
  "floresta-metrics",
+ "floresta-rpc",
  "floresta-watch-only",
  "floresta-wire",
  "libc",

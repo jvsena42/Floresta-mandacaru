@@ -6,7 +6,6 @@ use bitcoin::BlockHash;
 use bitcoin::Txid;
 use corepc_types::v29::GetTxOut;
 use corepc_types::v30::GetAddrManInfo;
-use corepc_types::v30::GetBlockchainInfo;
 use corepc_types::v30::GetDeploymentInfo;
 use serde::Serialize;
 use serde::de::Deserialize;
@@ -33,7 +32,7 @@ pub trait FlorestaRPC {
     /// This method returns a bunch of information about the chain we are on, including
     /// the current height, the best block hash, the difficulty, and whether we are
     /// currently in IBD (Initial Block Download) mode.
-    fn get_blockchain_info(&self) -> Result<GetBlockchainInfo>;
+    fn get_blockchain_info(&self) -> Result<GetBlockchainInfoRes>;
     /// Returns the hash of the best (tip) block in the most-work fully-validated chain.
     fn get_best_block_hash(&self) -> Result<BlockHash>;
     /// Returns the hash of the block at the given height
@@ -335,7 +334,7 @@ impl<T: JsonRPCClient> FlorestaRPC for T {
         self.call("getblockheader", &params)
     }
 
-    fn get_blockchain_info(&self) -> Result<GetBlockchainInfo> {
+    fn get_blockchain_info(&self) -> Result<GetBlockchainInfoRes> {
         self.call("getblockchaininfo", &[])
     }
 
@@ -436,6 +435,7 @@ mod tests {
     use std::vec;
 
     use bitcoin::hashes::Hash;
+    use corepc_types::v30::GetBlockchainInfo;
 
     use super::*;
 
@@ -501,26 +501,36 @@ mod tests {
     #[test]
     fn test_get_blockchain_info() {
         let client = MockRpcClient::new();
-        let get_blockchain_info_res = GetBlockchainInfo {
-            chain: "main".to_string(),
-            blocks: 1000,
-            headers: 1000,
-            best_block_hash: "".to_string(),
-            difficulty: 1.0,
-            automatic_pruning: None,
-            bits: "1d00ffff".to_string(),
-            chain_work: "".to_string(),
-            initial_block_download: false,
-            median_time: 0,
-            prune_height: None,
-            prune_target_size: None,
-            pruned: false,
-            signet_challenge: None,
-            size_on_disk: 0,
-            target: "1d00ffff".to_string(),
-            time: 0,
-            verification_progress: 1.0,
-            warnings: vec![],
+        let get_blockchain_info_res = GetBlockchainInfoRes {
+            core: GetBlockchainInfo {
+                chain: "main".to_string(),
+                blocks: 1000,
+                headers: 1000,
+                best_block_hash: "".to_string(),
+                difficulty: 1.0,
+                automatic_pruning: None,
+                bits: "1d00ffff".to_string(),
+                chain_work: "".to_string(),
+                initial_block_download: false,
+                median_time: 0,
+                prune_height: None,
+                prune_target_size: None,
+                pruned: false,
+                signet_challenge: None,
+                size_on_disk: 0,
+                target: "1d00ffff".to_string(),
+                time: 0,
+                verification_progress: 1.0,
+                warnings: vec![],
+            },
+            leaf_count: 42,
+            root_count: 1,
+            root_hashes: vec!["00".repeat(32)],
+            filters: Some(1000),
+            filters_start: Some(900),
+            rescan_in_progress: true,
+            rescan_blocks_processed: Some(1),
+            rescan_blocks_total: Some(2),
         };
         let expected_result = serde_json::to_value(get_blockchain_info_res).unwrap();
         client.set_result(expected_result.clone());

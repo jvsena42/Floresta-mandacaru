@@ -8,10 +8,56 @@ use std::path::PathBuf;
 
 use corepc_types::v30::GetBlockHeaderVerbose;
 use corepc_types::v30::GetBlockVerboseOne;
+use corepc_types::v30::GetBlockchainInfo;
 pub use corepc_types::v30::GetNetworkInfo;
 use corepc_types::v31::GetRawTransactionVerbose;
 use serde::Deserialize;
 use serde::Serialize;
+
+/// Return type for `getblockchaininfo`: Bitcoin Core's fields plus Floresta's extensions.
+///
+/// Mirrors the handler's `GetBlockchainInfoRes` in floresta-node, which tests that this type
+/// round-trips what it serves.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct GetBlockchainInfoRes {
+    #[serde(flatten)]
+    pub core: GetBlockchainInfo,
+    /// How many leaves we have in the utreexo accumulator so far
+    pub leaf_count: u64,
+    /// How many roots we have in the utreexo accumulator
+    pub root_count: u32,
+    /// The hex-encoded utreexo accumulator roots
+    pub root_hashes: Vec<String>,
+    /// Height up to which compact block filters have been downloaded.
+    ///
+    /// Absent when the node was started without compact-filter support.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub filters: Option<u32>,
+    /// Resolved absolute height at which compact filter download started for
+    /// the current on-disk store.
+    ///
+    /// Use together with `filters` and `headers` to compute filter sync
+    /// progress: `(filters - filters_start) / (headers - filters_start)`.
+    /// Absent when filters were started from genesis or compact filters are
+    /// disabled.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub filters_start: Option<u32>,
+    /// Whether a wallet rescan is currently running.
+    ///
+    /// Filter download reaching the tip does not mean the wallet is fully
+    /// scanned; while this is `true` the wallet history may still be
+    /// incomplete, so clients should not report "fully synced" yet.
+    #[serde(default)]
+    pub rescan_in_progress: bool,
+    /// Matched blocks processed so far by the in-progress rescan. Absent when no
+    /// rescan is running.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rescan_blocks_processed: Option<u32>,
+    /// Total matched blocks the in-progress rescan has to process. Absent when
+    /// no rescan is running.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rescan_blocks_total: Option<u32>,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 /// Return type for the `gettxoutproof` rpc command, the internal is

@@ -49,8 +49,8 @@ pub struct GetBlockchainInfoRes {
     /// Resolved absolute height at which compact filter download started for
     /// the current on-disk store.
     ///
-    /// Use together with `filters` and `height` to compute filter sync
-    /// progress: `(filters - filters_start) / (height - filters_start)`.
+    /// Use together with `filters` and `headers` to compute filter sync
+    /// progress: `(filters - filters_start) / (headers - filters_start)`.
     /// Absent when filters were started from genesis or compact filters are
     /// disabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -646,3 +646,55 @@ pub enum GetBlockHeaderRes {
 /// by Bitcoin Core.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct GetTxOutProof(pub String);
+
+#[cfg(test)]
+mod tests {
+    use corepc_types::v30::GetBlockchainInfo;
+
+    use super::GetBlockchainInfoRes;
+
+    fn server_response() -> GetBlockchainInfoRes {
+        GetBlockchainInfoRes {
+            core: GetBlockchainInfo {
+                chain: "main".to_string(),
+                blocks: 960_321,
+                headers: 967_710,
+                best_block_hash: "00".repeat(32),
+                bits: "1702349e".to_string(),
+                target: "00".repeat(32),
+                difficulty: 1.0,
+                time: 1,
+                median_time: 1,
+                verification_progress: 0.99,
+                initial_block_download: true,
+                chain_work: "00".repeat(32),
+                size_on_disk: 1,
+                pruned: true,
+                prune_height: Some(960_322),
+                automatic_pruning: Some(true),
+                prune_target_size: Some(0),
+                signet_challenge: None,
+                warnings: vec![],
+            },
+            leaf_count: 3_165_422_362,
+            root_count: 2,
+            root_hashes: vec!["11".repeat(32), "22".repeat(32)],
+            filters: Some(960_000),
+            filters_start: Some(822_375),
+            rescan_in_progress: true,
+            rescan_blocks_processed: Some(3),
+            rescan_blocks_total: Some(7),
+        }
+    }
+
+    /// The client-side mirror in floresta-rpc must decode every field the handler serves.
+    #[test]
+    fn client_type_round_trips_server_response() {
+        let served = serde_json::to_value(server_response()).unwrap();
+
+        let decoded: floresta_rpc::rpc_types::GetBlockchainInfoRes =
+            serde_json::from_value(served.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(decoded).unwrap(), served);
+    }
+}

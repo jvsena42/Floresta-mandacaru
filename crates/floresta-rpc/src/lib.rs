@@ -158,9 +158,11 @@ mod tests {
 
         let gbi = client.get_blockchain_info().expect("rpc not working");
 
-        assert_eq!(gbi.blocks, 0);
-        assert_eq!(gbi.chain, "regtest".to_owned());
-        assert!(gbi.initial_block_download);
+        assert_eq!(gbi.core.blocks, 0);
+        assert_eq!(gbi.core.chain, "regtest".to_owned());
+        assert!(gbi.core.initial_block_download);
+        assert_eq!(gbi.leaf_count, 0);
+        assert!(!gbi.rescan_in_progress);
     }
 
     #[test]
