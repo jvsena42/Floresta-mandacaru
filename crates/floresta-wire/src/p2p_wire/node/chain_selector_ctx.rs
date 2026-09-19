@@ -687,10 +687,6 @@ where
             let validation_index = self.chain.get_validation_index().unwrap();
             // already assumed the chain
             if validation_index >= assume_utreexo.height {
-                let tip_height = self.chain.get_best_block()?.0;
-                if validation_index >= tip_height {
-                    self.chain.update_ibd(IBDState::Done);
-                }
                 return Ok(());
             }
             info!(

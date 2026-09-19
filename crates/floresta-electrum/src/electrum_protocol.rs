@@ -111,12 +111,15 @@ impl<S: AsyncStream> TcpActor<S> {
                             break;
                         }
                         Err(e) => {
-                            // A non-UTF-8 read is almost always a client speaking
-                            // a non-line-protocol (most commonly a TLS handshake
-                            // on the plaintext port). It's a client-side
-                            // misconfiguration, not a server fault, so don't log
-                            // it at ERROR — just drop the connection.
-                            warn!("Dropping client {}: non-text input ({e:?}). If this was a wallet, it likely tried TLS on the plaintext Electrum port — disable TLS for this server.", self.client_id);
+                            if e.kind() == std::io::ErrorKind::InvalidData {
+                                warn!(
+                                    "Error reading from client: {e:?}. Perhaps you are sending \
+                                     TLS traffic on a cleartext stream? Disable TLS in your \
+                                     wallet, or connect to the SSL Electrum port instead."
+                                );
+                            } else {
+                                warn!("Error reading from client: {e:?}");
+                            }
                             self.message_transmitter
                                 .send(Message::Disconnect(self.client_id))
                                 .expect("Main loop is broken");
