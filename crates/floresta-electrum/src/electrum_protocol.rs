@@ -800,7 +800,8 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
         loop {
             for block in filters.get_blocks(ticket).await? {
                 if blocks.send(block).await.is_err() {
-                    // The server is gone.
+                    // The server is gone: free what the manager holds for this rescan.
+                    filters.cancel_rescan(ticket).await;
                     return Ok(());
                 }
             }

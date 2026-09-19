@@ -60,14 +60,8 @@ fuzz_target!(|input: FuzzInput| {
         file.path(),
         usize::from(input.cache_capacity),
     ) {
-        Ok(store) => {
-            assert_eq!(input.file_bytes.len() % record_size, 0);
-            store
-        }
-        Err(FlatFilterStoreError::CorruptedFile) => {
-            assert_ne!(input.file_bytes.len() % record_size, 0);
-            return;
-        }
+        // A partial trailing record is dropped on open rather than rejected.
+        Ok(store) => store,
         Err(_) => return,
     };
 
