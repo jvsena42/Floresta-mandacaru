@@ -461,8 +461,10 @@ where
                         let _ = responder.send(NodeResponse::CFilterHeaders(headers));
                     }
                 } else {
-                    warn!("Peer {peer} sent us cfheaders, but we didn't request it");
-                    self.increase_banscore(peer, 5)?;
+                    // Most likely the tail of a request that timed out: a batch is up to
+                    // a hundred messages, and a slow link delivers some after the deadline.
+                    // Penalizing them bans what may be our only compact-filters peer.
+                    debug!("Peer {peer} sent us a cfheaders we aren't waiting for");
                 }
 
                 Ok(None)
@@ -509,8 +511,10 @@ where
                         }
                     }
                 } else {
-                    warn!("Peer {peer} sent us a cfilter we didn't request");
-                    self.increase_banscore(peer, 5)?;
+                    // Most likely the tail of a request that timed out: a batch is up to
+                    // a hundred messages, and a slow link delivers some after the deadline.
+                    // Penalizing them bans what may be our only compact-filters peer.
+                    debug!("Peer {peer} sent us a cfilter we aren't waiting for");
                 }
 
                 Ok(None)
@@ -532,8 +536,10 @@ where
                         let _ = responder.send(NodeResponse::CFCheckpt(checkpoint));
                     }
                 } else {
-                    warn!("Peer {peer} sent us cfcheckpt, but we didn't request it");
-                    self.increase_banscore(peer, 5)?;
+                    // Most likely the tail of a request that timed out: a batch is up to
+                    // a hundred messages, and a slow link delivers some after the deadline.
+                    // Penalizing them bans what may be our only compact-filters peer.
+                    debug!("Peer {peer} sent us a cfcheckpt we aren't waiting for");
                 }
 
                 Ok(None)
@@ -542,7 +548,27 @@ where
         }
     }
 
+    /// Fails every user request waiting on `peer`, so the caller retries right away instead of
+    /// waiting out the request timeout for a reply that can't come anymore.
+    fn fail_user_requests_of(&mut self, peer: u32) {
+        let orphaned = self
+            .inflight_user_requests
+            .iter()
+            .filter(|(_, (request_peer, _, _))| *request_peer == peer)
+            .map(|(request, _)| request.clone())
+            .collect::<Vec<_>>();
+
+        for request in orphaned {
+            debug!("Peer {peer} left with a pending user request: {request:?}");
+            self.inflight_filter_batches.remove(&request);
+            // Dropping the responder is what reports the failure.
+            self.inflight_user_requests.remove(&request);
+        }
+    }
+
     pub(crate) fn handle_disconnection(&mut self, peer: u32, idx: usize) -> Result<(), WireError> {
+        self.fail_user_requests_of(peer);
+
         if let Some(p) = self.peers.remove(&peer) {
             if p.is_long_lived() && p.state == PeerStatus::Ready {
                 info!("Peer disconnected: {peer}");

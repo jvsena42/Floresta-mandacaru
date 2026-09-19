@@ -59,6 +59,13 @@ where
             return;
         }
 
+        // Requests are tracked by value. Overwriting the entry of an identical one would orphan
+        // its responder and hand its replies to the wrong batch, so fail the newcomer instead.
+        if self.inflight_user_requests.contains_key(&user_req) {
+            debug!("Dropping user request {user_req:?}: an identical one is in flight");
+            return;
+        }
+
         debug!("Performing user request {user_req:?}");
 
         let req = match user_req {
