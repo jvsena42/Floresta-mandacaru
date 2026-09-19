@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use bitcoin::Block;
 use bitcoin::ScriptBuf;
 use bitcoin::Transaction;
 use bitcoin::TxOut;
@@ -22,6 +23,7 @@ use floresta_common::get_hash_from_u8;
 use floresta_common::get_spk_hash;
 use floresta_common::spsc::Channel;
 use floresta_common::try_and_log;
+use floresta_compact_filters::filters_man::FilterManError;
 use floresta_compact_filters::filters_man::FilterManHandle;
 use floresta_compact_filters::filters_man::RescanRequest;
 use floresta_compact_filters::filters_man::RescanStatus;
@@ -38,9 +40,11 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 use tracing::debug;
 use tracing::error;
@@ -56,6 +60,13 @@ use crate::request::Request;
 ///
 /// One day, in seconds
 const REBROADCAST_INTERVAL: u64 = 24 * 3600;
+
+/// Matched blocks a rescan may hold while the server is busy with clients.
+const RESCAN_BLOCK_BUFFER: usize = 16;
+
+/// Delay before retrying a failed rescan, doubled by each consecutive failure.
+const RESCAN_RETRY_BASE_DELAY: Duration = Duration::from_secs(60);
+const RESCAN_RETRY_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
 
 /// Type alias for u32 representing a ClientId
 type ClientId = u32;
@@ -227,6 +238,27 @@ pub struct ElectrumServer<Blockchain: BlockchainInterface> {
     /// sure our transactions don't get stuck in the mempool if they are not getting confirmed for
     /// some reason. We keep track of this time to know when to re-broadcast them.
     last_rebroadcast: Option<Instant>,
+
+    /// The compact-filter rescan for newly learned scripts that is running, if any.
+    active_rescan: Option<ActiveRescan>,
+
+    /// Consecutive failed rescans, which space out the retries.
+    rescan_failures: u32,
+
+    /// When a failed rescan may be tried again.
+    rescan_retry_at: Option<Instant>,
+}
+
+/// A compact-filter rescan running in its own task, collected from the main loop.
+struct ActiveRescan {
+    /// The scripts being scanned, pushed back for a retry if the rescan fails.
+    addresses: Vec<ScriptBuf>,
+
+    /// Matched blocks, in chain order.
+    blocks: mpsc::Receiver<Block>,
+
+    /// Sent once the rescan is over, after its last block.
+    outcome: oneshot::Receiver<Result<(), String>>,
 }
 
 impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blockchain> {
@@ -240,6 +272,9 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
 
         Ok(Self {
             last_rebroadcast: None,
+            active_rescan: None,
+            rescan_failures: 0,
+            rescan_retry_at: None,
             chain,
             address_cache,
             node_interface,
@@ -647,59 +682,130 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             }
 
             // Rescan for scripts learned through the scriptpubkey endpoints.
-            if !self.addresses_to_scan.is_empty() {
-                if self.chain.is_in_ibd() {
-                    continue;
-                }
+            self.drive_rescan();
+        }
+    }
 
-                self.addresses_to_scan.iter().for_each(|address| {
-                    self.address_cache.cache_address(address.clone());
-                });
+    /// Whether the filter-header chain covers the whole chain, so a rescan up to the tip can
+    /// validate every filter it downloads.
+    fn filters_ready(&self, filters: &FilterManHandle) -> bool {
+        let Ok(tip) = self.chain.get_height() else {
+            return false;
+        };
+        filters.get_height().is_some_and(|height| height >= tip)
+    }
 
-                let addresses = std::mem::take(&mut self.addresses_to_scan);
-                info!("Catching up with addresses {addresses:?}");
-                if let Err(error) = self.rescan_for_addresses(&addresses).await {
-                    error!(%error, "Electrum script rescan failed");
-                    if !matches!(error, super::error::Error::CompactFiltersDisabled) {
-                        self.addresses_to_scan.extend(addresses);
-                    }
-                }
+    /// Starts a rescan for newly learned scripts, or moves the running one forward.
+    ///
+    /// A rescan downloads every filter in its range from the network and may run for a long
+    /// time, and the filter manager can take minutes to answer while it synchronizes headers.
+    /// So the rescan runs in its own task and this only collects what it found so far: clients
+    /// keep being served meanwhile.
+    fn drive_rescan(&mut self) {
+        let Some(mut rescan) = self.active_rescan.take() else {
+            self.maybe_start_rescan();
+            return;
+        };
+
+        self.process_rescan_blocks(&mut rescan);
+        let outcome = match rescan.outcome.try_recv() {
+            Err(oneshot::error::TryRecvError::Empty) => {
+                self.active_rescan = Some(rescan);
+                return;
+            }
+            Ok(outcome) => outcome,
+            Err(oneshot::error::TryRecvError::Closed) => Err("rescan task died".to_owned()),
+        };
+        // The outcome is sent after the last block, which may have landed since the drain above.
+        self.process_rescan_blocks(&mut rescan);
+
+        match outcome {
+            Ok(()) => {
+                info!("Electrum script rescan finished");
+                self.rescan_failures = 0;
+            }
+            Err(error) => {
+                // Every attempt downloads the range's filters again, so don't hammer.
+                let delay = RESCAN_RETRY_BASE_DELAY
+                    .saturating_mul(1 << self.rescan_failures.min(16))
+                    .min(RESCAN_RETRY_MAX_DELAY);
+                self.rescan_failures += 1;
+                self.rescan_retry_at = Some(Instant::now() + delay);
+                error!(%error, ?delay, "Electrum script rescan failed; will retry");
+                self.addresses_to_scan.extend(rescan.addresses);
             }
         }
     }
 
-    async fn rescan_for_addresses(
-        &mut self,
-        addresses: &[ScriptBuf],
-    ) -> Result<(), super::error::Error> {
-        let filters = self
-            .filter_handle
-            .clone()
-            .ok_or(super::error::Error::CompactFiltersDisabled)?;
-        let ticket = filters
-            .rescan(RescanRequest::new(addresses.to_vec()))
-            .await
-            .map_err(|error| super::error::Error::CompactFilters(error.to_string()))?;
+    fn process_rescan_blocks(&mut self, rescan: &mut ActiveRescan) {
+        while let Ok(block) = rescan.blocks.try_recv() {
+            // A matched block should always have a height; a miss means it was reorged out
+            // while we scanned. Skip it rather than giving up on the rest of the rescan.
+            match self.chain.get_block_height(&block.block_hash()) {
+                Ok(Some(height)) => self.handle_block(block, height),
+                _ => warn!(
+                    "Rescan matched block {} but it has no height; skipping",
+                    block.block_hash()
+                ),
+            }
+        }
+    }
+
+    fn maybe_start_rescan(&mut self) {
+        if self.addresses_to_scan.is_empty() || self.chain.is_in_ibd() {
+            return;
+        }
+        if self.rescan_retry_at.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
+        let Some(filters) = self.filter_handle.clone() else {
+            error!("Can't rescan for new Electrum scripts: compact filters are disabled");
+            self.addresses_to_scan.clear();
+            return;
+        };
+        if !self.filters_ready(&filters) {
+            return;
+        }
+
+        let addresses = std::mem::take(&mut self.addresses_to_scan);
+        for address in &addresses {
+            self.address_cache.cache_address(address.clone());
+        }
+        info!("Catching up with addresses {addresses:?}");
+
+        let (block_sender, blocks) = mpsc::channel(RESCAN_BLOCK_BUFFER);
+        let (outcome_sender, outcome) = oneshot::channel();
+        let request = RescanRequest::new(addresses.clone());
+        tokio::spawn(async move {
+            let result = Self::run_rescan(filters, request, block_sender).await;
+            let _ = outcome_sender.send(result.map_err(|error| error.to_string()));
+        });
+
+        self.rescan_retry_at = None;
+        self.active_rescan = Some(ActiveRescan {
+            addresses,
+            blocks,
+            outcome,
+        });
+    }
+
+    /// Forwards every block matched by `request` to `blocks`, in order, until the rescan ends.
+    async fn run_rescan(
+        filters: FilterManHandle,
+        request: RescanRequest,
+        blocks: mpsc::Sender<Block>,
+    ) -> Result<(), FilterManError> {
+        let ticket = filters.rescan(request).await?;
 
         loop {
-            let blocks = filters
-                .get_blocks(ticket)
-                .await
-                .map_err(|error| super::error::Error::CompactFilters(error.to_string()))?;
-            for block in blocks {
-                let height = self
-                    .chain
-                    .get_block_height(&block.block_hash())
-                    .map_err(|error| super::error::Error::Blockchain(Box::new(error)))?
-                    .ok_or(super::error::Error::InvalidParams)?;
-                self.handle_block(block, height);
+            for block in filters.get_blocks(ticket).await? {
+                if blocks.send(block).await.is_err() {
+                    // The server is gone.
+                    return Ok(());
+                }
             }
 
-            match filters
-                .get_info(ticket)
-                .await
-                .map_err(|error| super::error::Error::CompactFilters(error.to_string()))?
-            {
+            match filters.get_info(ticket).await? {
                 RescanStatus::Finished => return Ok(()),
                 RescanStatus::Available => continue,
                 RescanStatus::Started | RescanStatus::Waiting => {
