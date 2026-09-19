@@ -551,6 +551,11 @@ where
         }
     }
 
+    /// A filter batch is given up on after this many request timeouts, however steadily its
+    /// peer delivers. Ten batches of a hundred filters queue on one peer at a time, so this
+    /// still leaves a slow but honest link several minutes per batch.
+    const MAX_FILTER_BATCH_TIMEOUTS: u64 = 5;
+
     /// How many served filter batches we remember the sender of.
     const REMEMBERED_FILTER_SERVERS: usize = 64;
 
@@ -584,6 +589,9 @@ where
     /// Fails every user request waiting on `peer`, so the caller retries right away instead of
     /// waiting out the request timeout for a reply that can't come anymore.
     fn fail_user_requests_of(&mut self, peer: u32) {
+        // Whether or not it still owed us something: peers come and go for as long as we run.
+        self.last_filter_progress.remove(&peer);
+
         let orphaned = self
             .inflight_user_requests
             .iter()
@@ -594,7 +602,6 @@ where
         for request in orphaned {
             debug!("Peer {peer} left with a pending user request: {request:?}");
             self.inflight_filter_batches.remove(&request);
-            self.last_filter_progress.remove(&peer);
             // Dropping the responder is what reports the failure.
             self.inflight_user_requests.remove(&request);
         }
@@ -802,7 +809,11 @@ where
                         .map_or(*sent_at, |progress| progress.max(sent_at).to_owned()),
                     _ => *sent_at,
                 };
+                // Progress buys time, but not forever: a peer trickling one filter per window
+                // would otherwise keep every request queued on it alive indefinitely.
+                let age = now.duration_since(*sent_at).as_secs();
                 now.duration_since(last_activity).as_secs() > T::REQUEST_TIMEOUT
+                    || age > Self::MAX_FILTER_BATCH_TIMEOUTS * T::REQUEST_TIMEOUT
             })
             .map(|(request, _)| request.clone())
             .collect::<Vec<_>>();
