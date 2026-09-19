@@ -550,8 +550,22 @@ pub struct FiltersMan<Store, Chain, Node> {
     /// Height at which a peer's message last contradicted the stored headers. See
     /// [`FiltersMan::contradicted_at`].
     suspect_height: Option<u32>,
+    /// The request the current checkpoints came from, to tell the node whose they were.
+    checkpoints_stop_hash: Option<BlockHash>,
     /// When the last synchronization failed, if the last one did.
     last_sync_failure: Option<Instant>,
+    /// Peers' answers that contradicted what we hold, not yet reported to the node.
+    unreported: Vec<Contradicted>,
+}
+
+/// A peer's answer that contradicted the stored headers, identified by its request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Contradicted {
+    /// The `cfheaders` fetched up to this block.
+    Headers(BlockHash),
+
+    /// The `cfcheckpt` fetched through this block.
+    Checkpoints(BlockHash),
 }
 
 impl<Store, Chain, Node> FiltersMan<Store, Chain, Node>
@@ -585,7 +599,9 @@ where
             published_height: Arc::new(AtomicU32::new(published_height)),
             default_rescan_start: None,
             suspect_height: None,
+            checkpoints_stop_hash: None,
             last_sync_failure: None,
+            unreported: Vec::new(),
         }
     }
 
@@ -597,6 +613,20 @@ where
     pub fn with_default_rescan_start(mut self, height: Option<i32>) -> Self {
         self.default_rescan_start = height;
         self
+    }
+
+    /// Tells the node about the answers that contradicted us since the last time.
+    async fn report_contradictions(&mut self) {
+        for contradicted in std::mem::take(&mut self.unreported) {
+            match contradicted {
+                Contradicted::Headers(stop_hash) => {
+                    self.node.report_invalid_cfheaders(stop_hash).await;
+                }
+                Contradicted::Checkpoints(stop_hash) => {
+                    self.node.report_invalid_cfcheckpt(stop_hash).await;
+                }
+            }
+        }
     }
 
     /// Publishes the store height after a step that may have failed halfway, e.g. between a
@@ -636,6 +666,7 @@ where
             warn!(%error, "initial compact-filter synchronization failed; will retry");
         }
         self.republish_height();
+        self.report_contradictions().await;
 
         let mut sync_interval = tokio::time::interval(SYNC_INTERVAL);
         sync_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -656,6 +687,7 @@ where
                             warn!(%error, "failed to build compact filter for connected block");
                         }
                         self.republish_height();
+                        self.report_contradictions().await;
                         self.excuse_rescan_consumers(busy_since);
                     }
                 }
@@ -666,6 +698,7 @@ where
                         warn!(%error, "periodic compact-filter synchronization failed");
                     }
                     self.republish_height();
+                    self.report_contradictions().await;
                     self.excuse_rescan_consumers(busy_since);
                 }
             }
@@ -1327,7 +1360,8 @@ where
                     // Either the checkpoint or the headers below are wrong. The next
                     // synchronization compares fresh checkpoints with what is stored.
                     drop(store);
-                    self.contradicted_at(height)?;
+                    let by = self.checkpoints_stop_hash.map(Contradicted::Checkpoints);
+                    self.contradicted_at(height, by)?;
                     return Err(FilterManError::InvalidHeaders(format!(
                         "locally built filter disagrees with checkpoint at height {height}"
                     )));
@@ -1474,6 +1508,7 @@ where
         }
 
         self.checkpoints = response.filter_headers;
+        self.checkpoints_stop_hash = Some(stop_hash);
         Ok(())
     }
 
@@ -1512,7 +1547,16 @@ where
     /// lying `cfcheckpt` would make us delete and download the whole chain again. The first
     /// strike only forgets the checkpoints, so the next synchronization fetches them again. If
     /// what it gets contradicts the same height, the headers go.
-    fn contradicted_at(&mut self, height: u32) -> Result<(), FilterManError> {
+    ///
+    /// Either way the peer behind `by` gets reported: we can't tell whether it or the peer our
+    /// headers came from is wrong, which is why a report costs a peer half a ban, not a whole
+    /// one. It also keeps a liar from stalling us by contradicting a different height each time.
+    fn contradicted_at(
+        &mut self,
+        height: u32,
+        by: Option<Contradicted>,
+    ) -> Result<(), FilterManError> {
+        self.unreported.extend(by);
         self.checkpoints.clear();
         if self.suspect_height.replace(height) != Some(height) {
             warn!(
@@ -1542,7 +1586,8 @@ where
                 break;
             }
             if self.store.lock()?.get_filter_header(height)? != *checkpoint {
-                self.contradicted_at(height)?;
+                let by = self.checkpoints_stop_hash.map(Contradicted::Checkpoints);
+                self.contradicted_at(height, by)?;
                 return Err(FilterManError::InvalidHeaders(format!(
                     "stored filter header disagrees with checkpoint at height {height}"
                 )));
@@ -1609,7 +1654,7 @@ where
         if response.previous_filter_header != previous_header {
             // Either the peer lies or what we stored is wrong; a fresh start settles it.
             if start > 0 {
-                self.contradicted_at(start)?;
+                self.contradicted_at(start, Some(Contradicted::Headers(stop_hash)))?;
             }
             return Err(FilterManError::InvalidHeaders(format!(
                 "filter headers do not connect at height {start}"
@@ -2740,11 +2785,17 @@ mod tests {
         // First strike: one message isn't worth the whole chain. Only the checkpoints go, so
         // the next synchronization asks for them again.
         manager.checkpoints = lying.clone();
+        manager.checkpoints_stop_hash = Some(mock_block_hash(7));
         assert!(matches!(
             manager.verify_stored_checkpoints(),
             Err(FilterManError::InvalidHeaders(_))
         ));
         assert!(manager.checkpoints.is_empty());
+        // Whoever served those checkpoints gets reported, whichever side turns out to be wrong.
+        assert_eq!(
+            manager.unreported,
+            vec![Contradicted::Checkpoints(mock_block_hash(7))]
+        );
         assert_eq!(
             manager.store.lock().unwrap().get_height().unwrap(),
             Some(CHECKPOINT_INTERVAL + 5)

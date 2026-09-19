@@ -239,7 +239,12 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 .await
                 {
                     error!(?error, "wallet rescan failed");
-                    tracker.fail(format!("{error:?}"));
+                    // The same wording a caller of the RPC would have got.
+                    let rpc_error = error.rpc_error();
+                    tracker.fail(match rpc_error.data.as_ref().and_then(Value::as_str) {
+                        Some(detail) => format!("{}: {detail}", rpc_error.message),
+                        None => rpc_error.message,
+                    });
                 }
                 drop(tracker);
 

@@ -36,6 +36,7 @@ use crate::block_proof::Bitmap;
 use crate::node::running_ctx::RunningNode;
 use crate::node_context::NodeContext;
 use crate::node_context::PeerId;
+use crate::node_handle::FilterDataKind;
 use crate::node_handle::NodeResponse;
 use crate::node_handle::UserRequest;
 use crate::node_interface::PeerInfo;
@@ -459,6 +460,11 @@ where
 
                 if let Some(request) = request {
                     if let Some((_, _, responder)) = self.inflight_user_requests.remove(&request) {
+                        self.remember_filter_server(
+                            FilterDataKind::Headers,
+                            headers.stop_hash,
+                            peer,
+                        );
                         let _ = responder.send(NodeResponse::CFilterHeaders(headers));
                     }
                 } else {
@@ -509,7 +515,7 @@ where
                         if let Some((_, _, responder)) =
                             self.inflight_user_requests.remove(&request)
                         {
-                            self.remember_filter_server(block_hash, peer);
+                            self.remember_filter_server(FilterDataKind::Filters, block_hash, peer);
                             let _ = responder.send(NodeResponse::CFilters(filters));
                         }
                     }
@@ -536,6 +542,11 @@ where
 
                 if let Some(request) = request {
                     if let Some((_, _, responder)) = self.inflight_user_requests.remove(&request) {
+                        self.remember_filter_server(
+                            FilterDataKind::Checkpoints,
+                            checkpoint.stop_hash,
+                            peer,
+                        );
                         let _ = responder.send(NodeResponse::CFCheckpt(checkpoint));
                     }
                 } else {
@@ -559,30 +570,41 @@ where
     /// How many served filter batches we remember the sender of.
     const REMEMBERED_FILTER_SERVERS: usize = 64;
 
-    fn remember_filter_server(&mut self, stop_hash: BlockHash, peer: PeerId) {
+    fn remember_filter_server(&mut self, kind: FilterDataKind, stop_hash: BlockHash, peer: PeerId) {
         if self.recent_filter_servers.len() >= Self::REMEMBERED_FILTER_SERVERS {
             self.recent_filter_servers.pop_front();
         }
-        self.recent_filter_servers.push_back((stop_hash, peer));
+        self.recent_filter_servers
+            .push_back((kind, stop_hash, peer));
     }
 
     /// Penalizes the peer that served the filter batch ending at `stop_hash`, which the
     /// consumer found invalid. Two such batches ban it, so the consumer's retries reach another
     /// peer. It isn't banned outright: the filter-header chain the batch was checked against
     /// came from a peer too, and may be the one that is wrong.
-    pub(crate) fn punish_filter_server(&mut self, stop_hash: BlockHash) -> Result<(), WireError> {
+    ///
+    /// Two consequences worth knowing. Manual peers are exempt from ban scores, so with a
+    /// manual compact-filters peer every retry reaches it again and the consumer ends up
+    /// distrusting its headers instead. And when our headers really are the wrong ones, up to
+    /// two honest peers serve a full ban before the consumer finds out; the ban is what makes
+    /// the retries reach someone else, so a shorter disconnect wouldn't do.
+    pub(crate) fn punish_filter_server(
+        &mut self,
+        kind: FilterDataKind,
+        stop_hash: BlockHash,
+    ) -> Result<(), WireError> {
         let Some(position) = self
             .recent_filter_servers
             .iter()
-            .position(|(hash, _)| *hash == stop_hash)
+            .position(|(served, hash, _)| *served == kind && *hash == stop_hash)
         else {
             return Ok(());
         };
-        let Some((_, peer)) = self.recent_filter_servers.remove(position) else {
+        let Some((_, _, peer)) = self.recent_filter_servers.remove(position) else {
             return Ok(());
         };
 
-        warn!("Peer {peer} served compact filters that failed validation");
+        warn!("Peer {peer} served compact-filter data ({kind:?}) that failed validation");
         self.increase_banscore(peer, self.max_banscore.div_ceil(2))
     }
 
