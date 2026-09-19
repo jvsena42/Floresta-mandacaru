@@ -702,12 +702,19 @@ where
             Some(height) if height >= 0 => height.unsigned_abs(),
             Some(offset) => tip.saturating_sub(offset.unsigned_abs()),
         };
-        // A range that ends before the default start is scanned from genesis: the caller asked
-        // for blocks the default exists to skip, so it doesn't apply.
         let default_start = if default_start <= end {
             default_start
-        } else {
+        } else if request.end_height.is_some() {
+            // The caller named an end before the default start: they asked for blocks the
+            // default exists to skip, so it doesn't apply and the range starts at genesis.
             0
+        } else if request.start_height.is_none() {
+            // Nothing was named and the chain hasn't reached the default start. No block can
+            // hold wallet history yet; scanning from genesis instead would download every
+            // filter there is for nothing.
+            return Ok(self.finished_rescan(tip));
+        } else {
+            default_start
         };
         let start = request.start_height.unwrap_or(default_start);
         if start > end || end > tip {
@@ -759,6 +766,31 @@ where
         });
 
         Ok(ticket)
+    }
+
+    /// Registers a rescan that has nothing to scan, so the consumer sees it finish right away.
+    fn finished_rescan(&mut self, tip: u32) -> RescanTicket {
+        let ticket = RescanTicket(self.next_ticket);
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        let (_, blocks) = mpsc::channel(1);
+        let (outcome_sender, outcome) = oneshot::channel();
+        let _ = outcome_sender.send(Ok(()));
+        self.rescans.insert(
+            ticket,
+            RescanState {
+                blocks,
+                outcome,
+                result: None,
+                last_polled: Instant::now(),
+                page_size: 1,
+                first_status: true,
+                start: tip,
+                end: tip,
+                scanned: Arc::new(AtomicU32::new(1)),
+            },
+        );
+
+        ticket
     }
 
     fn rescan_status(&mut self, ticket: RescanTicket) -> Result<RescanStatus, FilterManError> {
@@ -1879,6 +1911,37 @@ mod tests {
             .unwrap();
         let (_, progress) = drain_rescan(&handle, ticket).await;
         assert_eq!((progress.start_height, progress.end_height), (0, 1));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn default_start_above_the_tip_scans_nothing() {
+        let (_file, store, chain, node, second_block) = setup_two_blocks();
+        let script = second_block.txdata[0].output[0].script_pubkey.clone();
+        let filter_requests = node.filter_requests.clone();
+        // The tip is at height 1.
+        let manager = FiltersMan::new(store, node, chain).with_default_rescan_start(Some(2));
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+
+        // With nothing named, falling back to genesis would download every filter for blocks
+        // that can't hold wallet history.
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script.clone()]))
+            .await
+            .unwrap();
+        let (matched, _) = drain_rescan(&handle, ticket).await;
+        assert!(matched.is_empty());
+        assert_eq!(filter_requests.load(Ordering::Relaxed), 0);
+
+        // An explicit start above the tip stays an invalid range.
+        assert!(matches!(
+            handle
+                .rescan(RescanRequest::new(vec![script]).with_range(Some(2), None))
+                .await,
+            Err(FilterManError::InvalidRescanRange { .. })
+        ));
 
         task.abort();
     }
