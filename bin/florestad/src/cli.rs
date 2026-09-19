@@ -108,6 +108,10 @@ pub struct Cli {
     /// The address where our json-rpc server should listen to, in the format `<address>[:<port>]`
     pub rpc_address: Option<String>,
 
+    #[arg(long, value_name = "HEIGHT")]
+    /// Wallet birthday: compact-filter rescans start at this height unless told otherwise. Negative numbers are relative to the current tip.
+    pub filters_start_height: Option<i32>,
+
     #[arg(long, default_value_t = false)]
     /// Whether assume utreexo should be disabled.
     ///

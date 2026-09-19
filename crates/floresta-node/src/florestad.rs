@@ -143,6 +143,16 @@ pub struct Config {
     /// Every filter header is persisted, while only a bounded number of full filters are cached.
     pub cfilters: bool,
 
+    /// Wallet birthday: the height compact-filter rescans start from when the caller doesn't
+    /// give an explicit one. Filter headers are always synchronized from genesis, but a rescan
+    /// downloads every full filter in its range, so skipping the blocks mined before the wallet
+    /// existed saves most of that bandwidth.
+    ///
+    /// If the value is negative, it's relative to the tip at the time of the rescan. For
+    /// example, if the current tip is at height 1000, and we set this value to -100, rescans
+    /// start from height 900.
+    pub filters_start_height: Option<i32>,
+
     #[cfg(feature = "zmq-server")]
     /// The address to listen to for our ZMQ server
     ///
@@ -228,6 +238,7 @@ impl Config {
             proxy: None,
             network,
             cfilters: false,
+            filters_start_height: None,
             #[cfg(feature = "zmq-server")]
             zmq_address: None,
             connect: Vec::new(),
@@ -303,6 +314,30 @@ impl fmt::Display for DumpError {
 }
 
 impl core::error::Error for DumpError {}
+
+/// Files written by the pre-`FiltersMan` compact-filter store, which persisted
+/// every full filter and grew past 10 GB on mainnet. Nothing reads them anymore.
+const LEGACY_FILTER_STORE_FILES: [&str; 3] =
+    ["cfilters", "cfilters-index", "cfilters-start-height"];
+
+/// Reclaims the disk space held by the legacy full-filter store.
+fn remove_legacy_filter_store(datadir: &Path) {
+    for name in LEGACY_FILTER_STORE_FILES {
+        let path = datadir.join(name);
+        let removed = match fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path),
+            Ok(_) => fs::remove_file(&path),
+            Err(_) => continue,
+        };
+        match removed {
+            Ok(()) => info!("Removed legacy compact-filter store at {}", path.display()),
+            Err(e) => warn!(
+                "Could not remove legacy compact-filter store at {}: {e}",
+                path.display()
+            ),
+        }
+    }
+}
 
 impl Florestad {
     /// Kills a running florestad, this will return as soon as the main node stops.
@@ -438,6 +473,8 @@ impl Florestad {
         // second `start()` call — OnceLock guarantees the first winner sticks.
         let _ = self.blockchain_state.set(blockchain_state.clone());
 
+        remove_legacy_filter_store(datadir);
+
         // If this network already allows pow fraud proofs, we should use it instead of assumeutreexo
         let assume_utreexo = match self.config.assume_utreexo {
             true => Some(ChainParams::get_assume_utreexo(self.config.network)),
@@ -533,7 +570,8 @@ impl Florestad {
             let store = FlatFilterStore::new(&path)
                 .map_err(FlorestadError::CouldNotLoadCompactFiltersStore)?;
             let manager =
-                FiltersMan::new(store, chain_provider.get_handle(), blockchain_state.clone());
+                FiltersMan::new(store, chain_provider.get_handle(), blockchain_state.clone())
+                    .with_default_rescan_start(self.config.filters_start_height);
             blockchain_state.subscribe(manager.block_consumer());
             let handle = manager.get_handle();
             let filter_chain = blockchain_state.clone();
@@ -997,5 +1035,29 @@ impl From<Config> for Florestad {
             #[cfg(feature = "json-rpc")]
             json_rpc: OnceLock::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod legacy_filter_store_tests {
+    use std::fs;
+
+    use super::remove_legacy_filter_store;
+
+    #[test]
+    fn removes_legacy_files_and_keeps_the_header_store() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("cfilters"), b"filters").unwrap();
+        fs::create_dir(dir.path().join("cfilters-index")).unwrap();
+        fs::write(dir.path().join("cfilters-index").join("0"), b"index").unwrap();
+        fs::write(dir.path().join("cfilter_headers.dat"), b"headers").unwrap();
+
+        remove_legacy_filter_store(dir.path());
+        // Idempotent once everything is gone.
+        remove_legacy_filter_store(dir.path());
+
+        assert!(!dir.path().join("cfilters").exists());
+        assert!(!dir.path().join("cfilters-index").exists());
+        assert!(dir.path().join("cfilter_headers.dat").exists());
     }
 }

@@ -155,7 +155,7 @@ impl RescanRequest {
 /// How far a rescan has gone through its height range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RescanProgress {
-    /// First height of the rescan.
+    /// First height of the rescan, after the default start height was applied.
     pub start_height: u32,
 
     /// Last height of the rescan, inclusively.
@@ -495,6 +495,7 @@ pub struct FiltersMan<Store, Chain, Node> {
     next_ticket: u64,
     checkpoints: Vec<FilterHeader>,
     published_height: Arc<AtomicU32>,
+    default_rescan_start: Option<i32>,
     /// When the last synchronization failed, if the last one did.
     last_sync_failure: Option<Instant>,
 }
@@ -528,8 +529,19 @@ where
             next_ticket: 0,
             checkpoints: Vec::new(),
             published_height: Arc::new(AtomicU32::new(published_height)),
+            default_rescan_start: None,
             last_sync_failure: None,
         }
+    }
+
+    /// Sets the height rescans start from when the request doesn't name one, e.g. a wallet
+    /// birthday. A negative value is relative to the tip at the time of the rescan.
+    ///
+    /// A rescan downloads every full filter in its range, so this bounds the bandwidth spent
+    /// on blocks that can't contain wallet history.
+    pub fn with_default_rescan_start(mut self, height: Option<i32>) -> Self {
+        self.default_rescan_start = height;
+        self
     }
 
     fn publish_height(&self) -> Result<(), FilterManError> {
@@ -621,8 +633,20 @@ where
         }
 
         let tip = self.chain.get_height().map_err(FilterManError::chain)?;
-        let start = request.start_height.unwrap_or(0);
         let end = request.end_height.unwrap_or(tip);
+        let default_start = match self.default_rescan_start {
+            None => 0,
+            Some(height) if height >= 0 => height.unsigned_abs(),
+            Some(offset) => tip.saturating_sub(offset.unsigned_abs()),
+        };
+        // A range that ends before the default start is scanned from genesis: the caller asked
+        // for blocks the default exists to skip, so it doesn't apply.
+        let default_start = if default_start <= end {
+            default_start
+        } else {
+            0
+        };
+        let start = request.start_height.unwrap_or(default_start);
         if start > end || end > tip {
             return Err(FilterManError::InvalidRescanRange { start, end, tip });
         }
@@ -1578,6 +1602,92 @@ mod tests {
         Arc::make_mut(&mut node.filters).insert(second_hash, second_filter);
 
         (file, store, chain, node, second_block)
+    }
+
+    async fn drain_rescan(handle: &FilterManHandle, ticket: RescanTicket) -> Vec<Block> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut matched = Vec::new();
+            loop {
+                matched.extend(handle.get_blocks(ticket).await.unwrap());
+                if handle.get_info(ticket).await.unwrap() == RescanStatus::Finished {
+                    break matched;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn default_rescan_start_skips_earlier_blocks() {
+        let (_file, store, chain, node, second_block) = setup_two_blocks();
+        let script = second_block.txdata[0].output[0].script_pubkey.clone();
+        let manager = FiltersMan::new(store, node, chain).with_default_rescan_start(Some(1));
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+
+        // Both blocks pay to `script`, but the one before the default start is never scanned.
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(drain_rescan(&handle, ticket).await, vec![second_block]);
+        assert_eq!(
+            handle.get_progress(ticket).await.unwrap(),
+            RescanProgress {
+                start_height: 1,
+                end_height: 1,
+                scanned: 1,
+            }
+        );
+
+        // An explicit start height wins over the default one.
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script]).with_range(Some(0), None))
+            .await
+            .unwrap();
+        assert_eq!(drain_rescan(&handle, ticket).await.len(), 2);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn negative_default_rescan_start_is_relative_to_the_tip() {
+        let (_file, store, chain, node, second_block) = setup_two_blocks();
+        let script = second_block.txdata[0].output[0].script_pubkey.clone();
+        let manager = FiltersMan::new(store, node, chain).with_default_rescan_start(Some(-1));
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script.clone()]))
+            .await
+            .unwrap();
+        drain_rescan(&handle, ticket).await;
+        let progress = handle.get_progress(ticket).await.unwrap();
+        assert_eq!((progress.start_height, progress.end_height), (0, 1));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn range_ending_before_the_default_start_is_scanned_from_genesis() {
+        let (_file, store, chain, node, second_block) = setup_two_blocks();
+        let script = second_block.txdata[0].output[0].script_pubkey.clone();
+        let manager = FiltersMan::new(store, node, chain).with_default_rescan_start(Some(1));
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script]).with_range(None, Some(0)))
+            .await
+            .unwrap();
+        assert_eq!(drain_rescan(&handle, ticket).await.len(), 1);
+        let progress = handle.get_progress(ticket).await.unwrap();
+        assert_eq!((progress.start_height, progress.end_height), (0, 0));
+
+        task.abort();
     }
 
     #[tokio::test]

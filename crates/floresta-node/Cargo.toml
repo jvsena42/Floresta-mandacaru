@@ -42,6 +42,7 @@ floresta-metrics = { workspace = true, optional = true }
 [dev-dependencies]
 floresta-rpc = { workspace = true }
 pretty_assertions = { version = "=1.4.1" }
+tempfile = { workspace = true }
 
 [target.'cfg(target_env = "gnu")'.dependencies]
 libc = { version = "=0.2.186" }
