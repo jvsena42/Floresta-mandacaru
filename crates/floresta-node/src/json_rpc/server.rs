@@ -6,6 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -41,6 +42,7 @@ use corepc_types::v31::RawTransactionOutput;
 use floresta_chain::ThreadSafeChain;
 use floresta_common::NetworkExt;
 use floresta_compact_filters::filters_man::FilterManHandle;
+use floresta_compact_filters::filters_man::RescanProgress;
 use floresta_compact_filters::filters_man::RescanRequest;
 use floresta_compact_filters::filters_man::RescanStatus;
 use floresta_watch_only::AddressCache;
@@ -154,9 +156,16 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let chain = self.chain.clone();
         let wallet = self.wallet.clone();
         tokio::spawn(async move {
-            let _tracker = tracker;
-            if let Err(error) =
-                Self::rescan_with_block_filters(addresses, chain, wallet, filters, None, None).await
+            if let Err(error) = Self::rescan_with_block_filters(
+                addresses,
+                chain,
+                wallet,
+                filters,
+                None,
+                None,
+                Some(&tracker),
+            )
+            .await
             {
                 error!(?error, "descriptor rescan failed");
             }
@@ -200,12 +209,18 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let chain = self.chain.clone();
         let wallet = self.wallet.clone();
         tokio::spawn(async move {
-            let _tracker = tracker;
             let start = (start_height != 0).then_some(start_height);
             let stop = (stop_height != 0).then_some(stop_height);
-            if let Err(error) =
-                Self::rescan_with_block_filters(addresses, chain, wallet, filters, start, stop)
-                    .await
+            if let Err(error) = Self::rescan_with_block_filters(
+                addresses,
+                chain,
+                wallet,
+                filters,
+                start,
+                stop,
+                Some(&tracker),
+            )
+            .await
             {
                 error!(?error, "blockchain rescan failed");
             }
@@ -528,6 +543,8 @@ async fn cannot_get(_state: State<Arc<RpcImpl<impl RpcChain>>>) -> Json<Value> {
 #[derive(Clone, Default)]
 pub(super) struct RescanState {
     in_progress: Arc<AtomicBool>,
+    blocks_processed: Arc<AtomicU32>,
+    blocks_total: Arc<AtomicU32>,
 }
 
 impl RescanState {
@@ -536,11 +553,19 @@ impl RescanState {
         self.in_progress
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .ok()?;
+        self.blocks_processed.store(0, Ordering::SeqCst);
+        self.blocks_total.store(0, Ordering::SeqCst);
         Some(RescanTracker(self.clone()))
     }
 
-    pub(super) fn in_progress(&self) -> bool {
-        self.in_progress.load(Ordering::SeqCst)
+    /// `(blocks scanned, blocks to scan)` of the running rescan, if any.
+    pub(super) fn progress(&self) -> Option<(u32, u32)> {
+        self.in_progress.load(Ordering::SeqCst).then(|| {
+            (
+                self.blocks_processed.load(Ordering::SeqCst),
+                self.blocks_total.load(Ordering::SeqCst),
+            )
+        })
     }
 }
 
@@ -548,6 +573,16 @@ impl RescanState {
 /// every exit path of the spawned task — normal completion, early return, or
 /// panic — and a future rescan is never permanently blocked.
 pub(super) struct RescanTracker(RescanState);
+
+impl RescanTracker {
+    fn report(&self, progress: &RescanProgress) {
+        let total = progress.end_height - progress.start_height + 1;
+        self.0.blocks_total.store(total, Ordering::SeqCst);
+        self.0
+            .blocks_processed
+            .store(progress.scanned.min(total), Ordering::SeqCst);
+    }
+}
 
 impl Drop for RescanTracker {
     fn drop(&mut self) {
@@ -557,7 +592,8 @@ impl Drop for RescanTracker {
 
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     /// Scans `[start_height, stop_height]` for `addresses` and feeds every
-    /// matched block to the wallet.
+    /// matched block to the wallet. `tracker`, when given, is kept up to date so
+    /// `getblockchaininfo` can report how far the scan has gone.
     pub(super) async fn rescan_with_block_filters(
         addresses: Vec<ScriptBuf>,
         chain: Blockchain,
@@ -565,6 +601,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         filters: FilterManHandle,
         start_height: Option<u32>,
         stop_height: Option<u32>,
+        tracker: Option<&RescanTracker>,
     ) -> Result<()> {
         let request = RescanRequest::new(addresses).with_range(start_height, stop_height);
         let ticket = filters
@@ -595,6 +632,12 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                         "rescan: height lookup failed for block {}: {e:?}; skipping",
                         block.block_hash()
                     ),
+                }
+            }
+
+            if let Some(tracker) = tracker {
+                if let Ok(progress) = filters.get_progress(ticket).await {
+                    tracker.report(&progress);
                 }
             }
 

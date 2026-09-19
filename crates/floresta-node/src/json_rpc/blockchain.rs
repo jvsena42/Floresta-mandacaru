@@ -306,7 +306,16 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let root_count = acc.roots.len() as u32;
         let root_hashes = acc.roots.iter().map(ToString::to_string).collect();
 
-        let rescan_in_progress = self.rescan.in_progress();
+        // An empty header store still means "filters enabled, nothing synced yet".
+        let filters = self
+            .filters
+            .as_ref()
+            .map(|filters| filters.get_height().unwrap_or(0));
+
+        let rescan_progress = self.rescan.progress();
+        let rescan_in_progress = rescan_progress.is_some();
+        let rescan_blocks_processed = rescan_progress.map(|(processed, _)| processed);
+        let rescan_blocks_total = rescan_progress.map(|(_, total)| total);
 
         let core = GetBlockchainInfo {
             chain,
@@ -335,11 +344,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             leaf_count,
             root_count,
             root_hashes,
-            filters: None,
-            filters_start: None,
+            filters,
             rescan_in_progress,
-            rescan_blocks_processed: None,
-            rescan_blocks_total: None,
+            rescan_blocks_processed,
+            rescan_blocks_total,
         })
     }
 
@@ -705,6 +713,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             self.wallet.clone(),
             filters,
             Some(height),
+            None,
             None,
         )
         .await?;

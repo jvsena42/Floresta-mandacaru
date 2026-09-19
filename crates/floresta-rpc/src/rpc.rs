@@ -527,7 +527,6 @@ mod tests {
             root_count: 1,
             root_hashes: vec!["00".repeat(32)],
             filters: Some(1000),
-            filters_start: Some(900),
             rescan_in_progress: true,
             rescan_blocks_processed: Some(1),
             rescan_blocks_total: Some(2),

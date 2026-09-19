@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -77,6 +79,9 @@ fn declares_plausible_element_count(filter: &BlockFilter) -> bool {
 
     elements <= content.len() as u64 * 8 / MIN_BITS_PER_FILTER_ELEMENT
 }
+
+/// Sentinel published through [`FilterManHandle::get_height`] while the store is empty.
+const NO_FILTER_HEADERS: u32 = u32::MAX;
 
 /// Minimal blockchain view required by [`FiltersMan`].
 pub trait FilterChain: Clone + Send + Sync + 'static {
@@ -145,6 +150,19 @@ impl RescanRequest {
         self.max_blocks_per_page = Some(max_blocks_per_page);
         self
     }
+}
+
+/// How far a rescan has gone through its height range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RescanProgress {
+    /// First height of the rescan.
+    pub start_height: u32,
+
+    /// Last height of the rescan, inclusively.
+    pub end_height: u32,
+
+    /// Number of heights whose filter was already checked.
+    pub scanned: u32,
 }
 
 /// Current state of an asynchronous rescan.
@@ -370,6 +388,10 @@ enum ManagerRequest {
         ticket: RescanTicket,
         response: oneshot::Sender<Result<Vec<Block>, FilterManError>>,
     },
+    RescanProgress {
+        ticket: RescanTicket,
+        response: oneshot::Sender<Result<RescanProgress, FilterManError>>,
+    },
     Filter {
         height: u32,
         response: oneshot::Sender<Result<BlockFilter, FilterManError>>,
@@ -382,12 +404,16 @@ struct RescanState {
     failure_message: Option<String>,
     page_size: usize,
     first_status: bool,
+    start: u32,
+    end: u32,
+    scanned: Arc<AtomicU32>,
 }
 
 /// Cloneable interface to a running [`FiltersMan`].
 #[derive(Clone)]
 pub struct FilterManHandle {
     sender: mpsc::Sender<ManagerRequest>,
+    height: Arc<AtomicU32>,
 }
 
 impl FilterManHandle {
@@ -410,6 +436,30 @@ impl FilterManHandle {
         let (response, receiver) = oneshot::channel();
         self.send(ManagerRequest::RescanBlocks { ticket, response }, receiver)
             .await
+    }
+
+    /// Returns how far `ticket` has gone through its height range.
+    pub async fn get_progress(
+        &self,
+        ticket: RescanTicket,
+    ) -> Result<RescanProgress, FilterManError> {
+        let (response, receiver) = oneshot::channel();
+        self.send(
+            ManagerRequest::RescanProgress { ticket, response },
+            receiver,
+        )
+        .await
+    }
+
+    /// Returns the height of the last persisted filter header, if any.
+    ///
+    /// Unlike the other methods this doesn't go through the manager's request queue, so it
+    /// keeps answering while the manager is busy synchronizing headers.
+    pub fn get_height(&self) -> Option<u32> {
+        match self.height.load(Ordering::Relaxed) {
+            NO_FILTER_HEADERS => None,
+            height => Some(height),
+        }
     }
 
     /// Returns a validated filter, fetching and caching it when necessary.
@@ -444,6 +494,7 @@ pub struct FiltersMan<Store, Chain, Node> {
     rescans: HashMap<RescanTicket, RescanState>,
     next_ticket: u64,
     checkpoints: Vec<FilterHeader>,
+    published_height: Arc<AtomicU32>,
     /// When the last synchronization failed, if the last one did.
     last_sync_failure: Option<Instant>,
 }
@@ -459,6 +510,11 @@ where
     pub fn new(store: Store, node: Node, chain: Chain) -> Self {
         let (request_sender, requests) = mpsc::channel(128);
         let (block_sender, connected_blocks) = mpsc::channel(CONNECTED_BLOCK_BUFFER);
+        let published_height = store
+            .get_height()
+            .ok()
+            .flatten()
+            .unwrap_or(NO_FILTER_HEADERS);
 
         Self {
             store: Arc::new(Mutex::new(store)),
@@ -471,14 +527,23 @@ where
             rescans: HashMap::new(),
             next_ticket: 0,
             checkpoints: Vec::new(),
+            published_height: Arc::new(AtomicU32::new(published_height)),
             last_sync_failure: None,
         }
+    }
+
+    fn publish_height(&self) -> Result<(), FilterManError> {
+        let height = self.store.lock()?.get_height()?;
+        self.published_height
+            .store(height.unwrap_or(NO_FILTER_HEADERS), Ordering::Relaxed);
+        Ok(())
     }
 
     /// Returns a cloneable service handle.
     pub fn get_handle(&self) -> FilterManHandle {
         FilterManHandle {
             sender: self.request_sender.clone(),
+            height: self.published_height.clone(),
         }
     }
 
@@ -534,6 +599,9 @@ where
             ManagerRequest::RescanBlocks { ticket, response } => {
                 let _ = response.send(self.rescan_blocks(ticket));
             }
+            ManagerRequest::RescanProgress { ticket, response } => {
+                let _ = response.send(self.rescan_progress(ticket));
+            }
             ManagerRequest::Filter { height, response } => {
                 let result = Self::fetch_filter(
                     self.store.clone(),
@@ -570,6 +638,7 @@ where
         self.next_ticket = self.next_ticket.wrapping_add(1);
         let (sender, blocks) = mpsc::channel(page_size);
         let (failure_sender, failure) = oneshot::channel();
+        let scanned = Arc::new(AtomicU32::new(0));
         self.rescans.insert(
             ticket,
             RescanState {
@@ -578,6 +647,9 @@ where
                 failure_message: None,
                 page_size,
                 first_status: true,
+                start,
+                end,
+                scanned: scanned.clone(),
             },
         );
 
@@ -586,7 +658,7 @@ where
         let chain = self.chain.clone();
         tokio::spawn(async move {
             if let Err(error) =
-                Self::run_rescan(store, node, chain, request, start, end, &sender).await
+                Self::run_rescan(store, node, chain, request, start, end, &sender, &scanned).await
             {
                 let _ = failure_sender.send(error.to_string());
             }
@@ -616,6 +688,19 @@ where
         }
 
         Ok(RescanStatus::Waiting)
+    }
+
+    fn rescan_progress(&mut self, ticket: RescanTicket) -> Result<RescanProgress, FilterManError> {
+        let state = self
+            .rescans
+            .get(&ticket)
+            .ok_or(FilterManError::RescanNotFound(ticket))?;
+
+        Ok(RescanProgress {
+            start_height: state.start,
+            end_height: state.end,
+            scanned: state.scanned.load(Ordering::Relaxed),
+        })
     }
 
     fn rescan_blocks(&mut self, ticket: RescanTicket) -> Result<Vec<Block>, FilterManError> {
@@ -651,6 +736,7 @@ where
         state.failure_message.clone()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_rescan(
         store: Arc<Mutex<Store>>,
         node: Node,
@@ -659,6 +745,7 @@ where
         start: u32,
         end: u32,
         blocks: &mpsc::Sender<Block>,
+        scanned: &AtomicU32,
     ) -> Result<(), FilterManError> {
         let mut batch_start = start;
         let mut matching_blocks = tracing::enabled!(tracing::Level::DEBUG).then(Vec::new);
@@ -724,6 +811,8 @@ where
                     matching_blocks.push(block_hash);
                 }
             }
+
+            scanned.store(batch_end - start + 1, Ordering::Relaxed);
 
             if batch_end == end {
                 if let Some(matching_blocks) = matching_blocks {
@@ -924,6 +1013,10 @@ where
 
         store.put_filter(height, filter)?;
         store.flush()?;
+        self.published_height.store(
+            store.get_height()?.unwrap_or(NO_FILTER_HEADERS),
+            Ordering::Relaxed,
+        );
         Ok(())
     }
 
@@ -981,6 +1074,7 @@ where
                     self.store.lock()?.truncate(Some(height))?;
                     self.checkpoints
                         .truncate((height / CHECKPOINT_INTERVAL) as usize);
+                    self.publish_height()?;
                 }
                 return Ok(());
             }
@@ -988,6 +1082,7 @@ where
             if height == 0 {
                 self.store.lock()?.truncate(None)?;
                 self.checkpoints.clear();
+                self.publish_height()?;
                 return Ok(());
             }
             height -= 1;
@@ -1156,6 +1251,10 @@ where
             store.put_filter_header(block_hash, filter_header)?;
         }
         store.flush()?;
+        self.published_height.store(
+            store.get_height()?.unwrap_or(NO_FILTER_HEADERS),
+            Ordering::Relaxed,
+        );
         Ok(())
     }
 }
@@ -1457,6 +1556,47 @@ mod tests {
 
         assert_eq!(filter_requests.load(Ordering::Relaxed), 1);
         task.abort();
+    }
+
+    /// Extends the single-block [`setup`] chain with a second block paying to the same script.
+    fn setup_two_blocks() -> (NamedTempFile, FlatFilterStore, MockChain, MockNode, Block) {
+        let (file, mut store, mut chain, mut node, block, first_filter) = setup();
+        let mut second_block = block.clone();
+        second_block.header.nonce = second_block.header.nonce.wrapping_add(1);
+        let second_hash = second_block.block_hash();
+        let second_filter = BlockFilter::new_script_filter(&second_block, |outpoint| {
+            Err::<ScriptBuf, _>(bitcoin::bip158::Error::UtxoMissing(*outpoint))
+        })
+        .unwrap();
+        let first_header = first_filter.filter_header(&FilterHeader::all_zeros());
+        store
+            .put_filter_header(second_hash, second_filter.filter_header(&first_header))
+            .unwrap();
+        store.flush().unwrap();
+        Arc::make_mut(&mut chain.hashes).push(second_hash);
+        Arc::make_mut(&mut node.blocks).insert(second_hash, second_block.clone());
+        Arc::make_mut(&mut node.filters).insert(second_hash, second_filter);
+
+        (file, store, chain, node, second_block)
+    }
+
+    #[tokio::test]
+    async fn handle_reports_the_stored_height_without_the_manager_running() {
+        let (_file, store, chain, node, _second_block) = setup_two_blocks();
+        let manager = FiltersMan::new(store, node, chain);
+
+        // `main_loop` was never spawned: the height doesn't go through the request queue.
+        assert_eq!(manager.get_handle().get_height(), Some(1));
+
+        let file = NamedTempFile::new().unwrap();
+        let empty = FlatFilterStore::new(file.path()).unwrap();
+        let (_file, _store, chain, node, _block, _filter) = setup();
+        assert_eq!(
+            FiltersMan::new(empty, node, chain)
+                .get_handle()
+                .get_height(),
+            None
+        );
     }
 
     #[tokio::test]
