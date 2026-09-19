@@ -444,27 +444,96 @@ where
                 self.increase_banscore(peer, 5)?;
                 Ok(None)
             }
-            PeerMessages::CFHeaders(cfheaders) => {
-                let req = self.inflight_user_requests.iter().find_map(|(req, _)| {
-                    if let UserRequest::GetCFilterHeaders { stop_hash, .. } = req {
-                        if *stop_hash == cfheaders.stop_hash {
-                            return Some(req.clone());
+            PeerMessages::CFHeaders(headers) => {
+                let request = self.inflight_user_requests.iter().find_map(
+                    |(request, (request_peer, _, _))| match request {
+                        UserRequest::GetCFilterHeaders { stop_hash, .. }
+                            if *stop_hash == headers.stop_hash && *request_peer == peer =>
+                        {
+                            Some(request.clone())
+                        }
+                        _ => None,
+                    },
+                );
+
+                if let Some(request) = request {
+                    if let Some((_, _, responder)) = self.inflight_user_requests.remove(&request) {
+                        let _ = responder.send(NodeResponse::CFilterHeaders(headers));
+                    }
+                } else {
+                    warn!("Peer {peer} sent us cfheaders, but we didn't request it");
+                    self.increase_banscore(peer, 5)?;
+                }
+
+                Ok(None)
+            }
+            PeerMessages::BlockFilter((block_hash, filter)) => {
+                let request = self.inflight_user_requests.iter().find_map(
+                    |(request, (request_peer, _, _))| match request {
+                        UserRequest::GetCFilters { block_hashes, .. }
+                            if *request_peer == peer
+                                && self
+                                    .inflight_filter_batches
+                                    .get(request)
+                                    .and_then(|filters| block_hashes.get(filters.len()))
+                                    == Some(&block_hash) =>
+                        {
+                            Some(request.clone())
+                        }
+                        _ => None,
+                    },
+                );
+
+                if let Some(request) = request {
+                    let filters = self
+                        .inflight_filter_batches
+                        .get_mut(&request)
+                        .expect("filter batch exists for every in-flight filter request");
+                    filters.push(filter);
+                    let complete = match &request {
+                        UserRequest::GetCFilters { block_hashes, .. } => {
+                            filters.len() == block_hashes.len()
+                        }
+                        _ => unreachable!("matched request is a filter batch"),
+                    };
+
+                    if complete {
+                        let filters = self
+                            .inflight_filter_batches
+                            .remove(&request)
+                            .expect("completed filter batch exists");
+                        if let Some((_, _, responder)) =
+                            self.inflight_user_requests.remove(&request)
+                        {
+                            let _ = responder.send(NodeResponse::CFilters(filters));
                         }
                     }
+                } else {
+                    warn!("Peer {peer} sent us a cfilter we didn't request");
+                    self.increase_banscore(peer, 5)?;
+                }
 
-                    None
-                });
+                Ok(None)
+            }
+            PeerMessages::CFCheckpt(checkpoint) => {
+                let request = self.inflight_user_requests.iter().find_map(
+                    |(request, (request_peer, _, _))| match request {
+                        UserRequest::GetCFCheckpt { stop_hash }
+                            if *stop_hash == checkpoint.stop_hash && *request_peer == peer =>
+                        {
+                            Some(request.clone())
+                        }
+                        _ => None,
+                    },
+                );
 
-                match req {
-                    Some(req) => {
-                        let final_req = self.inflight_user_requests.remove(&req).unwrap();
-                        let _ = final_req.2.send(NodeResponse::CFilterHeaders(cfheaders));
+                if let Some(request) = request {
+                    if let Some((_, _, responder)) = self.inflight_user_requests.remove(&request) {
+                        let _ = responder.send(NodeResponse::CFCheckpt(checkpoint));
                     }
-
-                    None => {
-                        warn!("Peer {peer} sent us cfheaders, but we didn't request it");
-                        self.increase_banscore(peer, 5)?;
-                    }
+                } else {
+                    warn!("Peer {peer} sent us cfcheckpt, but we didn't request it");
+                    self.increase_banscore(peer, 5)?;
                 }
 
                 Ok(None)
@@ -660,6 +729,25 @@ where
             }
         }
 
+        let timed_out_user_requests = self
+            .inflight_user_requests
+            .iter()
+            .filter(|(_, (_, sent_at, _))| {
+                now.duration_since(*sent_at).as_secs() > T::REQUEST_TIMEOUT
+            })
+            .map(|(request, _)| request.clone())
+            .collect::<Vec<_>>();
+
+        for request in timed_out_user_requests {
+            let Some((peer, _, responder)) = self.inflight_user_requests.remove(&request) else {
+                continue;
+            };
+            self.inflight_filter_batches.remove(&request);
+            debug!("User request timed out: {request:?}");
+            try_and_log!(self.increase_banscore(peer, 1));
+            drop(responder);
+        }
+
         Ok(())
     }
 
@@ -754,15 +842,6 @@ where
                     .insert(InflightRequests::UtreexoState(peer), (peer, Instant::now()));
             }
 
-            InflightRequests::GetFilters => {
-                // Do not re-issue here: we don't have access to the current
-                // filter-store height or stop hash from this context, so any
-                // request we build would start from genesis and never complete
-                // against the peer's view. Leaving `inflight` empty lets the
-                // next `download_filters()` tick rebuild the request correctly
-                // from the current filter height.
-            }
-
             InflightRequests::Connect(_) | InflightRequests::GetAddresses => {
                 // We don't need to do anything here
             }
@@ -828,10 +907,39 @@ where
                 inflight.1
             }
 
-            PeerMessages::BlockFilter((_, _)) => {
-                let inflight = self.inflight.get(&InflightRequests::GetFilters)?;
-                inflight.1
-            }
+            PeerMessages::BlockFilter((block_hash, _)) => self
+                .inflight_user_requests
+                .iter()
+                .find_map(|(request, (request_peer, sent_at, _))| match request {
+                    UserRequest::GetCFilters { block_hashes, .. }
+                        if block_hashes.contains(block_hash) && *request_peer == peer =>
+                    {
+                        Some(*sent_at)
+                    }
+                    _ => None,
+                })?,
+
+            PeerMessages::CFHeaders(headers) => self.inflight_user_requests.iter().find_map(
+                |(request, (request_peer, sent_at, _))| match request {
+                    UserRequest::GetCFilterHeaders { stop_hash, .. }
+                        if *stop_hash == headers.stop_hash && *request_peer == peer =>
+                    {
+                        Some(*sent_at)
+                    }
+                    _ => None,
+                },
+            )?,
+
+            PeerMessages::CFCheckpt(checkpoint) => self.inflight_user_requests.iter().find_map(
+                |(request, (request_peer, sent_at, _))| match request {
+                    UserRequest::GetCFCheckpt { stop_hash }
+                        if *stop_hash == checkpoint.stop_hash && *request_peer == peer =>
+                    {
+                        Some(*sent_at)
+                    }
+                    _ => None,
+                },
+            )?,
 
             PeerMessages::UtreexoState(_) => {
                 let inflight = self.inflight.get(&InflightRequests::UtreexoState(peer))?;

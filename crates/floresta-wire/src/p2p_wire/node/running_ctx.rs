@@ -4,13 +4,11 @@
 //! request our user might make and keep our peers alive. This mode requires way less bandwidth and
 //! CPU to run, being bound by the number of blocks found in a given period.
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::time::Duration;
 use std::time::Instant;
 
 use bitcoin::BlockHash;
-use bitcoin::bip158::BlockFilter;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::AddrV2Message;
 use floresta_chain::ThreadSafeChain;
@@ -64,7 +62,6 @@ pub struct RunningNode {
     /// in a timely manner, but keep the ones that notified us of a new blocks the fastest.
     /// We also keep the moment we received the first inv message
     pub(crate) last_invs: HashMap<BlockHash, (Instant, Vec<PeerId>)>,
-    pub(crate) inflight_filters: BTreeMap<u32, BlockFilter>,
 }
 
 impl NodeContext for RunningNode {
@@ -83,7 +80,6 @@ impl Default for RunningNode {
         Self {
             last_address_rearrange: Instant::now(),
             last_invs: HashMap::default(),
-            inflight_filters: BTreeMap::new(),
         }
     }
 }
@@ -170,10 +166,6 @@ where
         }
 
         if !self.has_compact_filters_peer() {
-            if self.block_filters.is_none() {
-                return Ok(());
-            }
-
             // Only churn an existing slot if the address manager actually has a
             // compact-filters candidate to dial. Otherwise we'd disconnect a healthy
             // regular peer and fill the slot with another non-CF peer, making no
@@ -254,7 +246,6 @@ where
             self.config.clone(),
             chain,
             self.mempool.clone(),
-            None,
             self.kill_signal.clone(),
             self.address_man.clone(),
         )
@@ -367,20 +358,6 @@ where
         }
 
         self.last_block_request = self.chain.get_validation_index().unwrap_or(0);
-        if let Some(ref cfilters) = self.block_filters {
-            self.last_filter = self
-                .chain
-                .get_block_hash(cfilters.get_height().unwrap_or(1))
-                .unwrap();
-        }
-
-        self.last_block_request = self.chain.get_validation_index().unwrap_or(0);
-        if let Some(ref cfilters) = self.block_filters {
-            self.last_filter = self
-                .chain
-                .get_block_hash(cfilters.get_height().unwrap_or(1))
-                .unwrap();
-        }
 
         let mut ticker = time::interval(RunningNode::MAINTENANCE_TICK);
         // If we fall behind, don't "catch up" by running maintenance repeatedly
@@ -488,7 +465,6 @@ where
         );
 
         // tries to download filters from the network
-        try_and_log!(self.download_filters());
         try_and_log!(self.ask_missed_block());
 
         // requests that need a utreexo peer
@@ -499,68 +475,6 @@ where
         try_and_log!(self.ask_for_missed_proofs());
 
         LoopControl::Continue
-    }
-
-    fn download_filters(&mut self) -> Result<(), WireError> {
-        if self.inflight.contains_key(&InflightRequests::GetFilters) {
-            return Ok(());
-        }
-
-        if !self.has_compact_filters_peer() {
-            return Ok(());
-        }
-
-        // If a previous batch was aborted (peer disconnected or request timed
-        // out) while some out-of-order filters sat in the buffer, those
-        // entries belong to a height range the next request may not cover or
-        // complete. Drop them so the fresh batch starts from a clean state.
-        if !self.context.inflight_filters.is_empty() {
-            self.context.inflight_filters.clear();
-        }
-
-        let Some(ref filters) = self.block_filters else {
-            return Ok(());
-        };
-
-        let mut height = filters.get_height()?;
-        let best_height = self.chain.get_height()?;
-
-        if height == 0 {
-            let user_height = self.config.filter_start_height.unwrap_or(1);
-
-            height = if user_height < 0 {
-                best_height.saturating_sub(user_height.unsigned_abs())
-            } else {
-                user_height as u32
-            };
-
-            height = height.saturating_sub(1);
-            filters.save_height(height)?;
-        }
-
-        if height >= best_height {
-            return Ok(());
-        }
-
-        info!("Downloading filters from height {}", filters.get_height()?);
-        let stop = if height + 1000 > best_height {
-            best_height
-        } else {
-            height + 1000
-        };
-
-        let stop_hash = self.chain.get_block_hash(stop)?;
-        self.last_filter = stop_hash;
-
-        let peer = self.send_to_fast_peer(
-            NodeRequest::GetFilter((stop_hash, height + 1)),
-            ServiceFlags::COMPACT_FILTERS,
-        )?;
-
-        self.inflight
-            .insert(InflightRequests::GetFilters, (peer, Instant::now()));
-
-        Ok(())
     }
 
     fn ask_missed_block(&mut self) -> Result<(), WireError> {
@@ -835,40 +749,17 @@ where
                         self.handle_disconnection(peer, idx)?;
                     }
 
-                    PeerMessages::BlockFilter((hash, filter)) => {
+                    PeerMessages::Addr(addresses) => {
+                        debug!("Got {} addresses from peer {}", addresses.len(), peer);
+                        let addresses: Vec<_> =
+                            addresses.into_iter().map(|addr| addr.into()).collect();
+
+                        self.address_man.push_addresses(&addresses);
+                    }
+
+                    PeerMessages::BlockFilter((hash, _filter)) => {
                         debug!("Got a block filter for block {hash} from peer {peer}");
-
-                        if let Some(filters) = self.common.block_filters.as_ref() {
-                            let mut current_height = filters.get_height()?;
-                            let Some(this_height) = self.chain.get_block_height(&hash)? else {
-                                warn!("Filter for block {hash} received, but we don't have it");
-                                return Ok(());
-                            };
-
-                            if current_height + 1 != this_height {
-                                self.context.inflight_filters.insert(this_height, filter);
-                                return Ok(());
-                            }
-
-                            filters.push_filter(filter, current_height + 1)?;
-                            current_height += 1;
-
-                            while let Some(filter) =
-                                self.context.inflight_filters.remove(&(current_height))
-                            {
-                                filters.push_filter(filter, current_height)?;
-                                current_height += 1;
-                            }
-
-                            filters.save_height(current_height)?;
-                            let current_hash = self.chain.get_block_hash(current_height)?;
-                            if self.last_filter == current_hash
-                                && self.context.inflight_filters.is_empty()
-                            {
-                                self.inflight.remove(&InflightRequests::GetFilters);
-                                self.download_filters()?;
-                            }
-                        }
+                        // TODO
                     }
 
                     _ => unreachable!(

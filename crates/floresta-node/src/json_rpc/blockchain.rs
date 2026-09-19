@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -307,21 +306,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let root_count = acc.roots.len() as u32;
         let root_hashes = acc.roots.iter().map(ToString::to_string).collect();
 
-        let filters = self
-            .block_filter_storage
-            .as_ref()
-            .and_then(|f| f.get_height().ok());
-        let filters_start = self.block_filter_start;
-
-        let rescan_in_progress = self.rescan_in_progress.load(Ordering::SeqCst);
-        let (rescan_blocks_processed, rescan_blocks_total) = if rescan_in_progress {
-            (
-                Some(self.rescan_blocks_processed.load(Ordering::SeqCst)),
-                Some(self.rescan_blocks_total.load(Ordering::SeqCst)),
-            )
-        } else {
-            (None, None)
-        };
+        let rescan_in_progress = self.rescan.in_progress();
 
         let core = GetBlockchainInfo {
             chain,
@@ -350,11 +335,11 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             leaf_count,
             root_count,
             root_hashes,
-            filters,
-            filters_start,
+            filters: None,
+            filters_start: None,
             rescan_in_progress,
-            rescan_blocks_processed,
-            rescan_blocks_total,
+            rescan_blocks_processed: None,
+            rescan_blocks_total: None,
         })
     }
 
@@ -708,54 +693,26 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         if let Some(txout) = self.wallet.get_utxo(&OutPoint { txid, vout }) {
             return Ok(serde_json::to_value(txout).expect(SERIALIZATION_EXPECT_MSG));
         }
-
-        // if we are on IBD, we don't have any filters to find this txout.
         if self.chain.is_in_ibd() {
             return Err(JsonRpcError::InInitialBlockDownload);
         }
 
-        // can't proceed without block filters
-        let Some(cfilters) = self.block_filter_storage.as_ref() else {
-            return Err(JsonRpcError::NoBlockFilters);
-        };
-
         self.wallet.cache_address(script.clone());
-        let filter_key = script.to_bytes();
-        let candidates = cfilters
-            .match_any(
-                vec![filter_key.as_slice()],
-                Some(height),
-                None,
-                self.chain.clone(),
-            )
-            .map_err(|e| JsonRpcError::Filters(e.to_string()))?;
+        let filters = self.filters.clone().ok_or(JsonRpcError::NoBlockFilters)?;
+        Self::rescan_with_block_filters(
+            vec![script],
+            self.chain.clone(),
+            self.wallet.clone(),
+            filters,
+            Some(height),
+            None,
+        )
+        .await?;
 
-        for candidate in candidates {
-            let candidate = self.node.get_block(candidate).await;
-            let candidate = match candidate {
-                Err(e) => {
-                    return Err(JsonRpcError::Node(e.to_string()));
-                }
-                Ok(None) => {
-                    return Err(JsonRpcError::Node(format!(
-                        "BUG: block {candidate:?} is a match in our filters, but we can't get it?"
-                    )));
-                }
-                Ok(Some(candidate)) => candidate,
-            };
-
-            let Ok(Some(height)) = self.chain.get_block_height(&candidate.block_hash()) else {
-                return Err(JsonRpcError::BlockNotFound);
-            };
-
-            self.wallet.block_process(&candidate, height);
-        }
-
-        let val = match self.get_tx_out(txid, vout, false)? {
-            Some(gettxout) => json!(gettxout),
+        Ok(match self.get_tx_out(txid, vout, false)? {
+            Some(txout) => json!(txout),
             None => json!({}),
-        };
-        Ok(val)
+        })
     }
 
     // getroots
