@@ -589,6 +589,15 @@ where
         self
     }
 
+    /// Publishes the store height after a step that may have failed halfway, e.g. between a
+    /// truncation and the write that follows it. Whatever mutation path ran, and however it
+    /// ended, the published height can't stay ahead of the store.
+    fn republish_height(&self) {
+        if let Err(error) = self.publish_height() {
+            warn!(%error, "could not publish the compact filter header height");
+        }
+    }
+
     fn publish_height(&self) -> Result<(), FilterManError> {
         let height = self.store.lock()?.get_height()?;
         self.published_height
@@ -616,6 +625,7 @@ where
         if let Err(error) = self.sync().await {
             warn!(%error, "initial compact-filter synchronization failed; will retry");
         }
+        self.republish_height();
 
         let mut sync_interval = tokio::time::interval(SYNC_INTERVAL);
         sync_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -634,6 +644,7 @@ where
                         if let Err(error) = self.process_connected_block(connected).await {
                             warn!(%error, "failed to build compact filter for connected block");
                         }
+                        self.republish_height();
                     }
                 }
                 _ = sync_interval.tick() => {
@@ -641,6 +652,7 @@ where
                     if let Err(error) = self.sync().await {
                         warn!(%error, "periodic compact-filter synchronization failed");
                     }
+                    self.republish_height();
                 }
             }
         }
