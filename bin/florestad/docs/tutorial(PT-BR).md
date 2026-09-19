@@ -39,7 +39,7 @@ se tudo estiver ok, irá compilar o programa e salvar o executável em `./target
 
 Antes de rodar ele pela primeira vez, você precisa extrair a xpub da sua carteira. Na Electrum, basta ir no menu "Carteira" e clicar em "Informações", a xpub vai aparecer em uma caixa de texto grande.
 
-Uma vez que você tenha a Chave Pública Extendida em mãos, copie o arquivo de configuração `config.toml.sample` para `config.toml` edite-o inserindo a xpub no campo apropriado. Você pode inserir infinitas xpubs. Também é permitido endereços soltos.
+Uma vez que você tenha a Chave Pública Extendida em mãos, copie o arquivo de configuração `contrib/config.toml.sample` para `config.toml` edite-o inserindo a xpub no campo apropriado. Você pode inserir infinitas xpubs. Também é permitido endereços soltos.
 
 Para endereços multisig, uma carteira como Sparrow é recomendada. Basta copiar o "output descriptor" gerado pela mesma.
 

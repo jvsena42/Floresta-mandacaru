@@ -158,20 +158,9 @@ mod tests {
 
         let gbi = client.get_blockchain_info().expect("rpc not working");
 
-        assert_eq!(gbi.height, 0);
+        assert_eq!(gbi.blocks, 0);
         assert_eq!(gbi.chain, "regtest".to_owned());
-        assert!(gbi.ibd);
-        assert_eq!(gbi.leaf_count, 0);
-        assert_eq!(gbi.root_hashes, Vec::<String>::new());
-    }
-
-    #[test]
-    fn test_get_roots() {
-        let (_proc, client) = start_florestad();
-
-        let gbi = client.get_blockchain_info().expect("rpc not working");
-
-        assert_eq!(gbi.root_hashes, Vec::<String>::new());
+        assert!(gbi.initial_block_download);
     }
 
     #[test]
@@ -275,7 +264,7 @@ mod tests {
         // P2P networking is enabled by default.
         assert!(info.network_active);
 
-        // Floresta has no mempool, so relay-related fields are hardcoded.
+        // Floresta's mempool has no inbound relay or fee policy yet, so relay-related fields are hardcoded.
         assert!(!info.local_relay);
         assert_eq!(info.relay_fee, 0.0);
         assert_eq!(info.incremental_fee, 0.0);
@@ -290,9 +279,9 @@ mod tests {
         let names: Vec<&str> = info.networks.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, vec!["ipv4", "ipv6", "onion", "i2p", "cjdns"]);
 
-        // Only ipv4 and ipv6 are currently SUPPORTED; the rest are limited.
+        // Only ipv4, ipv6 and Onion are currently SUPPORTED; the rest are limited.
         for net in &info.networks {
-            let supported = matches!(net.name.as_str(), "ipv4" | "ipv6");
+            let supported = matches!(net.name.as_str(), "ipv4" | "ipv6" | "onion");
             assert_eq!(net.reachable, supported);
             assert_eq!(net.limited, !supported);
         }

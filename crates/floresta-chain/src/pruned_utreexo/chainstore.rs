@@ -8,6 +8,10 @@
 //! - [DiskBlockHeader]: A block header linked to its validation-state metadata
 //! - [BestChain]: Tracks the current best chain, last valid block, and fork tips
 
+use core::fmt;
+use core::fmt::Display;
+use core::fmt::Formatter;
+
 use bitcoin::BlockHash;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::Decodable;
@@ -72,6 +76,45 @@ pub trait ChainStore {
     /// If you're using a database that already checks for integrity by itself,
     /// this can safely be a no-op.
     fn check_integrity(&self) -> Result<(), Self::Error>;
+
+    /// Returns the total size on disk, in bytes, of the data this store persists.
+    ///
+    /// The returned value is the sum of the sizes of each backing file managed by
+    /// this store. Implementations should not include the size of any enclosing
+    /// directory or unrelated data.
+    fn size_on_disk(&self) -> Result<u64, Self::Error>;
+
+    /// Returns accumulated health warnings about this store (e.g. index full).
+    ///
+    /// Warnings persist for the process lifetime and are never cleared.
+    fn get_warnings(&self) -> Vec<ChainStoreWarning> {
+        vec![]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A health warning raised by a [`ChainStore`], mapping to a message via [`Display`].
+pub enum ChainStoreWarning {
+    /// The header storage is full; new block headers cannot be stored.
+    HeaderStorageFull,
+
+    /// The block index is full; new blocks cannot be indexed.
+    BlockIndexFull,
+}
+
+impl Display for ChainStoreWarning {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HeaderStorageFull => write!(
+                f,
+                "Warning: header storage is full; new blocks cannot be stored."
+            ),
+            Self::BlockIndexFull => write!(
+                f,
+                "Warning: block index is full; new blocks cannot be stored."
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,13 +149,13 @@ impl DiskBlockHeader {
     /// Gets the block height or returns `None` if the block is orphaned or on an invalid chain.
     pub fn height(&self) -> Option<u32> {
         match self {
-            DiskBlockHeader::InFork(_, height) => Some(*height),
-            DiskBlockHeader::FullyValid(_, height) => Some(*height),
-            DiskBlockHeader::HeadersOnly(_, height) => Some(*height),
-            DiskBlockHeader::AssumedValid(_, height) => Some(*height),
+            Self::InFork(_, height) => Some(*height),
+            Self::FullyValid(_, height) => Some(*height),
+            Self::HeadersOnly(_, height) => Some(*height),
+            Self::AssumedValid(_, height) => Some(*height),
             // These two cases don't store the block height
-            DiskBlockHeader::Orphan(_) => None,
-            DiskBlockHeader::InvalidChain(_) => None,
+            Self::Orphan(_) => None,
+            Self::InvalidChain(_) => None,
         }
     }
 
@@ -128,12 +171,12 @@ impl Deref for DiskBlockHeader {
     type Target = BlockHeader;
     fn deref(&self) -> &Self::Target {
         match self {
-            DiskBlockHeader::FullyValid(header, _) => header,
-            DiskBlockHeader::Orphan(header) => header,
-            DiskBlockHeader::HeadersOnly(header, _) => header,
-            DiskBlockHeader::InFork(header, _) => header,
-            DiskBlockHeader::InvalidChain(header) => header,
-            DiskBlockHeader::AssumedValid(header, _) => header,
+            Self::FullyValid(header, _) => header,
+            Self::Orphan(header) => header,
+            Self::HeadersOnly(header, _) => header,
+            Self::InFork(header, _) => header,
+            Self::InvalidChain(header) => header,
+            Self::AssumedValid(header, _) => header,
         }
     }
 }
@@ -179,33 +222,33 @@ impl Encodable for DiskBlockHeader {
     ) -> bitcoin::io::Result<usize> {
         let mut len = 80 + 1; // Header + tag
         match self {
-            DiskBlockHeader::FullyValid(header, height) => {
+            Self::FullyValid(header, height) => {
                 0x00_u8.consensus_encode(writer)?;
                 header.consensus_encode(writer)?;
                 height.consensus_encode(writer)?;
                 len += 4;
             }
-            DiskBlockHeader::Orphan(header) => {
+            Self::Orphan(header) => {
                 0x01_u8.consensus_encode(writer)?;
                 header.consensus_encode(writer)?;
             }
-            DiskBlockHeader::HeadersOnly(header, height) => {
+            Self::HeadersOnly(header, height) => {
                 0x02_u8.consensus_encode(writer)?;
                 header.consensus_encode(writer)?;
                 height.consensus_encode(writer)?;
                 len += 4;
             }
-            DiskBlockHeader::InFork(header, height) => {
+            Self::InFork(header, height) => {
                 0x03_u8.consensus_encode(writer)?;
                 header.consensus_encode(writer)?;
                 height.consensus_encode(writer)?;
                 len += 4;
             }
-            DiskBlockHeader::InvalidChain(header) => {
+            Self::InvalidChain(header) => {
                 0x04_u8.consensus_encode(writer)?;
                 header.consensus_encode(writer)?;
             }
-            DiskBlockHeader::AssumedValid(header, height) => {
+            Self::AssumedValid(header, height) => {
                 0x05_u8.consensus_encode(writer)?;
                 header.consensus_encode(writer)?;
                 height.consensus_encode(writer)?;
@@ -291,7 +334,7 @@ mod tests {
     use bitcoin::consensus::Encodable;
     use bitcoin::hashes::Hash;
     use rand;
-    use rand::Rng;
+    use rand::RngExt;
 
     use super::*;
 

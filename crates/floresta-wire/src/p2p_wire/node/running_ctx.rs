@@ -80,7 +80,7 @@ impl NodeContext for RunningNode {
 
 impl Default for RunningNode {
     fn default() -> Self {
-        RunningNode {
+        Self {
             last_address_rearrange: Instant::now(),
             last_invs: HashMap::default(),
             inflight_filters: BTreeMap::new(),
@@ -129,7 +129,16 @@ where
 
         let sync = sync.run(|_| {}).await;
 
-        Ok(UtreexoNode {
+        // Once we are synced, peer diversity is the priority, as we must be able to discover
+        // newly mined blocks. However, the peer list that we have built during `SyncNode` is
+        // biased towards low-latency peers (often geographically close to our node).
+        //
+        // Here we try disconnecting half of our connected peers to open space for new peers.
+        let peers_to_disconnect = sync.connected_peers() / 2;
+        let protected_services = &[service_flags::UTREEXO.into()];
+        sync.disconnect_random_peers(peers_to_disconnect, protected_services);
+
+        Ok(Self {
             common: sync.common,
             context: self.context,
         })
@@ -294,6 +303,16 @@ where
         Ok(true)
     }
 
+    /// Runs the P2P node through initial synchronization and normal operation.
+    ///
+    /// The node initializes its peers, selects the best header chain, optionally starts historical
+    /// block backfill and catches the validated chain state up to the network tip. It then enters
+    /// the [`RunningNode`] event loop, where it processes peer and user messages and performs
+    /// periodic maintenance until shutdown is requested.
+    ///
+    /// On an orderly shutdown, the node closes its peer connections, persists its state and uses
+    /// `stop_signal` to notify the owner that shutdown is complete. If startup terminates early,
+    /// the sender is dropped and the corresponding receiver is closed.
     pub async fn run(mut self, stop_signal: tokio::sync::oneshot::Sender<()>) {
         try_and_warn!(self.init_peers());
 
@@ -305,7 +324,7 @@ where
 
         try_and_log!(UtreexoNode::<Chain, ChainSelector>::run(&mut ibd).await);
 
-        self = UtreexoNode {
+        self = Self {
             common: ibd.common,
             context: self.context,
         };
@@ -755,6 +774,7 @@ where
                                 .inflight
                                 .contains_key(&InflightRequests::Blocks(block_hash))
                                 || self.blocks.contains_key(&block_hash);
+
                             if already_requested {
                                 continue;
                             }
@@ -771,8 +791,8 @@ where
                                 return Ok(());
                             };
 
-                            let current_height = self.chain.get_best_block()?.0;
-                            if current_height.saturating_sub(MAX_REORG_DEPTH) > previous_height {
+                            let (best_height, _) = self.chain.get_best_block()?;
+                            if best_height.saturating_sub(MAX_REORG_DEPTH) > previous_height {
                                 // peer has a super deep reorg, this could be a disk fill attack
                                 warn!(
                                     "Peer {peer} is trying to reorg a very deep block, might be a disk fill attack. Banning it"
@@ -782,6 +802,14 @@ where
                             }
 
                             self.chain.accept_header(*header)?;
+
+                            // Call it again, since `accept_header` might reorg the chain
+                            let (_, best_hash) = self.chain.get_best_block()?;
+
+                            // this is a fork block, don't request the actual block.
+                            if header.prev_blockhash != best_hash {
+                                continue;
+                            }
 
                             self.send_to_peer(
                                 peer,

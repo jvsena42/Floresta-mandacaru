@@ -17,12 +17,14 @@ keywords = ["bitcoin", "utreexo", "node", "blockchain", "rust"]
 categories = ["cryptography::cryptocurrencies", "command-line-utilities"]
 
 [dependencies]
-anyhow = "1.0"
+# All dependencies MUST be pinned precisely with `X.Y.z`
+anyhow = { version = "=1.0.103" }
 bitcoin = { workspace = true }
 clap = { workspace = true, features = ["help"] }
 serde_json = { workspace = true }
 
 # Local dependencies
+floresta-common = { workspace = true }
 floresta-rpc = { workspace = true, features = ["clap"] }
 
 [lints]

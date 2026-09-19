@@ -7,12 +7,12 @@ license = { text = "MIT" }
 requires-python = ">=3.12"
 dependencies = [
   "jsonrpclib>=0.2.1",
-  "requests>=2.32.3",
-  "black>=26.3.1",
-  "pylint>=3.3.2",
-  "cryptography>=46.0.5",
+  "requests>=2.34.2",
+  "black>=26.5.1",
+  "pylint>=4.0.6",
+  "cryptography>=49.0.0",
   "pyOpenSSL>=25.0.0",
-  "pytest>=9.0.0",
+  "pytest>=9.1.0",
   "pytest-xdist>=3.8.0",
 ]
 
@@ -32,6 +32,7 @@ python_functions = ["test_*"]
 addopts = [
     "-v",
     "-n 4",
+    "--dist=loadscope",
     "--strict-markers",
     "--strict-config",
     "--tb=short",
@@ -45,6 +46,9 @@ markers = [
     "example: marks tests that demonstrate how to use the Floresta test framework",
     "florestad: marks tests specific to the Florestad daemon",
     "rpc: marks tests focused on RPC calls",
+    "p2p: marks tests related to peer-to-peer interactions",
+    "expensive: marks heavy-weight tests that only run when --run-expensive is passed",
+    "electrum: marks tests related to Electrum server interactions",
 ]
 
 minversion = "9.0"

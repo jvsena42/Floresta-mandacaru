@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_FUZZ_VERSION: 0.13.1
+  CARGO_FUZZ_VERSION: 0.13.2
   APT_CONFIG: |
     Dir::Cache "./.apt-cache";
     Dir::Cache::archives "./.apt-cache/archives";
@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -54,7 +54,7 @@ jobs:
       # Restore Rust build cache
       - name: Restore Rust cache
         id: cache-rust
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -72,7 +72,7 @@ jobs:
       # Restore apt packages cache
       - name: Restore apt cache
         id: cache-apt
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ./.apt-cache
@@ -116,7 +116,7 @@ jobs:
       # Save Rust cache if there was no exact match
       - name: Save Rust cache
         if: success() && steps.cache-rust.outputs.cache-hit != 'true'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -130,7 +130,7 @@ jobs:
       # Save apt cache if there was no exact match
       - name: Save apt cache
         if: success() && steps.cache-apt.outputs.cache-hit != 'true'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ./.apt-cache

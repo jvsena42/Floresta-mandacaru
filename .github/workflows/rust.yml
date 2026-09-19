@@ -16,12 +16,12 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
         with:
           tool: cargo-hack
 
@@ -36,7 +36,7 @@ jobs:
           sudo apt-get install -y libboost-all-dev
 
       - name: Spell check
-        uses: crate-ci/typos@5374cbf686e897b15713110e233094e2874de7ef # v1.46.1
+        uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
         with:
           config: ./_typos.toml
 
@@ -60,7 +60,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -70,7 +70,7 @@ jobs:
           rustup default 1.85.0
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2.77.6
+        uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
         with:
           tool: cargo-hack
 
@@ -86,32 +86,22 @@ jobs:
           brew update
           brew install boost
 
-      - name: Install Boost (Windows)
+      - name: Install Boost library
         if: runner.os == 'Windows'
-        shell: bash
         run: |
-          triplet=x64-windows
-          vcpkgRoot="${VCPKG_INSTALLATION_ROOT:-C:/vcpkg}"
+          git clone https://github.com/microsoft/vcpkg.git
+          cd vcpkg
+          .\bootstrap-vcpkg.bat
+          .\vcpkg install boost-multi-index:x64-windows-static boost-headers:x64-windows-static
+          echo "VCPKG_ROOT=$env:GITHUB_WORKSPACE\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "$env:GITHUB_WORKSPACE\vcpkg\installed\x64-windows-static\lib" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-          # Pin vcpkg to the baseline vendored by libbitcoinkernel-sys's Bitcoin Core subtree
-          # (2025.08.27 release; matches bitcoin/vcpkg.json in the crate's vendored source)
-          git -C "$vcpkgRoot" fetch --depth=1 origin 120deac3062162151622ca4860575a33844ba10b
-          git -C "$vcpkgRoot" checkout 120deac3062162151622ca4860575a33844ba10b
-
-          "$vcpkgRoot/bootstrap-vcpkg.bat"
-
-          "$vcpkgRoot/vcpkg.exe" install \
-          boost-system \
-          boost-filesystem \
-          boost-thread \
-          boost-multi-index \
-          --triplet "$triplet" \
-          --clean-after-build \
-          --disable-metrics
-
-          boostRoot="$vcpkgRoot/installed/$triplet"
-
-          echo "BOOST_ROOT=$boostRoot" >> "$GITHUB_ENV"
+      - name: Set environment variables for static linking
+        if: runner.os == 'windows'
+        run: |
+          echo "BOOST_ROOT=$env:GITHUB_WORKSPACE\vcpkg\installed\x64-windows-static" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "BOOST_INCLUDEDIR=$env:GITHUB_WORKSPACE\vcpkg\installed\x64-windows-static\include" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "BOOST_LIBRARYDIR=$env:GITHUB_WORKSPACE\vcpkg\installed\x64-windows-static\lib" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # Bi-weekly numbers to refresh caches every two weeks, ensuring recent project changes are cached
       - name: Set bi-weekly cache key
@@ -126,7 +116,7 @@ jobs:
       # Restore cached dependencies and build artifacts
       - name: Restore Rust cache
         id: cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -152,7 +142,7 @@ jobs:
       # This happens everytime we modify any `cargo.lock` or `cargo.toml`, or each two weeks (caching recent changes)
       - name: Save Rust cache
         if: success() && steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -172,7 +162,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -199,22 +189,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Cache Docker layers
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-docker-${{ hashFiles('Dockerfile') }}
+          key: ${{ runner.os }}-docker-${{ hashFiles('contrib/docker/Dockerfile') }}
 
       - name: Build Docker image
         run: |
           docker buildx build \
           --cache-to=type=local,dest=/tmp/.buildx-cache \
           --cache-from=type=local,src=/tmp/.buildx-cache \
+          -f contrib/docker/Dockerfile \
           -t dlsz/floresta:latest .

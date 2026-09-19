@@ -14,7 +14,6 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use core::ffi::c_uint;
 
 use bitcoin::Block;
 use bitcoin::BlockHash;
@@ -23,6 +22,8 @@ use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::params::Params;
+#[cfg(feature = "bitcoinkernel")]
+use bitcoinkernel::ScriptVerificationFlags;
 use floresta_common::acchashes;
 use floresta_common::bhash;
 use floresta_common::service_flags;
@@ -76,7 +77,7 @@ pub struct ChainParams {
 
     /// A list of exceptions to the rules, where the key is the block hash and the value is the
     /// verification flags
-    pub exceptions: HashMap<BlockHash, c_uint>,
+    pub exceptions: HashMap<BlockHash, u32>,
 
     /// The network this chain params is for
     pub network: Network,
@@ -94,9 +95,6 @@ pub struct ChainParams {
 /// Some seeds allow filtering by service flags, so we may use this to find peers that are
 /// likely to be running Utreexo, for example.
 pub struct DnsSeed {
-    /// The network this peer supports (e.g, mainnet, testnet, etc)
-    pub network: Network,
-
     /// The domain name of the seed
     pub seed: &'static str,
 
@@ -107,12 +105,8 @@ pub struct DnsSeed {
 /// This functionality is used to create a new DNS seed with possible filters.
 impl DnsSeed {
     /// Create a new DNS seed
-    pub fn new(network: Network, seed: &'static str, filters: ServiceFlags) -> Self {
-        DnsSeed {
-            network,
-            seed,
-            filters,
-        }
+    pub fn new(seed: &'static str, filters: ServiceFlags) -> Self {
+        Self { seed, filters }
     }
 }
 
@@ -252,7 +246,7 @@ impl ChainParams {
 
     #[cfg(feature = "bitcoinkernel")]
     /// Returns the validation flags for a given block hash and height
-    pub fn get_validation_flags(&self, height: u32, hash: BlockHash) -> c_uint {
+    pub fn get_validation_flags(&self, height: u32, hash: BlockHash) -> ScriptVerificationFlags {
         if let Some(flag) = self.exceptions.get(&hash) {
             return *flag;
         }
@@ -292,7 +286,7 @@ impl ChainParams {
 /// "looks like segwit but are not segwit". We pretend segwit
 /// was enabled since genesis, and only skip this for blocks
 /// that have such transactions using hardcoded values.
-fn get_exceptions() -> HashMap<BlockHash, c_uint> {
+fn get_exceptions() -> HashMap<BlockHash, ScriptVerificationFlags> {
     use bitcoinkernel::VERIFY_NONE;
     use bitcoinkernel::VERIFY_P2SH;
     use bitcoinkernel::VERIFY_WITNESS;
@@ -314,7 +308,7 @@ fn get_exceptions() -> HashMap<BlockHash, c_uint> {
 }
 
 #[cfg(not(feature = "bitcoinkernel"))]
-fn get_exceptions() -> HashMap<BlockHash, c_uint> {
+fn get_exceptions() -> HashMap<BlockHash, u32> {
     HashMap::new()
 }
 
@@ -330,7 +324,7 @@ impl From<Network> for ChainParams {
         let exceptions = get_exceptions();
 
         match network {
-            Network::Bitcoin => ChainParams {
+            Network::Bitcoin => Self {
                 params: Params::new(network),
                 network,
                 genesis,
@@ -342,7 +336,7 @@ impl From<Network> for ChainParams {
                 exceptions,
                 enforce_bip94: false,
             },
-            Network::Testnet => ChainParams {
+            Network::Testnet => Self {
                 params: Params::new(network),
                 network,
                 genesis,
@@ -354,7 +348,7 @@ impl From<Network> for ChainParams {
                 exceptions,
                 enforce_bip94: false,
             },
-            Network::Testnet4 => ChainParams {
+            Network::Testnet4 => Self {
                 params: Params::new(network),
                 network,
                 genesis,
@@ -366,7 +360,7 @@ impl From<Network> for ChainParams {
                 exceptions,
                 enforce_bip94: true,
             },
-            Network::Signet => ChainParams {
+            Network::Signet => Self {
                 params: Params::new(network),
                 network,
                 genesis,
@@ -378,14 +372,14 @@ impl From<Network> for ChainParams {
                 exceptions,
                 enforce_bip94: false,
             },
-            Network::Regtest => ChainParams {
+            Network::Regtest => Self {
                 params: Params::new(network),
                 network,
                 genesis,
-                pow_target_timespan: 14 * 24 * 60 * 60, // two weeks
+                pow_target_timespan: 24 * 60 * 60, // one day
                 subsidy_halving_interval: SubsidyHalvingInterval::Regtest,
                 coinbase_maturity: 100,
-                csv_activation_height: 0,
+                csv_activation_height: 1,
                 segwit_activation_height: 0,
                 exceptions,
                 enforce_bip94: false,
@@ -411,31 +405,32 @@ pub fn get_chain_dns_seeds(network: Network) -> Vec<DnsSeed> {
     #[rustfmt::skip]
     match network {
         Network::Bitcoin => {
-            seeds.push(DnsSeed::new(Network::Bitcoin, "seed.calvinkim.info", x1009));
-            seeds.push(DnsSeed::new(Network::Bitcoin, "seed.bitcoin.luisschwab.com", x1009));
-            seeds.push(DnsSeed::new(Network::Bitcoin, "seed.bitcoin.sipa.be", x9));
-            seeds.push(DnsSeed::new(Network::Bitcoin, "dnsseed.bluematt.me", x49));
-            seeds.push(DnsSeed::new(Network::Bitcoin, "seed.bitcoinstats.com", x49));
-            seeds.push(DnsSeed::new(Network::Bitcoin, "seed.btc.petertodd.org", x49));
-            seeds.push(DnsSeed::new(Network::Bitcoin, "seed.bitcoin.sprovoost.nl", x49));
-            seeds.push(DnsSeed::new(Network::Bitcoin, "dnsseed.emzy.de", x49));
-            seeds.push(DnsSeed::new(Network::Bitcoin, "seed.bitcoin.wiz.biz", x49));
-            seeds.push(DnsSeed::new(Network::Bitcoin, "bitcoin.seed.dlsouza.lol", x1000));
+            seeds.push(DnsSeed::new("seed.calvinkim.info", x1009));
+            seeds.push(DnsSeed::new("seed.bitcoin.luisschwab.com", x1009));
+            seeds.push(DnsSeed::new("seed.bitcoin.sipa.be", x9));
+            seeds.push(DnsSeed::new("dnsseed.bluematt.me", x49));
+            seeds.push(DnsSeed::new("seed.bitcoinstats.com", x49));
+            seeds.push(DnsSeed::new("seed.btc.petertodd.org", x49));
+            seeds.push(DnsSeed::new("seed.bitcoin.sprovoost.nl", x49));
+            seeds.push(DnsSeed::new("dnsseed.emzy.de", x49));
+            seeds.push(DnsSeed::new("seed.bitcoin.wiz.biz", x49));
+            seeds.push(DnsSeed::new("bitcoin.seed.dlsouza.lol", x1000));
         }
         Network::Signet => {
-            seeds.push(DnsSeed::new(Network::Signet, "signet.seed.dlsouza.lol", x1000));
-            seeds.push(DnsSeed::new(Network::Signet, "seed.signet.bitcoin.sprovoost.nl", x49));
+            seeds.push(DnsSeed::new("signet.seed.dlsouza.lol", x1000));
+            seeds.push(DnsSeed::new("seed.signet.bitcoin.sprovoost.nl", x49));
+            seeds.push(DnsSeed::new("signet.seed.utreexo.net", x1009));
         }
         Network::Testnet => {
-            seeds.push(DnsSeed::new(Network::Testnet, "testnet-seed.bitcoin.jonasschnelli.ch", x49));
-            seeds.push(DnsSeed::new(Network::Testnet, "testnet.seed.dlsouza.lol", x1000));
-            seeds.push(DnsSeed::new(Network::Testnet, "seed.tbtc.petertodd.org", x49));
-            seeds.push(DnsSeed::new(Network::Testnet, "seed.testnet.bitcoin.sprovoost.nl", x49));
-            seeds.push(DnsSeed::new(Network::Testnet, "testnet-seed.bluematt.me", none));
+            seeds.push(DnsSeed::new("testnet-seed.bitcoin.jonasschnelli.ch", x49));
+            seeds.push(DnsSeed::new("testnet.seed.dlsouza.lol", x1000));
+            seeds.push(DnsSeed::new("seed.tbtc.petertodd.org", x49));
+            seeds.push(DnsSeed::new("seed.testnet.bitcoin.sprovoost.nl", x49));
+            seeds.push(DnsSeed::new("testnet-seed.bluematt.me", none));
         }
         Network::Testnet4 => {
-            seeds.push(DnsSeed::new(Network::Testnet4, "seed.testnet4.bitcoin.sprovoost.nl", none));
-            seeds.push(DnsSeed::new(Network::Testnet4, "seed.testnet4.wiz.biz", none));
+            seeds.push(DnsSeed::new("seed.testnet4.bitcoin.sprovoost.nl", none));
+            seeds.push(DnsSeed::new("seed.testnet4.wiz.biz", none));
         }
         Network::Regtest => {}
     };

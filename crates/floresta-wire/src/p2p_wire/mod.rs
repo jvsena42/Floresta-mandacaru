@@ -27,11 +27,11 @@ pub struct UtreexoNodeConfig {
     /// needing to download the whole chain. It will download ~1GB of filters, and then
     /// download the blocks that match the filters.
     pub compact_filters: bool,
-    /// Fixed peers to connect to. Defaults to None.
+    /// Fixed peers to connect to. Defaults to an empty list.
     ///
-    /// If you want to connect to a specific peer, you can set this to a string with the
-    /// format `ip:port`. For example, `localhost:8333`.
-    pub fixed_peer: Option<String>,
+    /// Each entry is `host[:port]`, where `host` is an IPv4 address, a bracketed IPv6 address (`[::1]`), or a hostname;
+    /// `port` is optional and defaults to the network's default port (for example, `"localhost"` or `"127.0.0.1:8333"`).
+    pub fixed_peers: Vec<String>,
     /// Maximum ban score. Defaults to 100.
     ///
     /// If a peer misbehaves, we increase its ban score. If the ban score reaches this value,
@@ -70,12 +70,12 @@ pub struct UtreexoNodeConfig {
 
 impl Default for UtreexoNodeConfig {
     fn default() -> Self {
-        UtreexoNodeConfig {
+        Self {
             disable_dns_seeds: false,
             network: Network::Bitcoin,
             pow_fraud_proofs: false,
             compact_filters: false,
-            fixed_peer: None,
+            fixed_peers: Vec::new(),
             max_banscore: 100,
             datadir: ".floresta-node".into(),
             proxy: None,
@@ -89,13 +89,18 @@ impl Default for UtreexoNodeConfig {
 }
 
 pub mod address_man;
+pub mod bitcoin_socket_addr;
 pub mod block_proof;
 pub mod error;
+pub mod network_message_ext;
 pub mod node;
 pub mod node_context;
+pub mod node_handle;
 pub mod node_interface;
+pub mod onion;
 pub mod peer;
 pub mod socks;
+mod stump_updater;
 #[cfg(test)]
 #[doc(hidden)]
 pub mod tests;

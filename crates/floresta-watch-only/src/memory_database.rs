@@ -46,15 +46,15 @@ type Result<T> = floresta_common::prelude::Result<T, MemoryDatabaseError>;
 impl Display for MemoryDatabaseError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            MemoryDatabaseError::PoisonedLock => write!(f, "Poisoned lock"),
+            Self::PoisonedLock => write!(f, "Poisoned lock"),
         }
     }
 }
 
 impl MemoryDatabase {
     /// Create a new [`MemoryDatabase`].
-    pub fn new() -> MemoryDatabase {
-        MemoryDatabase {
+    pub fn new() -> Self {
+        Self {
             inner: Default::default(),
         }
     }

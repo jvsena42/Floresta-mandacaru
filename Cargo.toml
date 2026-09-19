@@ -12,13 +12,14 @@ members = [
     "crates/floresta-watch-only",
     "crates/floresta-wire",
     "crates/floresta-mempool",
+    "crates/floresta-domain",
+    "crates/floresta-metrics",
 
     # Binaries
     "bin/florestad",
     "bin/floresta-cli",
 
-    # Tests and monitoring
-    "metrics",
+    # Tests
     "fuzz",
 ]
 
@@ -33,6 +34,8 @@ default-members = [
     "crates/floresta-watch-only",
     "crates/floresta-wire",
     "crates/floresta-mempool",
+    "crates/floresta-domain",
+    "crates/floresta-metrics",
     "bin/florestad",
     "bin/floresta-cli",
 ]
@@ -43,36 +46,34 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
-# Version Convention: Use major.minor only (e.g., "1.9" not "1.9.1")
-# We accept all compatible patch versions, so specifying patch level is misleading.
-# For exact versions when needed, use "=1.9.1"
 [workspace.dependencies]
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tracing", "tokio"] }
+# All dependencies MUST be pinned precisely with `X.Y.z`
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tracing", "tokio"] }
 bitcoin = { version = "=0.32.8", default-features = false }
-clap = { version = "4.5", default-features = false, features = ["derive", "std"] }
-corepc-types = "0.11"
-console-subscriber = { version = "0.5", default-features = false }
-dns-lookup = "2.1"
-hex = "0.4"
-kv = "0.24"
-miniscript = { version = "12.3", default-features = false }
-rand = "0.9"
-rcgen = { version = "=0.14.7", default-features = false, features = ["ring", "pem"] }
-rustreexo = "0.5"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha2 = { version = "0.10", default-features = false }
-spin = { version = "0.10", default-features = false, features = ["spin_mutex", "rwlock"] }
-tempfile = "3.23"
-tokio = { version = "1.48", features = ["net", "time", "rt-multi-thread", "signal", "macros"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }
-tracing = { version = "0.1", default-features = false }
-zstd = "0.13"
+bitcoin_hashes = { version = "=1.1.0", default-features = false }
+clap = { version = "=4.6.1", default-features = false, features = ["derive", "std", "error-context"] }
+corepc-types = { version = "=0.15.0" }
+console-subscriber = { version = "=0.5.0", default-features = false }
+dns-lookup = { version = "=2.1.1" }
+hex = { version = "=0.4.3" }
+kv = { version = "=0.24.0" }
+miniscript = { version = "=13.1.0", default-features = false }
+rand = { version = "=0.10.2" }
+rcgen = { version = "=0.14.7", default-features = false, features = ["ring", "pem"] } # note: >0.14.7 requires Rust 1.86.0
+rustreexo = { version = "=0.6.0" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.150" }
+spin = { version = "=0.10.1", default-features = false, features = ["spin_mutex", "rwlock"] }
+tempfile = { version = "=3.27.0" }
+tokio = { version = "=1.52.3", features = ["net", "time", "rt-multi-thread", "signal", "macros"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
+toml = { version = "=1.1.2", default-features = false, features = ["std", "parse", "serde"] }
+tracing = { version = "=0.1.44", default-features = false }
+zstd = { version = "=0.13.3" }
 # Pins for MSRV compatibility:
-time = { version = "=0.3.45" }
-tonic = { version = "=0.14.5" }
-tonic-prost = { version = "=0.14.5" }
+time = { version = "=0.3.45" } # note: >0.3.45 requires Rust 1.88.0
+tonic = { version = "=0.14.5" } # note: >0.14.5 requires Rust 1.88.0
+tonic-prost = { version = "=0.14.5" } # note: >0.14.5 requires Rust 1.88.0
 
 # Local dependencies
 floresta-chain = { path = "crates/floresta-chain" }
@@ -84,10 +85,12 @@ floresta-rpc = { path = "crates/floresta-rpc" }
 floresta-watch-only = { path = "crates/floresta-watch-only" }
 floresta-wire = { path = "crates/floresta-wire" }
 floresta-mempool = { path = "crates/floresta-mempool" }
-metrics = { path = "metrics" }
+floresta-domain = { path = "crates/floresta-domain" }
+floresta-metrics = { path = "crates/floresta-metrics" }
 
 [workspace.lints.clippy]
 unused_async = "deny"
+use_self = "deny"
 
 [profile.release]
 opt-level = 3     # maximum optimization level

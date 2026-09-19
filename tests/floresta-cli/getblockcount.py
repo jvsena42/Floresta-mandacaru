@@ -6,15 +6,13 @@ utreexod. Then, assert that the command returns the same number of
 `blocks` and `height/validated` fields given in `getblockchaininfo`
 of utreexod/bitcoind and floresta, respectively"""
 
-import time
 import pytest
 
 MINE_BLOCKS = 10
-TIMEOUT_SECONDS = 20
 
 
 @pytest.mark.rpc
-def test_get_block_count(florestad_utreexod):
+def test_get_block_count(florestad_utreexod, node_manager):
     """
     Test the `getblockcount` shows the block count changes before and after mining.
     """
@@ -27,16 +25,7 @@ def test_get_block_count(florestad_utreexod):
     assert initial_florestad_count == initial_utreexod_count == 0
 
     # Mine blocks with utreexod
-    utreexod.rpc.generate(MINE_BLOCKS)
-    timeout = time.time() + TIMEOUT_SECONDS
-    while time.time() < timeout:
-        if (
-            florestad.rpc.get_block_count()
-            == utreexod.rpc.get_block_count()
-            == MINE_BLOCKS
-        ):
-            break
-        time.sleep(1)
+    node_manager.generate_blocks_and_sync(MINE_BLOCKS, is_finished_ibd=False)
 
     # Get final block counts
     final_florestad_count = florestad.rpc.get_block_count()

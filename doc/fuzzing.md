@@ -13,8 +13,13 @@ Available fuzz targets:
 - `addrman`
 - `best_chain_decode`
 - `best_chain_roundtrip`
+- `bitcoin_socket_addr`
 - `disk_block_header_decode`
 - `disk_block_header_roundtrip`
-- `local_address_str`
-- `utreexo_proof_des`
 - `flat_chainstore_header_insertion`
+- `local_address_str`
+- `merkle_root`
+- `onion_address_rtt`
+- `onion_address_str_parse`
+- `p2p_v2_message`
+- `utreexo_proof_des`

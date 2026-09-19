@@ -6,6 +6,7 @@ Tests for node information exchanged between Floresta and other peers.
 
 import re
 import pytest
+from test_framework.util import assert_bitcoind_service_fields
 
 
 @pytest.mark.rpc
@@ -16,20 +17,19 @@ def test_node_info(florestad_bitcoind):
     """
     florestad, bitcoind = florestad_bitcoind
 
-    peer_info = bitcoind.rpc.get_peerinfo()
+    peers_seen_by_bitcoind = bitcoind.rpc.get_peerinfo()
 
-    assert len(peer_info) == 1
-    assert peer_info[0]["services"] == "0000000000001808"  # WITNESS | P2P_V2 | UTREEXO
-    assert peer_info[0]["version"] == 70016
-    assert re.match(r"\/Floresta:\d+\.\d+\.\d+.*\/", peer_info[0]["subver"])
-    assert peer_info[0]["inbound"] is True
+    assert len(peers_seen_by_bitcoind) == 1
+    floresta_peer = peers_seen_by_bitcoind[0]
+    assert floresta_peer["services"] == "0000000000001808"  # WITNESS | P2P_V2 | UTREEXO
+    assert floresta_peer["version"] == 70016
+    assert re.match(r"\/Floresta:\d+\.\d+\.\d+.*\/", floresta_peer["subver"])
+    assert floresta_peer["inbound"] is True
 
-    peer_info = florestad.rpc.get_peerinfo()
-    assert peer_info[0]["address"] == bitcoind.p2p_url
-    assert peer_info[0]["kind"] == "manual"
-    assert (
-        peer_info[0]["services"]
-        == "ServiceFlags(NETWORK|WITNESS|NETWORK_LIMITED|P2P_V2)"
-    )
-    assert peer_info[0]["transport_protocol"] == "V2"
-    assert re.match(r"\/Satoshi:\d*\.\d*\.\d*\/", peer_info[0]["user_agent"])
+    peers_seen_by_floresta = florestad.rpc.get_peerinfo()
+    bitcoind_peer = peers_seen_by_floresta[0]
+    assert bitcoind_peer["address"] == bitcoind.p2p_url
+    assert bitcoind_peer["kind"] == "manual"
+    assert_bitcoind_service_fields(bitcoind_peer)
+    assert bitcoind_peer["transport_protocol"] == "V2"
+    assert re.match(r"\/Satoshi:\d*\.\d*\.\d*\/", bitcoind_peer["user_agent"])

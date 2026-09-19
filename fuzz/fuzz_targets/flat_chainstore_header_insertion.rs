@@ -109,7 +109,7 @@ impl<'a> Arbitrary<'a> for FuzzInput {
             operations.push(op);
         }
 
-        Ok(FuzzInput {
+        Ok(Self {
             headers,
             operations,
         })

@@ -6,11 +6,17 @@ use std::hint::black_box;
 use std::io::Cursor;
 
 use bitcoin::Block;
+use bitcoin::BlockHash;
+use bitcoin::CompactTarget;
 use bitcoin::Network;
 use bitcoin::OutPoint;
+use bitcoin::Transaction;
 use bitcoin::block::Header as BlockHeader;
+use bitcoin::block::Version as HeaderVersion;
 use bitcoin::consensus::Decodable;
 use bitcoin::consensus::deserialize;
+use bitcoin::constants::genesis_block;
+use bitcoin::merkle_tree;
 use criterion::BatchSize;
 use criterion::Criterion;
 use criterion::SamplingMode;
@@ -22,8 +28,12 @@ use floresta_chain::FlatChainStore;
 use floresta_chain::FlatChainStoreConfig;
 use floresta_chain::pruned_utreexo::UpdatableChainstate;
 use floresta_chain::pruned_utreexo::consensus::Consensus;
+use floresta_chain::pruned_utreexo::merkle::ConsensusMerkle;
 use floresta_chain::pruned_utreexo::utxo_data::UtxoData;
 use rustreexo::proof::Proof;
+
+const DEFAULT_TEST_CHAINSTORE_SIZE: usize = 32_768;
+const TEST_FORK_FILE_SIZE: usize = 10_000;
 
 /// Reads the first 151 blocks (or 150 blocks on top of genesis) from `regtest_blocks.txt`
 fn read_blocks_txt() -> Vec<Block> {
@@ -64,12 +74,14 @@ fn read_mainnet_headers() -> Vec<BlockHeader> {
 fn setup_test_chain(
     network: Network,
     assume_valid_arg: AssumeValidArg,
+    header_capacity: Option<usize>,
 ) -> ChainState<FlatChainStore> {
     let test_id = rand::random::<u64>();
+    let capacity = header_capacity.unwrap_or(DEFAULT_TEST_CHAINSTORE_SIZE);
     let config = FlatChainStoreConfig {
-        block_index_size: Some(32_768),
-        headers_file_size: Some(32_768),
-        fork_file_size: Some(10_000), // Will be rounded up to 16,384
+        block_index_size: Some(capacity),
+        headers_file_size: Some(capacity),
+        fork_file_size: Some(TEST_FORK_FILE_SIZE), // Will be rounded up to 16,384
         cache_size: Some(10),
         file_permission: Some(0o660),
         path: format!("./tmp-db/{test_id}/").into(),
@@ -104,6 +116,36 @@ fn decode_block_and_inputs(
     (block, inputs)
 }
 
+/// Stores 11 synthetic headers ending at `tip_height` for Median Time Past (MTP).
+/// Returns the most-recent synthetic block hash.
+fn store_mtp_headers(
+    chain: &ChainState<FlatChainStore>,
+    network: Network,
+    tip_height: u32,
+    time: u32,
+) -> BlockHash {
+    assert!(tip_height > 10, "Need at least 11 headers for MTP");
+    let genesis = genesis_block(network);
+    let mut prev_hash = genesis.block_hash();
+    let headers: Vec<_> = ((tip_height - 10)..=tip_height)
+        .map(|height| {
+            let header = BlockHeader {
+                version: HeaderVersion::NO_SOFT_FORK_SIGNALLING,
+                prev_blockhash: prev_hash,
+                merkle_root: genesis.header.merkle_root,
+                time,
+                bits: CompactTarget::from_consensus(0x1702_8c74),
+                nonce: height,
+            };
+            prev_hash = header.block_hash();
+            header
+        })
+        .collect();
+
+    chain.push_headers(headers, tip_height - 10).unwrap();
+    prev_hash
+}
+
 fn initialize_chainstore_benchmark(c: &mut Criterion) {
     c.bench_function("initialize_chainstore", |b| {
         b.iter_batched(
@@ -122,7 +164,7 @@ fn check_merkle_root_benchmark(c: &mut Criterion) {
     let block_bytes = zstd::decode_all(block_file).unwrap();
     let block: Block = deserialize(&block_bytes).unwrap();
 
-    // Both are equivalent: sanity check both before the benchmark
+    // Both implementations agree on this valid block.
     assert!(block.check_merkle_root());
     Consensus::check_merkle_root(&block).unwrap();
 
@@ -133,6 +175,20 @@ fn check_merkle_root_benchmark(c: &mut Criterion) {
     c.bench_function("Consensus::check_merkle_root", |b| {
         b.iter(|| black_box(Consensus::check_merkle_root(&block)))
     });
+
+    // Now benchmark merkle reduction only, given this txid list.
+    let txids: Vec<_> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+
+    c.bench_function("bitcoin::merkle_tree::calculate_root", |b| {
+        b.iter(|| {
+            let hash_iter = black_box(&txids).iter().map(|txid| txid.to_raw_hash());
+            black_box(merkle_tree::calculate_root(hash_iter))
+        })
+    });
+
+    c.bench_function("ConsensusMerkle::calculate_root", |b| {
+        b.iter(|| black_box(ConsensusMerkle::calculate_root(black_box(&txids))))
+    });
 }
 
 fn accept_mainnet_headers_benchmark(c: &mut Criterion) {
@@ -140,7 +196,7 @@ fn accept_mainnet_headers_benchmark(c: &mut Criterion) {
 
     c.bench_function("accept_10k_mainnet_headers", |b| {
         b.iter_batched(
-            || setup_test_chain(Network::Bitcoin, AssumeValidArg::Hardcoded),
+            || setup_test_chain(Network::Bitcoin, AssumeValidArg::Hardcoded, None),
             |chain| {
                 headers
                     .iter()
@@ -156,7 +212,7 @@ fn accept_headers_benchmark(c: &mut Criterion) {
 
     c.bench_function("accept_150_headers", |b| {
         b.iter_batched(
-            || setup_test_chain(Network::Regtest, AssumeValidArg::Disabled),
+            || setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None),
             |chain| {
                 blocks
                     .iter()
@@ -171,7 +227,7 @@ fn connect_blocks_benchmark(c: &mut Criterion) {
     let blocks = read_blocks_txt();
 
     let setup_chain = || {
-        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled);
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
         // We need to accept the headers before connecting blocks
         blocks
             .iter()
@@ -196,22 +252,30 @@ fn connect_blocks_benchmark(c: &mut Criterion) {
 }
 
 fn validate_full_block_benchmark(c: &mut Criterion) {
+    const HEIGHT: u32 = 866342;
+    const BLOCKS: usize = (HEIGHT + 1) as usize;
+
     let block_file = File::open("./testdata/block_866342/raw.zst").unwrap();
     let stxos_file = File::open("./testdata/block_866342/spent_utxos.zst").unwrap();
-    let (block, inputs) = decode_block_and_inputs(block_file, stxos_file);
+    let (mut block, inputs) = decode_block_and_inputs(block_file, stxos_file);
 
-    let chain = setup_test_chain(Network::Bitcoin, AssumeValidArg::Disabled);
+    let chain = setup_test_chain(Network::Bitcoin, AssumeValidArg::Disabled, Some(BLOCKS));
+    let prev_hash = store_mtp_headers(&chain, Network::Bitcoin, HEIGHT - 1, block.header.time);
+    block.header.prev_blockhash = prev_hash;
 
     c.bench_function("validate_block_866342", |b| {
         b.iter_batched(
             || inputs.clone(),
-            |inputs| chain.validate_block_no_acc(&block, 866342, inputs).unwrap(),
+            |inputs| chain.validate_block_no_acc(&block, HEIGHT, inputs).unwrap(),
             BatchSize::LargeInput,
         )
     });
 }
 
 fn validate_many_inputs_block_benchmark(c: &mut Criterion) {
+    const HEIGHT: u32 = 367891;
+    const BLOCKS: usize = (HEIGHT + 1) as usize;
+
     if std::env::var("EXPENSIVE_BENCHES").is_err() {
         println!(
             "validate_many_inputs_block_benchmark ... \x1b[33mskipped\x1b[0m\n\
@@ -225,7 +289,7 @@ fn validate_many_inputs_block_benchmark(c: &mut Criterion) {
     let stxos_file = File::open("./testdata/block_367891/spent_utxos.zst").unwrap();
     let (block, inputs) = decode_block_and_inputs(block_file, stxos_file);
 
-    let chain = setup_test_chain(Network::Bitcoin, AssumeValidArg::Disabled);
+    let chain = setup_test_chain(Network::Bitcoin, AssumeValidArg::Disabled, Some(BLOCKS));
 
     // Create a group with the lowest possible sample size, as validating this block is very slow
     let mut group = c.benchmark_group("validate_block_367891");
@@ -235,7 +299,7 @@ fn validate_many_inputs_block_benchmark(c: &mut Criterion) {
     group.bench_function("validate_block_367891", |b| {
         b.iter_batched(
             || inputs.clone(),
-            |inputs| chain.validate_block_no_acc(&block, 367891, inputs).unwrap(),
+            |inputs| chain.validate_block_no_acc(&block, HEIGHT, inputs).unwrap(),
             BatchSize::LargeInput,
         )
     });
@@ -276,6 +340,23 @@ fn chainstore_checksum_benchmark(c: &mut Criterion) {
     });
 }
 
+fn check_transaction_context_free_benchmark(c: &mut Criterion) {
+    let block_file = File::open("./testdata/block_866342/raw.zst").unwrap();
+    let block_bytes = zstd::decode_all(block_file).unwrap();
+    let block: Block = deserialize(&block_bytes).unwrap();
+
+    // Collect all non-coinbase transactions from the block
+    let transactions: Vec<Transaction> = block.txdata.into_iter().skip(1).collect();
+
+    c.bench_function("check_transaction_context_free_block_866342", |b| {
+        b.iter(|| {
+            for tx in &transactions {
+                black_box(Consensus::check_transaction_context_free(tx)).ok();
+            }
+        })
+    });
+}
+
 criterion_group!(
     benches,
     initialize_chainstore_benchmark,
@@ -285,6 +366,7 @@ criterion_group!(
     connect_blocks_benchmark,
     validate_full_block_benchmark,
     validate_many_inputs_block_benchmark,
-    chainstore_checksum_benchmark
+    chainstore_checksum_benchmark,
+    check_transaction_context_free_benchmark
 );
 criterion_main!(benches);

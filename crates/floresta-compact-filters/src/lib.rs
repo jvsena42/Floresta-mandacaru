@@ -66,10 +66,10 @@ pub enum IterableFilterStoreError {
 impl Display for IterableFilterStoreError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            IterableFilterStoreError::Io(e) => write!(f, "IterableFilterStore I/O Error: {e:?}"),
-            IterableFilterStoreError::Eof => write!(f, "The IterableFilterStore reached EOF"),
-            IterableFilterStoreError::PoisonedLock => write!(f, "The lock is poisoned"),
-            IterableFilterStoreError::OversizedBlockFilter => write!(f, "The filter is too large"),
+            Self::Io(e) => write!(f, "IterableFilterStore I/O Error: {e:?}"),
+            Self::Eof => write!(f, "The IterableFilterStore reached EOF"),
+            Self::PoisonedLock => write!(f, "The lock is poisoned"),
+            Self::OversizedBlockFilter => write!(f, "The filter is too large"),
         }
     }
 }
@@ -78,13 +78,13 @@ impl error::Error for IterableFilterStoreError {}
 
 impl From<io::Error> for IterableFilterStoreError {
     fn from(e: io::Error) -> Self {
-        IterableFilterStoreError::Io(e)
+        Self::Io(e)
     }
 }
 
 impl From<PoisonError<RwLockWriteGuard<'_, FlatFiltersStore>>> for IterableFilterStoreError {
     fn from(_: PoisonError<RwLockWriteGuard<'_, FlatFiltersStore>>) -> Self {
-        IterableFilterStoreError::PoisonedLock
+        Self::PoisonedLock
     }
 }
 

@@ -58,13 +58,6 @@ class DisconnectNodeTest:
 
             assert len(bitcoin_peers) == expected_peer_count
 
-    def floresta_cli_addnode(self):
-        """
-        Call the `addnode` RPC from `florestad`.
-        """
-        self.log.info(f"florestad: addnode {self.bitcoind.p2p_url} add")
-        self.node_manager.connect_nodes(self.florestad, self.bitcoind)
-
     def floresta_cli_disconnectnode(
         self, node_address: str = "", node_id: int | None = None
     ):
@@ -89,8 +82,7 @@ class DisconnectNodeTest:
         Verifies that the RPC fails when called with invalid
         arguments and successfully disconnects from existing peers.
         """
-        self.log.info("===== Adding bitcoind as a peer")
-        self.floresta_cli_addnode()
+        self.log.info("===== Checking bitcoind was added as a peer")
         self.check_peer_connection_state(is_connected=True)
 
         self.log.info("===== Attempting to remove the peer with an invalid node_id")
@@ -137,8 +129,7 @@ class DisconnectNodeTest:
         assert res is None
         self.check_peer_connection_state(is_connected=False)
 
-        # Connect to `bitcoind` again with retry logic.
-        self.floresta_cli_addnode()
+        # Wait for florestad to reconnect to the peer on its own.
         max_retries = 20
         for retry in range(max_retries):
             try:

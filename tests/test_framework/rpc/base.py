@@ -8,18 +8,18 @@ Define a base class for making RPC calls to a
 """
 
 import json
+import re
 import socket
 import time
-import re
+from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
-from abc import ABC, abstractmethod
 
 from requests import post
 from requests.exceptions import HTTPError
 from requests.models import HTTPBasicAuth
-from test_framework.rpc.exceptions import JSONRPCError
 from test_framework.rpc import ConfigRPC
+from test_framework.rpc.exceptions import JSONRPCError
 
 
 # pylint: disable=too-many-public-methods
@@ -39,7 +39,7 @@ class BaseRPC(ABC):
     Subclasses should use `perform_request` to implement RPC calls.
     """
 
-    TIMEOUT: int = 15  # seconds
+    TIMEOUT: int = 30  # seconds
 
     def __init__(self, config: ConfigRPC, log):
         self._config = config
@@ -101,27 +101,69 @@ class BaseRPC(ABC):
 
         return logmsg
 
-    def build_request(self, method: str, params: List[Any]) -> Dict[str, Any]:
+    def _build_request_kwargs(self, timeout: int = None) -> Dict[str, Any]:
         """
-        Build the request dictionary for the RPC call.
+        Build the common HTTP-level request kwargs (url, headers, auth, timeout).
+        Does NOT include the JSON-RPC payload body.
         """
-        request = {
-            "url": f"{self.address}",
+        kwargs = {
+            "url": self.address,
             "headers": {"content-type": "application/json"},
-            "data": json.dumps(
-                {
-                    "jsonrpc": self._jsonrpc_version,
-                    "id": "0",
-                    "method": method,
-                    "params": params,
-                }
-            ),
-            "timeout": self.TIMEOUT,
+            "timeout": timeout if timeout is not None else self.TIMEOUT,
         }
         if self._config.user is not None and self._config.password is not None:
-            request["auth"] = HTTPBasicAuth(self._config.user, self._config.password)
+            kwargs["auth"] = HTTPBasicAuth(self._config.user, self._config.password)
+        return kwargs
 
+    def build_request(
+        self, method: str, params: List[Any] = None, request_id: str = "test"
+    ) -> Dict[str, Any]:
+        """
+        Build the full request dictionary for a JSON-RPC call.
+        """
+        request = self._build_request_kwargs()
+        payload = {
+            "jsonrpc": self._jsonrpc_version,
+            "id": request_id,
+            "method": method,
+        }
+        if params is not None:
+            payload["params"] = params
+        request["data"] = json.dumps(payload)
         return request
+
+    def _send_request(self, request_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute an HTTP POST and return a normalized response dict:
+        {"status_code": int, "body": <parsed JSON>}.
+        """
+        response = post(**request_kwargs)
+        return {"status_code": response.status_code, "body": response.json()}
+
+    def noraise_request(
+        self, method: str, params: List[Any] = None, request_id: str = "test"
+    ) -> Dict[str, Any]:
+        """Send a standard JSON-RPC request and return the parsed response (no raise)."""
+        request = self.build_request(method, params, request_id)
+        return self._send_request(request)
+
+    def noraise_raw_request(
+        self,
+        data: Any,
+        content_type: str = "application/json",
+    ) -> Dict[str, Any]:
+        """
+        Send raw data or a dict as a JSON-RPC request body and return the raw
+        parsed response WITHOUT raising.
+        """
+        request_kwargs = self._build_request_kwargs()
+        request_kwargs["headers"]["content-type"] = content_type
+
+        if isinstance(data, dict):
+            data = json.dumps(data)
+
+        request_kwargs["data"] = data
+        return self._send_request(request_kwargs)
 
     # pylint: disable=unused-argument,dangerous-default-value
     def perform_request(
@@ -138,21 +180,20 @@ class BaseRPC(ABC):
         The method will return the result of the request or raise
         a JSONRPCError if the request failed.
         """
-        request = self.build_request(method, params)
-
-        # Now make the POST request to the RPC server
         logmsg = BaseRPC.build_log_message(
-            request["url"], method, params, self._config.user, self._config.password
+            self.address, method, params, self._config.user, self._config.password
         )
-
         self.log.debug(self.log_msg(logmsg))
-        response = post(**request)
 
-        # If response isnt 200, raise an HTTPError
-        if response.status_code != 200:
+        resp = self.noraise_request(method, params)
+
+        if resp["status_code"] != 200:
+            self.log.error(
+                f"RPC request failed with status code {resp['status_code']}: {resp['body']}"
+            )
             raise HTTPError
 
-        result = response.json()
+        result = resp["body"]
         # Error could be None or a str
         # If in the future this change,
         # cast the resulted error to str
@@ -343,13 +384,23 @@ class BaseRPC(ABC):
         """
         return self.perform_request("gettxout", params=[txid, vout, include_mempool])
 
+    def get_txout_proof(self, txids: list, blockhash: str = None) -> str:
+        """
+        Get a hex-encoded Merkle proof that one or more transactions
+        were included in a block.
+        """
+        params = [txids]
+        if blockhash is not None:
+            params.append(blockhash)
+        return self.perform_request("gettxoutproof", params=params)
+
     def ping(self):
         """
         Tells our node to send a ping to all its peers
         """
         return self.perform_request("ping")
 
-    def disconnectnode(self, node_address: str, node_id: Optional[int] = None):
+    def disconnectnode(self, node_address: str = "", node_id: Optional[int] = None):
         """
         Disconnect from a peer by `node_address` or `node_id`
         """
@@ -365,3 +416,98 @@ class BaseRPC(ABC):
         List all loaded descriptors
         """
         return self.perform_request("listdescriptors")
+
+    def get_addrman_info(self) -> dict:
+        """
+        Get address manager statistics broken down by network
+        """
+        return self.perform_request("getaddrmaninfo")
+
+    def get_raw_transaction(self, txid: str, verbose: int | None = None):
+        """
+        Returns the raw transaction data for a given transaction ID.
+        """
+        params = [txid]
+        if verbose is not None:
+            params.append(int(verbose))
+
+        return self.perform_request("getrawtransaction", params=params)
+
+    def ensure_rpc_raw_request_call_success(
+        self, payload, content_type="application/json"
+    ):
+        """Assert that a raw JSON-RPC request indicates success (HTTP 200, no error)."""
+        resp = self.noraise_raw_request(payload, content_type)
+        self.assert_rpc_success(resp)
+
+        return resp
+
+    def ensure_rpc_call_success(self, method, params=None, request_id="test"):
+        """Assert that a JSON-RPC response indicates success (HTTP 200, no error)."""
+        resp = self.noraise_request(method, params, request_id)
+        self.assert_rpc_success(resp)
+
+        return resp
+
+    def assert_rpc_success(self, resp):
+        """Assert that a JSON-RPC response indicates success (HTTP 200, no error)."""
+        assert resp["status_code"] == 200
+        assert resp["body"].get("error") is None
+
+    # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def ensure_rpc_raw_request_call_error(
+        self,
+        payload,
+        expected_status_code=None,
+        expected_rpcerror_code=None,
+        expected_message=None,
+        content_type="application/json",
+    ):
+        """Assert that a raw JSON-RPC request indicates an error (non-200, error present)."""
+        resp = self.noraise_raw_request(payload, content_type)
+        self.assert_rpc_error(
+            resp, expected_status_code, expected_rpcerror_code, expected_message
+        )
+
+        return resp
+
+    # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def ensure_rpc_call_error(
+        self,
+        method,
+        params=None,
+        request_id="test",
+        expected_status_code=None,
+        expected_rpcerror_code=None,
+        expected_message=None,
+    ):
+        """Assert that a JSON-RPC response indicates an error (non-200, error present)."""
+        resp = self.noraise_request(method, params, request_id)
+        self.assert_rpc_error(
+            resp, expected_status_code, expected_rpcerror_code, expected_message
+        )
+
+        return resp
+
+    def assert_rpc_error(
+        self,
+        resp,
+        expected_status_code=None,
+        expected_rpcerror_code=None,
+        expected_message=None,
+    ):
+        """
+        Assert that a JSON-RPC response indicates an error (non-200, error present).
+        """
+        assert resp["body"].get("error") is not None
+
+        if expected_status_code is None:
+            assert resp["status_code"] != 200
+        else:
+            assert resp["status_code"] == expected_status_code
+
+        if expected_rpcerror_code is not None:
+            assert resp["body"]["error"]["code"] == expected_rpcerror_code
+
+        if expected_message is not None:
+            assert resp["body"]["error"]["message"] == expected_message

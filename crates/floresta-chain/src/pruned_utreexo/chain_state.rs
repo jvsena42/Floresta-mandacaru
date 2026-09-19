@@ -42,7 +42,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256;
 use floresta_common::Channel;
 #[cfg(feature = "metrics")]
-use metrics;
+use floresta_metrics as metrics;
 use rustreexo::node_hash::BitcoinNodeHash;
 use rustreexo::proof::Proof;
 use rustreexo::stump::Stump;
@@ -56,6 +56,7 @@ use super::UpdatableChainstate;
 use super::chain_state_builder::BlockchainBuilderError;
 use super::chain_state_builder::ChainStateBuilder;
 use super::chainparams::ChainParams;
+use super::chainstore::ChainStoreWarning;
 use super::chainstore::DiskBlockHeader;
 use super::consensus::Consensus;
 use super::error::BlockValidationErrors;
@@ -64,8 +65,10 @@ use super::partial_chain::PartialChainState;
 use super::partial_chain::PartialChainStateInner;
 use crate::BestChain;
 use crate::ChainStore;
+use crate::extensions::HeaderExt;
 use crate::extensions::WorkExt;
 use crate::prelude::*;
+use crate::pruned_utreexo::IBDState;
 use crate::pruned_utreexo::utxo_data::UtxoData;
 use crate::read_lock;
 use crate::write_lock;
@@ -132,8 +135,8 @@ pub struct ChainStateInner<PersistedState: ChainStore> {
     subscribers: Vec<Arc<dyn BlockConsumer>>,
     /// Fee estimation for 1, 10 and 20 blocks
     fee_estimation: (f64, f64, f64),
-    /// Are we in Initial Block Download?
-    ibd: bool,
+    /// What is our current IBD state?
+    ibd: IBDState,
     /// Parameters for the chain and functions that verify the chain.
     consensus: Consensus,
     /// Assume valid is a Core-specific config that tells the node to not validate signatures
@@ -425,17 +428,20 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         ))
     }
 
-    /// Changes the acc we are using to validate blocks.
-    fn reorg_acc(&self, fork_point: &BlockHeader) -> Result<(), BlockchainError> {
+    /// Returns the acc we must validate from after reorging, given the new `validation_index`.
+    fn reorg_acc(&self, validation_index: BlockHash) -> Result<Stump, BlockchainError> {
         let height = self
-            .get_block_height(&fork_point.block_hash())?
+            .get_block_height(&validation_index)?
             .ok_or(BlockchainError::BlockNotPresent)?;
 
-        let acc = self.get_roots_for_block(height)?.unwrap_or_default();
-        let mut inner = write_lock!(self);
-        inner.acc = acc;
+        // Genesis is the only block we take as valid without ever validating it, so it's the only
+        // one that legitimately has no roots saved. Its accumulator is the empty one.
+        if height == 0 {
+            return Ok(Stump::new());
+        }
 
-        Ok(())
+        self.get_roots_for_block(height)?
+            .ok_or(BlockchainError::BadValidationIndex)
     }
 
     // This method should only be called after we validate the new branch
@@ -443,24 +449,31 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         let current_best_block = self.get_block_header(&self.get_best_block()?.1)?;
         let fork_point = self.find_fork_point(&new_tip)?;
 
+        let validation_index = self.get_last_valid_block(&new_tip)?;
+        let depth = self.get_chain_depth(&new_tip)?;
+        let acc = self.reorg_acc(validation_index)?;
+
         self.mark_chain_as_inactive(&current_best_block, fork_point.block_hash())?;
         self.mark_chain_as_active(&new_tip, fork_point.block_hash())?;
 
-        let validation_index = self.get_last_valid_block(&new_tip)?;
-        let depth = self.get_chain_depth(&new_tip)?;
-
-        self.change_active_chain(&new_tip, validation_index, depth);
-        self.reorg_acc(&fork_point)?;
+        self.change_active_chain(&new_tip, validation_index, depth, acc);
 
         Ok(())
     }
 
     /// Changes the active chain to the new branch during a reorg
-    fn change_active_chain(&self, new_tip: &BlockHeader, last_valid: BlockHash, depth: u32) {
+    fn change_active_chain(
+        &self,
+        new_tip: &BlockHeader,
+        last_valid: BlockHash,
+        depth: u32,
+        acc: Stump,
+    ) {
         let mut inner = self.inner.write();
         inner.best_block.best_block = new_tip.block_hash();
         inner.best_block.validation_index = last_valid;
         inner.best_block.depth = depth;
+        inner.acc = acc;
     }
 
     /// Grabs the last block we validated in this branch. We don't validate a fork, unless it
@@ -564,6 +577,20 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             .ok_or(BlockchainError::BlockNotPresent)
     }
 
+    /// Returns the Median Time Past (MTP) of `header`, following its `prev_blockhash` chain.
+    fn median_time_past(&self, header: BlockHeader) -> Result<u32, BlockchainError> {
+        header.median_time_past_with(|current_header| {
+            self.get_disk_block_header(&current_header.prev_blockhash)
+                .map(|header| *header)
+        })
+    }
+
+    /// Returns the Median Time Past (MTP) of `header`'s parent, resolved by `prev_blockhash`.
+    fn previous_median_time_past(&self, header: &BlockHeader) -> Result<u32, BlockchainError> {
+        let previous_header = *self.get_disk_block_header(&header.prev_blockhash)?;
+        self.median_time_past(previous_header)
+    }
+
     fn notify(&self, block: &Block, height: u32, inputs: Option<&HashMap<OutPoint, UtxoData>>) {
         let inner = self.inner.read();
         for client in &inner.subscribers {
@@ -575,11 +602,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         }
     }
 
-    fn new(
-        mut chainstore: PersistedState,
-        network: Network,
-        assume_valid: AssumeValidArg,
-    ) -> ChainState<PersistedState> {
+    fn new(mut chainstore: PersistedState, network: Network, assume_valid: AssumeValidArg) -> Self {
         let parameters = network.into();
         let genesis = genesis_block(&parameters);
 
@@ -593,7 +616,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
         let assume_valid = ChainParams::get_assume_valid(network, assume_valid);
 
-        ChainState {
+        Self {
             inner: RwLock::new(ChainStateInner {
                 chainstore,
                 acc: Stump::new(),
@@ -605,7 +628,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
                 },
                 subscribers: Vec::new(),
                 fee_estimation: (1_f64, 1_f64, 1_f64),
-                ibd: true,
+                ibd: IBDState::HeadersSync,
                 consensus: Consensus { parameters },
                 assume_valid,
             }),
@@ -746,7 +769,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         mut chainstore: PersistedState,
         network: Network,
         assume_valid: AssumeValidArg,
-    ) -> Result<ChainState<PersistedState>, BlockchainError> {
+    ) -> Result<Self, BlockchainError> {
         let best_block = chainstore
             .load_height()?
             .ok_or(BlockchainError::ChainNotInitialized)?;
@@ -767,7 +790,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             chainstore,
             fee_estimation: (1_f64, 1_f64, 1_f64),
             subscribers: Vec::new(),
-            ibd: true,
+            ibd: IBDState::HeadersSync,
             consensus: Consensus {
                 parameters: network.into(),
             },
@@ -779,7 +802,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             inner.best_block.depth,
         );
 
-        let chainstate = ChainState {
+        let chainstate = Self {
             inner: RwLock::new(inner),
         };
 
@@ -1006,20 +1029,25 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         height: u32,
         inputs: HashMap<OutPoint, UtxoData>,
     ) -> Result<(), BlockchainError> {
-        read_lock!(self).consensus.check_block(block, height)?;
+        let consensus = read_lock!(self).consensus.clone();
+        consensus.check_block(block, height)?;
 
         // Validate block transactions
-        let subsidy = read_lock!(self).consensus.get_subsidy(height);
-        let verify_script = self.verify_script(height)?;
+        let subsidy = consensus.get_subsidy(height);
+        let lock_time_cutoff = consensus.block_lock_time_cutoff(height, &block.header, || {
+            self.previous_median_time_past(&block.header)
+        })?;
         #[cfg(feature = "bitcoinkernel")]
-        let flags = self
-            .chain_params()
+        let flags = consensus
+            .parameters
             .get_validation_flags(height, block.block_hash());
         #[cfg(not(feature = "bitcoinkernel"))]
         let flags = 0;
+        let verify_script = self.verify_script(height)?;
 
         Consensus::verify_block_transactions(
             height,
+            lock_time_cutoff,
             inputs,
             &block.txdata,
             subsidy,
@@ -1044,6 +1072,10 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
 
     fn acc(&self) -> Stump {
         read_lock!(self).acc.to_owned()
+    }
+
+    fn size_on_disk(&self) -> Result<u64, Self::Error> {
+        Ok(read_lock!(self).chainstore.size_on_disk()?)
     }
 
     fn get_fork_point(&self, block: BlockHash) -> Result<BlockHash, Self::Error> {
@@ -1131,7 +1163,7 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
     }
 
     fn is_in_ibd(&self) -> bool {
-        self.inner.read().ibd
+        self.inner.read().ibd != IBDState::Done
     }
 
     fn get_block_height(&self, hash: &BlockHash) -> Result<Option<u32>, Self::Error> {
@@ -1231,6 +1263,15 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
 
         Ok(height + chain_params.coinbase_maturity <= current_height)
     }
+
+    fn ibd_state(&self) -> IBDState {
+        let inner = read_lock!(self);
+        inner.ibd
+    }
+
+    fn get_warnings(&self) -> Vec<ChainStoreWarning> {
+        read_lock!(self).chainstore.get_warnings()
+    }
 }
 
 impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedState> {
@@ -1256,7 +1297,8 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         acc: Stump,
         assumed_hash: BlockHash,
     ) -> Result<bool, BlockchainError> {
-        let mut curr_header = self.get_disk_block_header(&assumed_hash)?;
+        let assumed_header = self.get_disk_block_header(&assumed_hash)?;
+        let mut curr_header = assumed_header;
 
         while let Ok(header) = self.get_disk_block_header(&curr_header.block_hash()) {
             if self.is_genesis(&header) {
@@ -1268,11 +1310,8 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
             curr_header = self.get_ancestor(&header)?;
         }
 
-        self.update_view(curr_header.try_height()?, &curr_header, acc.clone())?;
-
-        let mut guard = write_lock!(self);
-        guard.best_block.validation_index = assumed_hash;
-        guard.acc = acc;
+        self.update_view(assumed_header.try_height()?, &assumed_header, acc)?;
+        self.flush()?;
 
         Ok(true)
     }
@@ -1298,9 +1337,9 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         Ok(())
     }
 
-    fn toggle_ibd(&self, is_ibd: bool) {
+    fn update_ibd(&self, ibd_state: IBDState) {
         let mut inner = write_lock!(self);
-        inner.ibd = is_ibd;
+        inner.ibd = ibd_state;
     }
 
     fn connect_block(
@@ -1489,7 +1528,7 @@ impl<T: ChainStore> TryFrom<ChainStateBuilder<T>> for ChainState<T> {
             chainstore: builder.chainstore()?,
             best_block: builder.best_block()?,
             assume_valid: builder.assume_valid(),
-            ibd: builder.ibd(),
+            ibd: builder.ibd_state(),
             subscribers: Vec::new(),
             fee_estimation: (1_f64, 1_f64, 1_f64),
             consensus: Consensus {
@@ -1523,21 +1562,36 @@ mod test {
     use std::format;
     use std::fs::File;
     use std::io::Cursor;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::thread;
     use std::vec::Vec;
 
     use bitcoin::Block;
     use bitcoin::BlockHash;
+    use bitcoin::CompactTarget;
     use bitcoin::Network;
     use bitcoin::OutPoint;
+    use bitcoin::ScriptBuf;
+    use bitcoin::Sequence;
+    use bitcoin::Transaction;
+    use bitcoin::TxMerkleNode;
     use bitcoin::Work;
+    use bitcoin::absolute::LockTime;
     use bitcoin::block::Header as BlockHeader;
+    use bitcoin::block::Version as HeaderVersion;
     use bitcoin::consensus::Decodable;
     use bitcoin::consensus::deserialize;
     use bitcoin::consensus::encode::deserialize_hex;
     use bitcoin::constants::genesis_block;
+    use bitcoin::hashes::Hash;
+    use bitcoin::opcodes::OP_TRUE;
+    use bitcoin::script::Builder;
+    use bitcoin::transaction::Version as TransactionVersion;
     use floresta_common::assert_ok;
     use floresta_common::bhash;
-    use rand::Rng;
+    use rand::RngExt;
+    use rustreexo::node_hash::BitcoinNodeHash;
     use rustreexo::proof::Proof;
     use rustreexo::stump::Stump;
 
@@ -1554,17 +1608,25 @@ mod test {
     use crate::extensions::WorkExt;
     use crate::prelude::HashMap;
     use crate::pruned_utreexo::consensus::Consensus;
+    use crate::pruned_utreexo::error::BlockValidationErrors;
     use crate::pruned_utreexo::utxo_data::UtxoData;
+    use crate::txin;
+    use crate::txout;
 
+    const DEFAULT_TEST_CHAINSTORE_SIZE: usize = 32_768;
+    const TEST_FORK_FILE_SIZE: usize = 10_000;
+    const EASIEST_REGTEST_TARGET_BITS: u32 = 0x207f_ffff;
     fn setup_test_chain(
         network: Network,
         assume_valid_arg: AssumeValidArg,
+        header_capacity: Option<usize>,
     ) -> ChainState<FlatChainStore> {
         let test_id = rand::random::<u64>();
-        let config = crate::FlatChainStoreConfig {
-            block_index_size: Some(32_768),
-            headers_file_size: Some(32_768),
-            fork_file_size: Some(10_000), // Will be rounded up to 16,384
+        let capacity = header_capacity.unwrap_or(DEFAULT_TEST_CHAINSTORE_SIZE);
+        let config = FlatChainStoreConfig {
+            block_index_size: Some(capacity),
+            headers_file_size: Some(capacity),
+            fork_file_size: Some(TEST_FORK_FILE_SIZE), // Will be rounded up to 16,384
             cache_size: Some(10),
             file_permission: Some(0o660),
             path: format!("./tmp-db/{test_id}/").into(),
@@ -1572,6 +1634,85 @@ mod test {
 
         let chainstore = FlatChainStore::new(config).unwrap();
         ChainState::open(chainstore, network, assume_valid_arg).unwrap()
+    }
+
+    fn anyone_can_spend_script() -> ScriptBuf {
+        let mut script = ScriptBuf::new();
+        script.push_opcode(OP_TRUE);
+        script
+    }
+
+    fn test_coinbase(height: u32, sequence: Sequence, lock_time: LockTime) -> Transaction {
+        let script_sig = Builder::new()
+            .push_int(i64::from(height))
+            .push_int(0)
+            .into_script();
+
+        Transaction {
+            version: TransactionVersion::TWO,
+            lock_time,
+            input: vec![txin!(OutPoint::null(), script_sig, sequence)],
+            output: vec![txout!(0, ScriptBuf::new_op_return([0x0, 0x1]))],
+        }
+    }
+
+    fn block_with_transactions(height: u32, txdata: Vec<Transaction>) -> Block {
+        let mut block = Block {
+            header: BlockHeader {
+                version: HeaderVersion::TWO,
+                prev_blockhash: genesis_block(Network::Regtest).block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_716_400_000 + height,
+                bits: CompactTarget::from_consensus(EASIEST_REGTEST_TARGET_BITS),
+                nonce: 0,
+            },
+            txdata,
+        };
+        block.header.merkle_root = block.compute_merkle_root().expect("block txs");
+        block
+    }
+
+    fn block_with_coinbase(height: u32, coinbase: Transaction) -> Block {
+        block_with_transactions(height, vec![coinbase])
+    }
+
+    fn test_outpoint(vout: u32) -> OutPoint {
+        OutPoint {
+            txid: genesis_block(Network::Regtest).txdata[0].compute_txid(),
+            vout,
+        }
+    }
+
+    /// Builds a two-input test transaction with the given lock time and sequences,
+    /// plus its referenced input UTXOs.
+    fn test_spend(
+        lock_time: LockTime,
+        first_sequence: Sequence,
+        second_sequence: Sequence,
+    ) -> (Transaction, HashMap<OutPoint, UtxoData>) {
+        let first_prevout = test_outpoint(0);
+        let second_prevout = test_outpoint(1);
+        let transaction = Transaction {
+            version: TransactionVersion::TWO,
+            lock_time,
+            input: vec![
+                txin!(first_prevout, ScriptBuf::new(), first_sequence),
+                txin!(second_prevout, ScriptBuf::new(), second_sequence),
+            ],
+            output: vec![txout!(1, ScriptBuf::new_op_return([0x0, 0x1]))],
+        };
+        let input_utxo = UtxoData {
+            txout: txout!(1, anyone_can_spend_script()),
+            is_coinbase: false,
+            creation_height: 0,
+            creation_time: 0,
+        };
+        let inputs = HashMap::from([
+            (first_prevout, input_utxo.clone()),
+            (second_prevout, input_utxo),
+        ]);
+
+        (transaction, inputs)
     }
 
     fn decode_block_and_inputs(
@@ -1599,9 +1740,101 @@ mod test {
         (block, inputs)
     }
 
+    /// Stores 11 synthetic headers ending at `tip_height` for Median Time Past (MTP).
+    /// Returns the most-recent synthetic block hash.
+    fn store_mtp_headers(
+        chain: &ChainState<FlatChainStore>,
+        network: Network,
+        tip_height: u32,
+        time: u32,
+    ) -> BlockHash {
+        assert!(tip_height > 10, "Need at least 11 headers for MTP");
+        let genesis = genesis_block(network);
+        let mut prev_hash = genesis.block_hash();
+
+        for height in (tip_height - 10)..=tip_height {
+            let header = BlockHeader {
+                version: HeaderVersion::NO_SOFT_FORK_SIGNALLING,
+                prev_blockhash: prev_hash,
+                merkle_root: genesis.header.merkle_root,
+                time,
+                bits: CompactTarget::from_consensus(0x1702_8c74),
+                nonce: height,
+            };
+            prev_hash = header.block_hash();
+
+            write_lock!(chain)
+                .chainstore
+                .save_header(&DiskBlockHeader::FullyValid(header, height))
+                .unwrap();
+            write_lock!(chain)
+                .chainstore
+                .update_block_index(height, prev_hash)
+                .unwrap();
+        }
+
+        prev_hash
+    }
+
+    #[test]
+    fn reject_non_final_block_transaction() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let height = 1;
+
+        let invalid = block_with_coinbase(
+            height,
+            test_coinbase(
+                height,
+                Sequence::ENABLE_LOCKTIME_NO_RBF,
+                LockTime::from_height(height).unwrap(),
+            ),
+        );
+        let valid =
+            block_with_coinbase(height, test_coinbase(height, Sequence::MAX, LockTime::ZERO));
+
+        match chain.validate_block_no_acc(&invalid, height, HashMap::new()) {
+            Err(BlockchainError::BlockValidation(BlockValidationErrors::NonFinalTransaction)) => {}
+            other => panic!("expected NonFinalTransaction, got {other:?}"),
+        }
+
+        chain
+            .validate_block_no_acc(&valid, height, HashMap::new())
+            .expect("block transactions are valid and final");
+    }
+
+    #[test]
+    fn future_lock_time_requires_all_input_sequences_to_be_final() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let height = 1;
+        let future_lock_time = LockTime::from_height(height + 1).unwrap();
+        let coinbase = || test_coinbase(height, Sequence::MAX, LockTime::ZERO);
+
+        let (transaction, inputs) = test_spend(future_lock_time, Sequence::MAX, Sequence::MAX);
+        let block = block_with_transactions(height, vec![coinbase(), transaction]);
+
+        chain
+            .validate_block_no_acc(&block, height, inputs)
+            .expect("all input sequences are final");
+
+        let (transaction, inputs) = test_spend(
+            future_lock_time,
+            Sequence::MAX,
+            Sequence::ENABLE_LOCKTIME_NO_RBF,
+        );
+        let block = block_with_transactions(height, vec![coinbase(), transaction]);
+
+        match chain.validate_block_no_acc(&block, height, inputs) {
+            Err(BlockchainError::BlockValidation(BlockValidationErrors::NonFinalTransaction)) => {}
+            other => panic!("expected NonFinalTransaction, got {other:?}"),
+        }
+    }
+
     #[test]
     #[cfg_attr(debug_assertions, ignore = "this test is very slow in debug mode")]
     fn test_validate_many_inputs_block() {
+        const HEIGHT: u32 = 367891;
+        const BLOCKS: usize = (HEIGHT + 1) as usize;
+
         let block_file = File::open("./testdata/block_367891/raw.zst").unwrap();
         let stxos_file = File::open("./testdata/block_367891/spent_utxos.zst").unwrap();
         let (block, inputs) = decode_block_and_inputs(block_file, stxos_file);
@@ -1612,17 +1845,20 @@ mod test {
         );
 
         // Check whether the block validation passes or not
-        let chain = setup_test_chain(Network::Bitcoin, AssumeValidArg::Disabled);
+        let chain = setup_test_chain(Network::Bitcoin, AssumeValidArg::Disabled, Some(BLOCKS));
         chain
-            .validate_block_no_acc(&block, 367891, inputs)
+            .validate_block_no_acc(&block, HEIGHT, inputs)
             .expect("Block must be valid");
     }
 
     #[test]
     fn test_validate_full_block() {
+        const HEIGHT: u32 = 866342;
+        const BLOCKS: usize = (HEIGHT + 1) as usize;
+
         let block_file = File::open("./testdata/block_866342/raw.zst").unwrap();
         let stxos_file = File::open("./testdata/block_866342/spent_utxos.zst").unwrap();
-        let (block, inputs) = decode_block_and_inputs(block_file, stxos_file);
+        let (mut block, inputs) = decode_block_and_inputs(block_file, stxos_file);
 
         assert_eq!(
             block.block_hash(),
@@ -1630,10 +1866,105 @@ mod test {
         );
 
         // Check whether the block validation passes or not
-        let chain = setup_test_chain(Network::Bitcoin, AssumeValidArg::Disabled);
+        let chain = setup_test_chain(Network::Bitcoin, AssumeValidArg::Disabled, Some(BLOCKS));
+        let prev_hash = store_mtp_headers(&chain, Network::Bitcoin, HEIGHT - 1, block.header.time);
+        block.header.prev_blockhash = prev_hash;
         chain
-            .validate_block_no_acc(&block, 866342, inputs)
+            .validate_block_no_acc(&block, HEIGHT, inputs)
             .expect("Block must be valid");
+    }
+
+    fn store_linked_headers(chain: &ChainState<FlatChainStore>, times: &[u32]) -> Vec<BlockHeader> {
+        let genesis = genesis_block(Network::Regtest);
+        let mut prev_hash = genesis.block_hash();
+        let mut headers = Vec::with_capacity(times.len());
+
+        for (height, &time) in (1u32..).zip(times) {
+            let header = BlockHeader {
+                version: HeaderVersion::TWO,
+                prev_blockhash: prev_hash,
+                merkle_root: genesis.header.merkle_root,
+                time,
+                bits: CompactTarget::from_consensus(EASIEST_REGTEST_TARGET_BITS),
+                nonce: height,
+            };
+            prev_hash = header.block_hash();
+            write_lock!(chain)
+                .chainstore
+                .save_header(&DiskBlockHeader::FullyValid(header, height))
+                .unwrap();
+            write_lock!(chain)
+                .chainstore
+                .update_block_index(height, prev_hash)
+                .unwrap();
+            headers.push(header);
+        }
+
+        headers
+    }
+
+    fn median_time(mut times: Vec<u32>) -> u32 {
+        times.sort_unstable();
+        times[times.len() / 2]
+    }
+
+    #[test]
+    fn chain_state_median_time_past_sorts_recent_headers() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let times = [111, 101, 109, 107, 103, 105, 110, 102, 108, 104, 106];
+        let headers = store_linked_headers(&chain, &times);
+
+        assert_eq!(
+            chain.median_time_past(headers[10]).unwrap(),
+            median_time(times.to_vec())
+        );
+    }
+
+    #[test]
+    fn chain_state_median_time_past_requires_connected_headers() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let missing_prev = BlockHeader {
+            version: HeaderVersion::TWO,
+            prev_blockhash: genesis_block(Network::Regtest).block_hash(),
+            merkle_root: genesis_block(Network::Regtest).header.merkle_root,
+            time: 100,
+            bits: CompactTarget::from_consensus(EASIEST_REGTEST_TARGET_BITS),
+            nonce: 1,
+        };
+        let header = BlockHeader {
+            version: HeaderVersion::TWO,
+            prev_blockhash: missing_prev.block_hash(),
+            merkle_root: genesis_block(Network::Regtest).header.merkle_root,
+            time: 200,
+            bits: CompactTarget::from_consensus(EASIEST_REGTEST_TARGET_BITS),
+            nonce: 2,
+        };
+
+        assert!(matches!(
+            chain.median_time_past(header),
+            Err(BlockchainError::BlockNotPresent)
+        ));
+    }
+
+    #[test]
+    fn chain_state_previous_median_time_past_uses_parent_hash() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let times = [211, 201, 209, 207, 203, 205, 210, 202, 208, 204, 206];
+        let headers = store_linked_headers(&chain, &times);
+
+        let candidate = BlockHeader {
+            version: HeaderVersion::TWO,
+            prev_blockhash: headers[10].block_hash(),
+            merkle_root: genesis_block(Network::Regtest).header.merkle_root,
+            time: 100,
+            bits: CompactTarget::from_consensus(EASIEST_REGTEST_TARGET_BITS),
+            nonce: 12,
+        };
+
+        assert_eq!(
+            chain.previous_median_time_past(&candidate).unwrap(),
+            median_time(times.to_vec())
+        );
     }
 
     #[test]
@@ -1644,7 +1975,7 @@ mod test {
         let mut buffer = uncompressed.as_slice();
 
         let mut headers = Vec::new();
-        let chain = setup_test_chain(Network::Bitcoin, AssumeValidArg::Hardcoded);
+        let chain = setup_test_chain(Network::Bitcoin, AssumeValidArg::Hardcoded, None);
 
         while let Ok(header) = BlockHeader::consensus_decode(&mut buffer) {
             chain.accept_header(header).unwrap();
@@ -1706,7 +2037,7 @@ mod test {
         let uncompressed: Vec<u8> = zstd::decode_all(Cursor::new(file)).unwrap();
         let mut buffer = uncompressed.as_slice();
 
-        let chain = setup_test_chain(Network::Signet, AssumeValidArg::Hardcoded);
+        let chain = setup_test_chain(Network::Signet, AssumeValidArg::Hardcoded, None);
         while let Ok(header) = BlockHeader::consensus_decode(&mut buffer) {
             chain.accept_header(header).unwrap();
         }
@@ -1727,8 +2058,44 @@ mod test {
     }
 
     #[test]
+    fn test_calc_next_work_required_underflow() {
+        let first_block: BlockHeader = deserialize_hex("0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a008f4d5fae77031e8ad22203").unwrap();
+        let last_block: BlockHeader = deserialize_hex("00000020dec6741f7dc5df6661bcb2d3ec2fceb14bd0e6def3db80da904ed1eeb8000000d1f308132e6a72852c04b059e92928ea891ae6d513cd3e67436f908c804ec7be51df535fae77031e4d00f800").unwrap();
+
+        // The "first" block has a timestamp later than the "last" one, so computing the
+        // timespan `last.time - first.time` should underflow.
+        //
+        // The saturating subtraction yields a timespan of 0, which gets clamped to
+        // `pow_target_timespan / 4`, quartering the target.
+        let next_target = Consensus::calc_next_work_required(
+            &first_block,
+            &last_block,
+            ChainParams::from(Network::Signet),
+        );
+
+        assert!((first_block.time as i32 - last_block.time as i32) < 0);
+
+        assert_eq!(0x1e00ddeb, next_target.to_compact_lossy().to_consensus());
+
+        let mut new_last = last_block;
+        new_last.time = first_block.time;
+
+        assert!(first_block.time - new_last.time == 0);
+
+        // Since the time value is saturated and clamped, them being exactly equal should
+        // make the result to be the same.
+        let next_target = Consensus::calc_next_work_required(
+            &first_block,
+            &new_last,
+            ChainParams::from(Network::Signet),
+        );
+
+        assert_eq!(0x1e00ddeb, next_target.to_compact_lossy().to_consensus());
+    }
+
+    #[test]
     fn test_reorg() {
-        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded);
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
         let json_blocks = include_str!("../../testdata/test_reorg.json");
         let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
         let mut fork_acc = Stump::default();
@@ -1875,12 +2242,55 @@ mod test {
     }
 
     #[test]
+    fn test_fork_tips() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+
+        let parse_blocks = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|s| deserialize_hex(s).unwrap())
+                .collect::<Vec<Block>>()
+        };
+
+        let short_chain = parse_blocks(&blocks[0]); // 10 blocks on genesis
+        let long_chain = parse_blocks(&blocks[1]); // 11 blocks forking from block 5
+
+        // Accept all 10 main-chain headers
+        for block in &short_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        // Only one tip so far (the main chain)
+        let tips = chain.get_chain_tips().unwrap();
+        assert_eq!(tips.len(), 1);
+
+        // Accept only 4 fork headers (less work than main chain: 4 < 5 blocks after fork point)
+        for block in &long_chain[..4] {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        // Now we should have 2 tips: main chain + fork
+        let tips = chain.get_chain_tips().unwrap();
+        assert_eq!(tips.len(), 2);
+
+        // First tip is always the best block (main chain tip at height 10)
+        let (best_height, best_hash) = chain.get_best_block().unwrap();
+        assert_eq!(best_height, 10);
+        assert_eq!(tips[0], best_hash);
+
+        // Second tip is the fork tip (4th fork block)
+        assert_eq!(tips[1], long_chain[3].block_hash());
+    }
+
+    #[test]
     fn test_chainstate_functions() {
         let file = include_bytes!("../../testdata/signet_headers.zst");
         let uncompressed: Vec<u8> = zstd::decode_all(Cursor::new(file)).unwrap();
         let mut buffer = uncompressed.as_slice();
 
-        let chain = setup_test_chain(Network::Signet, AssumeValidArg::Hardcoded);
+        let chain = setup_test_chain(Network::Signet, AssumeValidArg::Hardcoded, None);
         let mut headers: Vec<BlockHeader> = Vec::new();
         while let Ok(header) = BlockHeader::consensus_decode(&mut buffer) {
             headers.push(header);
@@ -1989,5 +2399,262 @@ mod test {
         assert_eq!(work.to_string_hex(), expected_hex_string);
         assert_eq!(fork_work, work);
         assert_eq!(work, expected_work);
+    }
+
+    fn connect_reorg_chains(
+        chain: &ChainState<FlatChainStore>,
+        short_chain: &[Block],
+        long_chain: &[Block],
+    ) -> HashMap<BlockHash, Stump> {
+        let mut accs = HashMap::new();
+        accs.insert(chain.get_block_hash(0).unwrap(), chain.acc());
+
+        for block in short_chain {
+            chain.accept_header(block.header).unwrap();
+            chain
+                .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+            accs.insert(block.block_hash(), chain.acc());
+        }
+
+        for block in long_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        for block in long_chain {
+            chain
+                .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+            accs.insert(block.block_hash(), chain.acc());
+        }
+
+        accs
+    }
+
+    #[test]
+    fn reorg_publishes_the_validation_index_and_the_accumulator_together() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+
+        let parse_blocks = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|s| deserialize_hex(s).unwrap())
+                .collect::<Vec<Block>>()
+        };
+
+        let short_chain = parse_blocks(&blocks[0]);
+        let long_chain = parse_blocks(&blocks[1]);
+
+        let reference = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+        let accs = connect_reorg_chains(&reference, &short_chain, &long_chain);
+
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+        let done = AtomicBool::new(false);
+
+        thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    while !done.load(Ordering::Acquire) {
+                        let (validation_index, acc) = {
+                            let inner = chain.inner.read();
+                            (inner.best_block.validation_index, inner.acc.clone())
+                        };
+
+                        assert_eq!(
+                            accs.get(&validation_index),
+                            Some(&acc),
+                            "the accumulator must be the one left by block {validation_index}",
+                        );
+                    }
+                });
+            }
+
+            connect_reorg_chains(&chain, &short_chain, &long_chain);
+            done.store(true, Ordering::Release);
+        });
+
+        assert_eq!(chain.get_validation_index().unwrap(), 16);
+    }
+
+    #[test]
+    fn reorg_above_the_validation_index_keeps_the_accumulator() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+
+        let parse_blocks = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|s| deserialize_hex(s).unwrap())
+                .collect::<Vec<Block>>()
+        };
+
+        let short_chain = parse_blocks(&blocks[0]);
+        let long_chain = parse_blocks(&blocks[1]);
+
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+
+        // Take the headers all the way to the tip of the short chain, but only validate the
+        // first four blocks. The fork point, block 5, is left as `HeadersOnly`, which is the
+        // ordinary state during IBD: headers run ahead of block validation.
+        for block in &short_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        for block in short_chain.iter().take(4) {
+            chain
+                .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+        }
+
+        assert_eq!(chain.get_validation_index().unwrap(), 4);
+
+        let acc = chain.acc();
+        assert_ne!(acc, Stump::new(), "we validated four blocks");
+
+        // The long chain forks at block 5, above our validation index, so the reorg doesn't
+        // undo any validated block and must leave the accumulator alone.
+        for block in &long_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        assert_eq!(chain.get_validation_index().unwrap(), 4);
+        assert_eq!(
+            chain.acc(),
+            acc,
+            "a reorg above the validation index must not change the accumulator",
+        );
+    }
+
+    #[test]
+    fn a_failed_reorg_leaves_the_chain_state_untouched() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+
+        let parse_blocks = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|s| deserialize_hex(s).unwrap())
+                .collect::<Vec<Block>>()
+        };
+
+        let short_chain = parse_blocks(&blocks[0]);
+        let long_chain = parse_blocks(&blocks[1]);
+
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+
+        for block in &short_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        for block in short_chain.iter().take(4) {
+            chain
+                .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+        }
+
+        // `mark_chain_as_assumed` takes a whole range as `FullyValid` but only saves the roots
+        // for genesis, so every assumed block above our validation index has none. This is the
+        // state an assume-utreexo node runs in, and a reorg landing on one of those blocks
+        // can't find the accumulator it has to publish.
+        let acc = chain.acc();
+        chain
+            .mark_chain_as_assumed(acc.clone(), short_chain[9].block_hash())
+            .unwrap();
+
+        assert!(chain.get_roots_for_block(5).unwrap().is_none());
+
+        let best_block = chain.get_best_block().unwrap();
+        let validation_index = chain.get_validation_index().unwrap();
+        let block_after_fork = chain.get_block_hash(6).unwrap();
+
+        // The long chain forks at block 5, one of the assumed blocks, so this reorg fails when
+        // it looks for the accumulator that goes with the new validation index.
+        let error = long_chain
+            .iter()
+            .find_map(|block| chain.accept_header(block.header).err());
+
+        assert!(
+            matches!(error, Some(BlockchainError::BadValidationIndex)),
+            "expected the reorg to fail with BadValidationIndex, got {error:?}",
+        );
+
+        // A reorg that fails must not leave half of itself behind: the branches keep the state
+        // they had, and the tip, validation index and accumulator still describe the old chain.
+        assert_eq!(chain.get_best_block().unwrap(), best_block);
+        assert_eq!(
+            chain.get_validation_index().ok(),
+            Some(validation_index),
+            "the validation index must still point to a block we validated",
+        );
+        assert_eq!(chain.get_block_hash(6).unwrap(), block_after_fork);
+        assert_eq!(chain.acc(), acc);
+    }
+
+    #[test]
+    fn an_assumed_chain_finds_its_accumulator_again_after_a_restart() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+        let chain_blocks: Vec<Block> = blocks[0]
+            .iter()
+            .map(|s| deserialize_hex(s).unwrap())
+            .collect();
+
+        let test_id = rand::random::<u64>();
+        let path = format!("./tmp-db/{test_id}/");
+        let config = || FlatChainStoreConfig {
+            block_index_size: Some(DEFAULT_TEST_CHAINSTORE_SIZE),
+            headers_file_size: Some(DEFAULT_TEST_CHAINSTORE_SIZE),
+            fork_file_size: Some(TEST_FORK_FILE_SIZE),
+            cache_size: Some(10),
+            file_permission: Some(0o660),
+            path: path.clone().into(),
+        };
+
+        let acc = Stump {
+            leaves: 42,
+            roots: vec![BitcoinNodeHash::Some([1; 32])],
+        };
+
+        let chain = ChainState::open(
+            FlatChainStore::new(config()).unwrap(),
+            Network::Regtest,
+            AssumeValidArg::Hardcoded,
+        )
+        .unwrap();
+
+        for block in &chain_blocks {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        let assumed_hash = chain_blocks[9].block_hash();
+        chain
+            .mark_chain_as_assumed(acc.clone(), assumed_hash)
+            .unwrap();
+
+        // The roots have to sit at the height the validation index points to, because that's
+        // where `open` looks for them.
+        let assumed_height = chain.get_validation_index().unwrap();
+        assert_eq!(assumed_height, 10);
+        assert_eq!(
+            chain.get_roots_for_block(assumed_height).unwrap(),
+            Some(acc.clone())
+        );
+
+        drop(chain);
+
+        let chain = ChainState::open(
+            FlatChainStore::new(config()).unwrap(),
+            Network::Regtest,
+            AssumeValidArg::Hardcoded,
+        )
+        .unwrap();
+
+        assert_eq!(chain.get_validation_index().unwrap(), assumed_height);
+        assert_eq!(
+            chain.acc(),
+            acc,
+            "a restart must not throw the assumed accumulator away",
+        );
     }
 }

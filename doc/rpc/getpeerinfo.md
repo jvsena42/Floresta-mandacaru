@@ -29,11 +29,18 @@ Returns a JSON array of objects, each representing a connected peer with the fol
 
 - `id` - (numeric) This peer's unique identifier in the node's peer manager. This is useful for commands like `disconnectnode` which can target a peer by its ID.
 - `address` - (string) The network address and port for this peer (e.g., "192.168.1.5:8333"). This helps identify where the connection is established.
-- `services` - (string) A string listing the services this peer advertises (e.g., NODE_NETWORK, UTREEXO, WITNESS). This indicates what capabilities the peer supports and what data we can request from them.
+- `services` - (string) A 16-character hexadecimal bitfield with the services this peer advertises (e.g., "0000000000000c09"). This indicates what capabilities the peer supports and what data we can request from them.
+- `servicesnames` - (array of strings) Human-readable names for the recognized services this peer advertises (e.g., "NETWORK", "WITNESS", "P2P_V2"). Unknown service bits are still represented in `services`.
+- `relaytxes` - (boolean) Whether mempool transaction relay is enabled with this peer. Always `false` in Floresta, since Floresta does not track per-peer transaction relay preferences.
 - `user_agent` - (string) The User Agent string representing the client software and version being used by the peer (e.g., `/Satoshi-26.0/`). Useful for identifying the software distribution on the network.
+- `inbound` - (boolean) Whether this peer connection is inbound. Always `false` in Floresta, since Floresta does not accept inbound P2P connections.
+- `bip152_hb_to` - (boolean) Whether we selected this peer as a BIP152 high-bandwidth compact block relay peer. Always `false` in Floresta, since this relay mode is not implemented.
+- `bip152_hb_from` - (boolean) Whether this peer selected us as a BIP152 high-bandwidth compact block relay peer. Always `false` in Floresta, since this relay mode is not implemented.
 - `initial_height` - (numeric) The block height this peer reported when the connection was first established. This may differ from the current chain tip if the peer has not announced new blocks since connecting.
+- `timeoffset` - (numeric) The peer time offset in seconds, computed from the peer's version message timestamp.
 - `kind` - (string) The connection type of this peer. Possible values are "feeler" (short-lived connections to test address validity), "regular" (standard persistent P2P connection), "extra", or "manual".
 - `state` - (string) The current state of this peer. Can be "Ready" (fully handshaked and active), "Awaiting" (still establishing connection), or "Banned" (connection rejected/dropped).
+- `permissions` - (array of strings) Special permissions granted to this peer. Always empty in Floresta, since Floresta does not implement Bitcoin Core's peer permission system.
 - `transport_protocol` - (string) The transport protocol used to communicate with the peer (e.g., "V1" or "V2").
 
 ### Error Enum
