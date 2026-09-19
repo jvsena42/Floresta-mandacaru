@@ -104,7 +104,7 @@ check_interactive_mode() {
 }
 
 # Use getopt for long options
-if ! OPTIONS=$(getopt -o x:d:a:n:t:p:C:z:v:f:usUNh --long xpub:,desc:,address:,network:,tag:,proxy:,connect:,zmq-address:,assume-valid:,filters:,assume-utreexo,tls,uninstall,non-interactive,help -n "$0" -- "$@"); then
+if ! OPTIONS=$(getopt -o x:d:a:n:t:p:C:z:v:fusUNh --long xpub:,desc:,address:,network:,tag:,proxy:,connect:,zmq-address:,assume-valid:,filters,assume-utreexo,tls,uninstall,non-interactive,help -n "$0" -- "$@"); then
     show_usage
     exit 1
 fi
@@ -1021,14 +1021,17 @@ interactive_zeromq() {
 #
 # Ask whether the compact-filter manager should be enabled.
 interactive_filters() {
-    if dialog --title "Floresta-Installer (Compact filters)" \
-        --yesno "Enable compact-filter synchronization for historical wallet rescans?" 10 60; then
+    dialog --title "Floresta-Installer (Compact filters)" \
+        --yesno "Enable compact-filter synchronization for historical wallet rescans?" 10 60
+    # Has to run right after dialog: it reads `$?` into `code`, and leaves on ESC.
+    check_dialog_escape
+
+    if [ "$code" -eq 0 ]; then
         enable_cfilters=true
     else
         enable_cfilters=false
     fi
 
-    check_dialog_escape
     interactive_advanced_setup
 }
 
