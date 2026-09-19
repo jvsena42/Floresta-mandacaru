@@ -71,6 +71,12 @@ Furthermore, the request will be aborted if the node still syncing with the bloc
 
 - Be sure to not insert invalid values, e.g. the start being greater than the stop.
 
-- This rescan relies on BIP 158 block filters.
+- This rescan relies on BIP 158 block filters. Only filter headers are stored: the filters of the requested range are downloaded from peers every time, so narrow ranges are much cheaper than a rescan from genesis.
+
+- A `start_block` of `0` means "not given": the rescan then starts at `--filters-start-height` (the wallet birthday) when one is configured, and at genesis otherwise. Pass `1` to scan the whole chain regardless.
+
+- Only one wallet rescan runs at a time. While one is running this command fails with "A rescan is already in progress"; its progress is reported by `getblockchaininfo` (`rescan_in_progress`, `rescan_blocks_processed`, `rescan_blocks_total`).
+
+- The range can't reach past the synchronized filter headers (`filters` in `getblockchaininfo`).
 
 - You dont need to be picky with timestamps but, when using uncertain timestamps you mostly want to set a high confidence which is not necessary for precise timestamps.
