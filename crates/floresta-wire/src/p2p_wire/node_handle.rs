@@ -117,6 +117,12 @@ pub enum UserRequest {
         block_hashes: Vec<BlockHash>,
     },
 
+    /// The filters we returned for the batch ending at `stop_hash` failed the caller's validation.
+    ReportInvalidCFilters {
+        /// The final block of the offending batch.
+        stop_hash: BlockHash,
+    },
+
     /// Request BIP157 filter-header checkpoints through a block.
     GetCFCheckpt {
         /// The final block in the checkpoint chain.
@@ -260,6 +266,13 @@ impl floresta_common::ChainMethods for NodeHandle {
             .await?;
 
         extract_variant!(CFilters, val)
+    }
+
+    async fn report_invalid_cfilters(&self, stop_hash: BlockHash) {
+        // Nothing comes back: the node drops the responder once it has acted on the report.
+        let _ = self
+            .send_request(UserRequest::ReportInvalidCFilters { stop_hash })
+            .await;
     }
 
     async fn get_cfcheckpt(&self, stop_hash: BlockHash) -> Result<CFCheckpt, Self::Error> {

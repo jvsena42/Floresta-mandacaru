@@ -62,6 +62,19 @@ pub trait ChainMethods {
         block_hashes: Vec<bitcoin::BlockHash>,
     ) -> impl core::future::Future<Output = Result<Vec<bitcoin::bip158::BlockFilter>, Self::Error>> + Send;
 
+    /// Reports that the filters returned by [`get_cfilter`](Self::get_cfilter) for a batch ending
+    /// at `stop_hash` failed validation, so the node can hold the peer that served them
+    /// accountable and later requests go to another one.
+    ///
+    /// The default does nothing, for implementations that can't tell peers apart.
+    fn report_invalid_cfilters(
+        &self,
+        stop_hash: bitcoin::BlockHash,
+    ) -> impl core::future::Future<Output = ()> + Send {
+        let _ = stop_hash;
+        async {}
+    }
+
     /// Returns BIP157 filter-header checkpoints through `stop_hash`.
     fn get_cfcheckpt(
         &self,

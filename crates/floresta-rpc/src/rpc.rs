@@ -530,6 +530,7 @@ mod tests {
             rescan_in_progress: true,
             rescan_blocks_processed: Some(1),
             rescan_blocks_total: Some(2),
+            rescan_error: None,
         };
         let expected_result = serde_json::to_value(get_blockchain_info_res).unwrap();
         client.set_result(expected_result.clone());

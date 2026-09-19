@@ -316,6 +316,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let rescan_in_progress = rescan_progress.is_some();
         let rescan_blocks_processed = rescan_progress.map(|(processed, _)| processed);
         let rescan_blocks_total = rescan_progress.map(|(_, total)| total);
+        let rescan_error = self.rescan.last_error();
 
         let core = GetBlockchainInfo {
             chain,
@@ -348,6 +349,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             rescan_in_progress,
             rescan_blocks_processed,
             rescan_blocks_total,
+            rescan_error,
         })
     }
 

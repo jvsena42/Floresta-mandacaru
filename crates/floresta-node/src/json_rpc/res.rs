@@ -62,6 +62,12 @@ pub struct GetBlockchainInfoRes {
     /// rescan is running.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rescan_blocks_total: Option<u32>,
+    /// Why the last wallet rescan failed. Cleared when another rescan starts.
+    ///
+    /// `rescan_in_progress` going back to `false` doesn't tell a completed
+    /// rescan from a failed one; clients should offer a retry when this is set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rescan_error: Option<String>,
 }
 
 /// Types and methods implementing the [JSON-RPC 2.0 spec](https://www.jsonrpc.org/specification),
@@ -675,6 +681,7 @@ mod tests {
             rescan_in_progress: true,
             rescan_blocks_processed: Some(3),
             rescan_blocks_total: Some(7),
+            rescan_error: None,
         }
     }
 
