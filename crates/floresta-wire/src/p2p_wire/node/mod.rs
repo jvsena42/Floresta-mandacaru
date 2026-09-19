@@ -284,6 +284,15 @@ pub struct NodeCommon<Chain: ChainBackend> {
     pub(crate) inflight_user_requests:
         HashMap<UserRequest, (u32, Instant, oneshot::Sender<NodeResponse>)>,
     pub(crate) inflight_filter_batches: HashMap<UserRequest, Vec<BlockFilter>>,
+
+    /// When each peer last delivered a filter of a batch we asked for. A batch is up to a hundred
+    /// messages and several batches queue up on one peer, so a request is only considered stalled
+    /// when its peer stopped making progress, not when its answer takes long to complete.
+    pub(crate) last_filter_progress: HashMap<PeerId, Instant>,
+
+    /// Whether some consumer asked for compact-filter data through the node handle. Until then
+    /// we don't spend a peer slot on a compact-filters peer.
+    pub(crate) wants_compact_filters: bool,
     pub(crate) last_tip_update: Instant,
     pub(crate) last_connection: Instant,
     pub(crate) last_peer_db_dump: Instant,
@@ -375,6 +384,8 @@ where
                 inflight: HashMap::new(),
                 inflight_user_requests: HashMap::new(),
                 inflight_filter_batches: HashMap::new(),
+                last_filter_progress: HashMap::new(),
+                wants_compact_filters: false,
                 peer_id_count: 0,
                 peers: HashMap::new(),
                 last_block_request: chain.get_validation_index().expect("Invalid chain"),

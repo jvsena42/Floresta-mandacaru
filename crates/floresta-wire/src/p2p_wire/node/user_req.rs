@@ -195,6 +195,7 @@ where
                 start_height,
                 stop_hash,
             } => {
+                self.wants_compact_filters = true;
                 let req = NodeRequest::GetCFHeaders {
                     start_height,
                     stop_hash,
@@ -213,6 +214,7 @@ where
                 start_height,
                 ref block_hashes,
             } => {
+                self.wants_compact_filters = true;
                 let Some(stop_hash) = block_hashes.last().copied() else {
                     let _ = responder.send(NodeResponse::CFilters(Vec::new()));
                     return;
@@ -229,6 +231,7 @@ where
             }
 
             UserRequest::GetCFCheckpt { stop_hash } => {
+                self.wants_compact_filters = true;
                 let request = NodeRequest::GetCFCheckpt(stop_hash);
                 if let Ok(peer) = self.send_to_fast_peer(request, ServiceFlags::COMPACT_FILTERS) {
                     self.inflight_user_requests

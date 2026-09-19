@@ -94,6 +94,16 @@ const BASIC_FILTER_VERSION: u8 = 0;
 /// How many filter (or filter headers) are allowed in a single message.
 const MAX_FILTERS_PER_MESSAGE: usize = 2_000;
 
+/// A `cfcheckpt` carries one filter header per 1,000 blocks, so it needs a bound of its own: the
+/// per-message one would stop checkpoint sync on any chain past height 2,000,000 (testnet3 is).
+/// This covers 50 million blocks and stays under 2 MB.
+const MAX_CHECKPOINTS_PER_MESSAGE: usize = 50_000;
+
+/// Largest compact filter we take from a peer. A basic filter for a full mainnet block is well
+/// under 200 KB. Filters are buffered by the hundred before anyone can validate them, so without
+/// a bound a peer could make us hold 4 MB (the transport limit) for each.
+const MAX_CFILTER_SIZE: usize = 1_000_000;
+
 #[derive(Debug, PartialEq)]
 enum State {
     None,
@@ -599,6 +609,9 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                 }
                 NetworkMessage::CFilter(filter_msg) => match filter_msg.filter_type {
                     0 => {
+                        if filter_msg.filter.len() > MAX_CFILTER_SIZE {
+                            return Err(PeerError::MessageTooBig);
+                        }
                         let filter = BlockFilter::new(&filter_msg.filter);
 
                         self.send_to_node(
@@ -626,7 +639,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                 }
 
                 NetworkMessage::CFCheckpt(checkpoint) => {
-                    if checkpoint.filter_headers.len() > MAX_FILTERS_PER_MESSAGE {
+                    if checkpoint.filter_headers.len() > MAX_CHECKPOINTS_PER_MESSAGE {
                         return Err(PeerError::MessageTooBig);
                     }
 

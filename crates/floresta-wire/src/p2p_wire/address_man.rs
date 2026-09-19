@@ -565,21 +565,16 @@ impl AddressMan {
             .unwrap_or_default()
     }
 
-    /// Whether the address manager knows at least one address advertising the
-    /// given service (good peers or merely known peers).
+    /// Whether the address manager has an address advertising the given service
+    /// that we could dial right now: never tried, tried with success, or failed
+    /// long enough ago to deserve another attempt.
     ///
     /// Used by peer-rotation logic that should avoid churning an outgoing slot
-    /// unless we actually have a replacement candidate to dial.
+    /// unless we actually have a replacement candidate to dial. Addresses that
+    /// are banned, connected or recently failed don't count: evicting a healthy
+    /// peer for them only ends with another peer lacking the service.
     pub fn has_address_for_service(&self, service: ServiceFlags) -> bool {
-        let good = self
-            .good_peers_by_service
-            .get(&service)
-            .is_some_and(|v| !v.is_empty());
-        let known = self
-            .peers_by_service
-            .get(&service)
-            .is_some_and(|v| !v.is_empty());
-        good || known
+        self.try_with_service(service).is_some()
     }
 
     /// Returns address manager statistics broken down by network type.
@@ -1881,6 +1876,39 @@ mod test {
 
         // Without a service requirement, we still return the one peer we have.
         assert!(address_man.get_random_address(ServiceFlags::NONE).is_some());
+    }
+
+    #[test]
+    fn test_has_address_for_service_ignores_addresses_we_cannot_dial() {
+        let mut address_man = AddressMan::new(None, &[ReachableNetworks::IPv4]);
+        let cf_peer = LocalAddress {
+            address: BitcoinSocketAddr::new(AddrV2::Ipv4("12.146.182.45".parse().unwrap()), 8333),
+            last_connected: 0,
+            state: AddressState::NeverTried,
+            services: ServiceFlags::NETWORK
+                | ServiceFlags::NETWORK_LIMITED
+                | ServiceFlags::WITNESS
+                | ServiceFlags::COMPACT_FILTERS,
+            id: 0,
+        };
+        address_man.push_addresses(&[cf_peer]);
+        let id = *address_man.addresses.keys().next().unwrap();
+        assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS));
+
+        // Evicting a peer to dial any of these would only fill the slot with a non-CF peer.
+        let now = AddressMan::time_since_unix();
+        for state in [
+            AddressState::Failed(now),
+            AddressState::Banned(now),
+            AddressState::Connected,
+        ] {
+            address_man.update_set_state(id, state);
+            assert!(!address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS));
+        }
+
+        // A failure old enough to be retried counts again.
+        address_man.update_set_state(id, AddressState::Failed(now - RETRY_TIME - 1));
+        assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS));
     }
 
     #[test]
