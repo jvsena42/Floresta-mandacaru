@@ -5,8 +5,11 @@
 import pytest
 from requests.exceptions import HTTPError
 
+from test_framework.compact_filters import (
+    add_cfilters_utreexod,
+    add_florestad_synced_with,
+)
 from test_framework.constants import WALLET_ADDRESS
-from test_framework.node import NodeType
 from test_framework.rpc.exceptions import JSONRPCError
 from test_framework.util import wait_until
 
@@ -18,15 +21,7 @@ HISTORICAL_HEIGHT = 1
 def test_compact_filter_rescan(add_node_with_extra_args, node_manager, setup_logging):
     """Find a historical output through filters served by utreexod."""
     log = setup_logging
-    utreexod = add_node_with_extra_args(
-        variant=NodeType.UTREEXOD,
-        extra_args=[
-            f"--miningaddr={WALLET_ADDRESS}",
-            "--utreexoproofindex",
-            "--prune=0",
-            "--cfilters",
-        ],
-    )
+    utreexod = add_cfilters_utreexod(add_node_with_extra_args, [WALLET_ADDRESS])
 
     log.info("Mining blocks before Floresta starts")
     utreexod.rpc.generate(MINE_BLOCKS)
@@ -35,19 +30,8 @@ def test_compact_filter_rescan(add_node_with_extra_args, node_manager, setup_log
     coinbase_output = utreexod.rpc.get_txout(coinbase_txid, 0, False)
     script = coinbase_output["scriptPubKey"]["hex"]
 
-    florestad = add_node_with_extra_args(
-        variant=NodeType.FLORESTAD,
-        extra_args=[],
-    )
-    node_manager.connect_nodes(florestad, utreexod)
-    node_manager.wait_for_sync_nodes()
-
-    wait_until(
-        lambda: any(
-            "COMPACT_FILTERS" in peer["servicesnames"]
-            for peer in florestad.rpc.get_peerinfo()
-        ),
-        error_msg="Floresta did not connect to a compact-filter peer",
+    florestad = add_florestad_synced_with(
+        add_node_with_extra_args, node_manager, utreexod
     )
 
     with pytest.raises((HTTPError, JSONRPCError)):

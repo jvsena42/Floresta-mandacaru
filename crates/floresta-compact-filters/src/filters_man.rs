@@ -22,7 +22,9 @@ use bitcoin::BlockHash;
 use bitcoin::FilterHeader;
 use bitcoin::OutPoint;
 use bitcoin::ScriptBuf;
+use bitcoin::VarInt;
 use bitcoin::bip158::BlockFilter;
+use bitcoin::consensus::Decodable;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_filter::CFHeaders;
 use floresta_chain::BlockConsumer;
@@ -49,6 +51,26 @@ const DEFAULT_RESCAN_PAGE_SIZE: usize = 50;
 const MAX_RESCAN_PAGE_SIZE: usize = 10_000;
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const RESCAN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Bits a BIP158 basic filter spends on each element, at the very least: a Golomb-Rice code with
+/// `P = 19` is a unary quotient of one bit or more followed by a 19-bit remainder.
+const MIN_BITS_PER_FILTER_ELEMENT: u64 = 20;
+
+/// Whether the element count `filter` starts with can fit in the bytes that follow.
+///
+/// Matching multiplies that count by the BIP158 `M` parameter, and rust-bitcoin does it unchecked.
+/// The count comes from a peer, and the filter header we validate filters against was handed to
+/// us by a peer as well, so both can be crafted: the product then overflows, which panics in
+/// builds with overflow checks and silently corrupts the match otherwise.
+fn declares_plausible_element_count(filter: &BlockFilter) -> bool {
+    let mut content = filter.content.as_slice();
+    let Ok(VarInt(elements)) = VarInt::consensus_decode(&mut content) else {
+        // No count to read: matching treats that as an empty filter.
+        return true;
+    };
+
+    elements <= content.len() as u64 * 8 / MIN_BITS_PER_FILTER_ELEMENT
+}
 
 /// Minimal blockchain view required by [`FiltersMan`].
 pub trait FilterChain: Clone + Send + Sync + 'static {
@@ -661,7 +683,10 @@ where
                 }
             };
 
-            for (block_hash, filter) in filters {
+            for (offset, (block_hash, filter)) in filters.into_iter().enumerate() {
+                if !declares_plausible_element_count(&filter) {
+                    return Err(FilterManError::InvalidFilter(batch_start + offset as u32));
+                }
                 let matches = filter.match_any(
                     &block_hash,
                     request.scripts.iter().map(|script| script.as_bytes()),
@@ -1202,6 +1227,23 @@ mod tests {
         }
     }
 
+    /// Decrements `counter` unless it is zero, and tells whether it did.
+    fn take_one(counter: &AtomicUsize) -> bool {
+        let mut current = counter.load(Ordering::Relaxed);
+        while current > 0 {
+            match counter.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+        false
+    }
+
     impl ChainMethods for MockNode {
         type Error = MockError;
 
@@ -1233,13 +1275,7 @@ mod tests {
                 .fetch_max(active, Ordering::Relaxed);
             tokio::task::yield_now().await;
 
-            let result = if self
-                .filter_failures
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |failures| {
-                    failures.checked_sub(1)
-                })
-                .is_ok()
-            {
+            let result = if take_one(&self.filter_failures) {
                 Err(MockError("filter request failed"))
             } else {
                 block_hashes
@@ -1467,6 +1503,59 @@ mod tests {
         .unwrap();
 
         assert_eq!(filter_requests.load(Ordering::Relaxed), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rescan_rejects_filter_with_an_overflowing_element_count() {
+        let (file, _store, chain, _node, block, well_formed) = setup();
+        assert!(declares_plausible_element_count(&well_formed));
+
+        // Claims `u64::MAX` elements, whose product with BIP158's `M` overflows while matching.
+        let mut content = vec![0xff; 9];
+        content.extend_from_slice(&[0; 32]);
+        let crafted = BlockFilter::new(&content);
+        assert!(!declares_plausible_element_count(&crafted));
+
+        // The header chain commits to the crafted filter, so it passes validation.
+        drop(file);
+        let file = NamedTempFile::new().unwrap();
+        let mut store = FlatFilterStore::new(file.path()).unwrap();
+        let block_hash = block.block_hash();
+        store
+            .put_filter_header(
+                block_hash,
+                crafted.filter_header(&FilterHeader::all_zeros()),
+            )
+            .unwrap();
+        store.flush().unwrap();
+        let node = MockNode::new(
+            HashMap::from([(block_hash, block.clone())]),
+            HashMap::from([(block_hash, crafted)]),
+        );
+
+        let script = block.txdata[0].output[0].script_pubkey.clone();
+        let manager = FiltersMan::new(store, node, chain);
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script]))
+            .await
+            .unwrap();
+
+        let failure = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match handle.get_info(ticket).await {
+                    Err(error) => break error,
+                    Ok(status) => assert_ne!(status, RescanStatus::Finished),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(failure, FilterManError::RescanFailed(_)));
+
         task.abort();
     }
 
