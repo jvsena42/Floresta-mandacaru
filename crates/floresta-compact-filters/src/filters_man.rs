@@ -60,6 +60,10 @@ const RESCAN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// of them would otherwise start a synchronization that fails right away.
 const SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How many times a rescan asks again for a batch whose filters failed validation. A retry
+/// usually lands on another peer; a batch that never validates means our header chain is off.
+const MAX_INVALID_BATCH_ATTEMPTS: u32 = 5;
+
 /// Bits a BIP158 basic filter spends on each element, at the very least: a Golomb-Rice code with
 /// `P = 19` is a unary quotient of one bit or more followed by a 19-bit remainder.
 const MIN_BITS_PER_FILTER_ELEMENT: u64 = 20;
@@ -230,6 +234,15 @@ pub enum FilterManError {
     /// A rescan request contained no scripts.
     EmptyRescan,
 
+    /// A rescan reaches past the synchronized filter headers, so its filters can't be validated.
+    FiltersNotSynced {
+        /// Height of the last stored filter header, if any.
+        filters: Option<u32>,
+
+        /// Requested last height.
+        end: u32,
+    },
+
     /// A rescan range is outside the current best chain or is reversed.
     InvalidRescanRange {
         /// Requested first height.
@@ -291,6 +304,10 @@ impl Display for FilterManError {
                 "peer returned {received} compact filters; expected {expected}"
             ),
             Self::EmptyRescan => write!(f, "a rescan requires at least one script"),
+            Self::FiltersNotSynced { filters, end } => write!(
+                f,
+                "filter headers are synchronized up to {filters:?}, can't rescan up to {end} yet"
+            ),
             Self::InvalidRescanRange { start, end, tip } => write!(
                 f,
                 "invalid rescan range {start}..={end}; current tip is {tip}"
@@ -651,6 +668,13 @@ where
             return Err(FilterManError::InvalidRescanRange { start, end, tip });
         }
 
+        // Failing here is synchronous and visible. Past this point the rescan runs detached
+        // and would die on the first filter it has no header to validate against.
+        let filters = self.store.lock()?.get_height()?;
+        if filters.is_none_or(|filters| filters < end) {
+            return Err(FilterManError::FiltersNotSynced { filters, end });
+        }
+
         let page_size = request
             .max_blocks_per_page
             .unwrap_or(DEFAULT_RESCAN_PAGE_SIZE);
@@ -697,13 +721,17 @@ where
             .get_mut(&ticket)
             .ok_or(FilterManError::RescanNotFound(ticket))?;
 
+        // Sampled first: the rescan task sends its last block (or its failure) and only then
+        // drops the sender. Looking at the queue before the closed flag could miss that block
+        // and still see the channel closed, reporting a finished rescan with a match unread.
+        let closed = state.blocks.is_closed();
         if let Some(error) = Self::rescan_failure(state) {
             return Err(FilterManError::RescanFailed(error));
         }
         if !state.blocks.is_empty() {
             return Ok(RescanStatus::Available);
         }
-        if state.blocks.is_closed() {
+        if closed {
             return Ok(RescanStatus::Finished);
         }
         if state.first_status {
@@ -775,6 +803,7 @@ where
         let mut matching_blocks = tracing::enabled!(tracing::Level::DEBUG).then(Vec::new);
         loop {
             let batch_end = batch_start.saturating_add(FILTER_BATCH_SIZE - 1).min(end);
+            let mut invalid_attempts = 0;
             let filters = loop {
                 if blocks.is_closed() {
                     return Err(FilterManError::ManagerStopped);
@@ -796,6 +825,22 @@ where
                             start = batch_start,
                             end = batch_end,
                             "compact-filter rescan batch failed; retrying"
+                        );
+                        tokio::time::sleep(RESCAN_RETRY_INTERVAL).await;
+                    }
+                    // One peer serving bad data shouldn't cost the whole rescan: everything
+                    // scanned so far would be downloaded again by the next attempt.
+                    Err(
+                        error @ (FilterManError::InvalidFilter(_)
+                        | FilterManError::InvalidFilterCount { .. }),
+                    ) if invalid_attempts + 1 < MAX_INVALID_BATCH_ATTEMPTS => {
+                        invalid_attempts += 1;
+                        warn!(
+                            %error,
+                            start = batch_start,
+                            end = batch_end,
+                            attempt = invalid_attempts,
+                            "compact-filter rescan batch failed validation; retrying"
                         );
                         tokio::time::sleep(RESCAN_RETRY_INTERVAL).await;
                     }
@@ -1349,6 +1394,7 @@ mod tests {
         block_requests: Arc<AtomicUsize>,
         filter_requests: Arc<AtomicUsize>,
         filter_failures: Arc<AtomicUsize>,
+        short_filter_responses: Arc<AtomicUsize>,
         active_filter_requests: Arc<AtomicUsize>,
         max_filter_requests: Arc<AtomicUsize>,
         header_requests: Arc<AtomicUsize>,
@@ -1369,6 +1415,7 @@ mod tests {
                 filter_requests: Arc::new(AtomicUsize::new(0)),
                 header_requests: Arc::new(AtomicUsize::new(0)),
                 filter_failures: Arc::new(AtomicUsize::new(0)),
+                short_filter_responses: Arc::new(AtomicUsize::new(0)),
                 active_filter_requests: Arc::new(AtomicUsize::new(0)),
                 max_filter_requests: Arc::new(AtomicUsize::new(0)),
                 checkpoint_requests: Arc::new(AtomicUsize::new(0)),
@@ -1426,6 +1473,8 @@ mod tests {
 
             let result = if take_one(&self.filter_failures) {
                 Err(MockError("filter request failed"))
+            } else if take_one(&self.short_filter_responses) {
+                Ok(Vec::new())
             } else {
                 block_hashes
                     .into_iter()
@@ -1831,6 +1880,73 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(failure, FilterManError::RescanFailed(_)));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rescan_retries_batches_that_fail_validation() {
+        let (_file, store, chain, node, block, _filter) = setup();
+        node.short_filter_responses.store(1, Ordering::Relaxed);
+        let filter_requests = node.filter_requests.clone();
+        let script = block.txdata[0].output[0].script_pubkey.clone();
+        let manager = FiltersMan::new(store, node, chain);
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script]))
+            .await
+            .unwrap();
+
+        let matched = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut matched = Vec::new();
+            loop {
+                matched.extend(handle.get_blocks(ticket).await.unwrap());
+                if handle.get_info(ticket).await.unwrap() == RescanStatus::Finished {
+                    break matched;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(matched, vec![block]);
+        assert_eq!(filter_requests.load(Ordering::Relaxed), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_rescans_past_the_synchronized_filter_headers() {
+        let (_file, store, mut chain, node, block, _filter) = setup();
+        // The chain is one block ahead of the filter-header store.
+        let mut next_block = block.clone();
+        next_block.header.nonce = next_block.header.nonce.wrapping_add(1);
+        Arc::make_mut(&mut chain.hashes).push(next_block.block_hash());
+        let filter_requests = node.filter_requests.clone();
+        let script = block.txdata[0].output[0].script_pubkey.clone();
+        let manager = FiltersMan::new(store, node, chain);
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+
+        assert!(matches!(
+            handle
+                .rescan(RescanRequest::new(vec![script.clone()]))
+                .await,
+            Err(FilterManError::FiltersNotSynced {
+                filters: Some(0),
+                end: 1
+            })
+        ));
+        assert_eq!(filter_requests.load(Ordering::Relaxed), 0);
+
+        // The part that is covered can still be scanned.
+        assert!(
+            handle
+                .rescan(RescanRequest::new(vec![script]).with_range(None, Some(0)))
+                .await
+                .is_ok()
+        );
 
         task.abort();
     }
