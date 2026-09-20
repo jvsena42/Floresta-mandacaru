@@ -51,6 +51,7 @@ use super::address_man::LocalAddress;
 use super::block_proof::Bitmap;
 use super::error::WireError;
 use super::node_context::NodeContext;
+use super::node_handle::FilterDataKind;
 use super::node_handle::NodeResponse;
 use super::node_handle::UserRequest;
 use super::peer::PeerMessages;
@@ -294,7 +295,7 @@ pub struct NodeCommon<Chain: ChainBackend> {
     /// Which peer served the latest filter batches, keyed by the batch's last block hash, so a
     /// consumer that finds a batch invalid can have its sender held accountable. Filters can only
     /// be validated by whoever keeps the filter-header chain, which isn't us.
-    pub(crate) recent_filter_servers: VecDeque<(BlockHash, PeerId)>,
+    pub(crate) recent_filter_servers: VecDeque<(FilterDataKind, BlockHash, PeerId)>,
 
     /// Whether some consumer asked for compact-filter data through the node handle. Until then
     /// we don't spend a peer slot on a compact-filters peer.

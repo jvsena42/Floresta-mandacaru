@@ -38,6 +38,19 @@ use crate::node_interface::NetworkMethods;
 use crate::node_interface::NodeConfigMethods;
 use crate::node_interface::PeerInfo;
 
+/// The compact-filter responses a consumer can report as invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FilterDataKind {
+    /// A `cfilter` batch.
+    Filters,
+
+    /// A `cfheaders` message.
+    Headers,
+
+    /// A `cfcheckpt` message.
+    Checkpoints,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// A request that can be made to the node.
 ///
@@ -117,9 +130,13 @@ pub enum UserRequest {
         block_hashes: Vec<BlockHash>,
     },
 
-    /// The filters we returned for the batch ending at `stop_hash` failed the caller's validation.
-    ReportInvalidCFilters {
-        /// The final block of the offending batch.
+    /// What we returned for the compact-filter request ending at `stop_hash` failed the caller's
+    /// validation.
+    ReportInvalidFilterData {
+        /// Which kind of response it was.
+        kind: FilterDataKind,
+
+        /// The final block of the offending request.
         stop_hash: BlockHash,
     },
 
@@ -202,6 +219,13 @@ pub struct NodeHandle {
 }
 
 impl NodeHandle {
+    async fn report_invalid(&self, kind: FilterDataKind, stop_hash: BlockHash) {
+        // Nothing comes back: the node drops the responder once it has acted on the report.
+        let _ = self
+            .send_request(UserRequest::ReportInvalidFilterData { kind, stop_hash })
+            .await;
+    }
+
     pub fn new(node_sender: UnboundedSender<NodeNotification>) -> Self {
         Self { node_sender }
     }
@@ -269,9 +293,17 @@ impl floresta_common::ChainMethods for NodeHandle {
     }
 
     async fn report_invalid_cfilters(&self, stop_hash: BlockHash) {
-        // Nothing comes back: the node drops the responder once it has acted on the report.
-        let _ = self
-            .send_request(UserRequest::ReportInvalidCFilters { stop_hash })
+        self.report_invalid(FilterDataKind::Filters, stop_hash)
+            .await;
+    }
+
+    async fn report_invalid_cfheaders(&self, stop_hash: BlockHash) {
+        self.report_invalid(FilterDataKind::Headers, stop_hash)
+            .await;
+    }
+
+    async fn report_invalid_cfcheckpt(&self, stop_hash: BlockHash) {
+        self.report_invalid(FilterDataKind::Checkpoints, stop_hash)
             .await;
     }
 

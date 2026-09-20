@@ -56,6 +56,13 @@ where
         user_req: UserRequest,
         responder: oneshot::Sender<NodeResponse>,
     ) {
+        // Needs neither a peer nor an inflight slot, and dropping it while we are busy would let
+        // the peer keep serving us bad filters.
+        if let UserRequest::ReportInvalidFilterData { kind, stop_hash } = user_req {
+            try_and_log!(self.punish_filter_server(kind, stop_hash));
+            return;
+        }
+
         if self.inflight.len() >= RunningNode::MAX_INFLIGHT_REQUESTS {
             return;
         }
@@ -231,10 +238,8 @@ where
                 return;
             }
 
-            UserRequest::ReportInvalidCFilters { stop_hash } => {
-                try_and_log!(self.punish_filter_server(stop_hash));
-                return;
-            }
+            // Handled above, before any of the limits that apply to real requests.
+            UserRequest::ReportInvalidFilterData { .. } => return,
 
             UserRequest::GetCFCheckpt { stop_hash } => {
                 self.wants_compact_filters = true;

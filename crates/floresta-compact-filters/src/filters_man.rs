@@ -319,7 +319,7 @@ impl Display for FilterManError {
             ),
             Self::StaleFilterHeaders(height) => write!(
                 f,
-                "the filter header stored at height {height} is for a block that was reorged out"
+                "no filter header is stored for the best-chain block at height {height} (yet)"
             ),
             Self::InvalidRescanRange { start, end, tip } => write!(
                 f,
@@ -446,7 +446,8 @@ struct RescanState {
     page_size: usize,
     first_status: bool,
     start: u32,
-    end: u32,
+    /// Moves up while a rescan without an explicit end follows the tip.
+    end: Arc<AtomicU32>,
     scanned: Arc<AtomicU32>,
 }
 
@@ -546,8 +547,25 @@ pub struct FiltersMan<Store, Chain, Node> {
     checkpoints: Vec<FilterHeader>,
     published_height: Arc<AtomicU32>,
     default_rescan_start: Option<i32>,
+    /// Height at which a peer's message last contradicted the stored headers. See
+    /// [`FiltersMan::contradicted_at`].
+    suspect_height: Option<u32>,
+    /// The request the current checkpoints came from, to tell the node whose they were.
+    checkpoints_stop_hash: Option<BlockHash>,
     /// When the last synchronization failed, if the last one did.
     last_sync_failure: Option<Instant>,
+    /// Peers' answers that contradicted what we hold, not yet reported to the node.
+    unreported: Vec<Contradicted>,
+}
+
+/// A peer's answer that contradicted the stored headers, identified by its request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Contradicted {
+    /// The `cfheaders` fetched up to this block.
+    Headers(BlockHash),
+
+    /// The `cfcheckpt` fetched through this block.
+    Checkpoints(BlockHash),
 }
 
 impl<Store, Chain, Node> FiltersMan<Store, Chain, Node>
@@ -580,7 +598,10 @@ where
             checkpoints: Vec::new(),
             published_height: Arc::new(AtomicU32::new(published_height)),
             default_rescan_start: None,
+            suspect_height: None,
+            checkpoints_stop_hash: None,
             last_sync_failure: None,
+            unreported: Vec::new(),
         }
     }
 
@@ -592,6 +613,20 @@ where
     pub fn with_default_rescan_start(mut self, height: Option<i32>) -> Self {
         self.default_rescan_start = height;
         self
+    }
+
+    /// Tells the node about the answers that contradicted us since the last time.
+    async fn report_contradictions(&mut self) {
+        for contradicted in std::mem::take(&mut self.unreported) {
+            match contradicted {
+                Contradicted::Headers(stop_hash) => {
+                    self.node.report_invalid_cfheaders(stop_hash).await;
+                }
+                Contradicted::Checkpoints(stop_hash) => {
+                    self.node.report_invalid_cfcheckpt(stop_hash).await;
+                }
+            }
+        }
     }
 
     /// Publishes the store height after a step that may have failed halfway, e.g. between a
@@ -631,6 +666,7 @@ where
             warn!(%error, "initial compact-filter synchronization failed; will retry");
         }
         self.republish_height();
+        self.report_contradictions().await;
 
         let mut sync_interval = tokio::time::interval(SYNC_INTERVAL);
         sync_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -646,18 +682,24 @@ where
                 }
                 connected = self.connected_blocks.recv() => {
                     if let Some(connected) = connected {
+                        let busy_since = Instant::now();
                         if let Err(error) = self.process_connected_block(connected).await {
                             warn!(%error, "failed to build compact filter for connected block");
                         }
                         self.republish_height();
+                        self.report_contradictions().await;
+                        self.excuse_rescan_consumers(busy_since);
                     }
                 }
                 _ = sync_interval.tick() => {
                     self.prune_abandoned_rescans();
+                    let busy_since = Instant::now();
                     if let Err(error) = self.sync().await {
                         warn!(%error, "periodic compact-filter synchronization failed");
                     }
                     self.republish_height();
+                    self.report_contradictions().await;
+                    self.excuse_rescan_consumers(busy_since);
                 }
             }
         }
@@ -750,6 +792,7 @@ where
         let (sender, blocks) = mpsc::channel(page_size);
         let (outcome_sender, outcome) = oneshot::channel();
         let scanned = Arc::new(AtomicU32::new(0));
+        let end = Arc::new(AtomicU32::new(end));
         self.rescans.insert(
             ticket,
             RescanState {
@@ -760,7 +803,7 @@ where
                 page_size,
                 first_status: true,
                 start,
-                end,
+                end: end.clone(),
                 scanned: scanned.clone(),
             },
         );
@@ -771,7 +814,7 @@ where
         let manager = self.request_sender.clone();
         tokio::spawn(async move {
             let result = Self::run_rescan(
-                store, node, chain, request, start, end, &sender, &scanned, &manager,
+                store, node, chain, request, start, &end, &sender, &scanned, &manager,
             )
             .await;
             // After the last block, so an `Ok` outcome means every match is already queued.
@@ -798,7 +841,7 @@ where
                 page_size: 1,
                 first_status: true,
                 start: tip,
-                end: tip,
+                end: Arc::new(AtomicU32::new(tip)),
                 scanned: Arc::new(AtomicU32::new(1)),
             },
         );
@@ -841,7 +884,7 @@ where
 
         Ok(RescanProgress {
             start_height: state.start,
-            end_height: state.end,
+            end_height: state.end.load(Ordering::Relaxed),
             scanned: state.scanned.load(Ordering::Relaxed),
         })
     }
@@ -886,6 +929,15 @@ where
         state.result.clone()
     }
 
+    /// The manager doesn't serve requests while it synchronizes, so time spent there says
+    /// nothing about whether a consumer is still around.
+    fn excuse_rescan_consumers(&mut self, busy_since: Instant) {
+        let busy_for = busy_since.elapsed();
+        for state in self.rescans.values_mut() {
+            state.last_polled += busy_for;
+        }
+    }
+
     /// Drops the rescans whose consumer stopped asking about them.
     fn prune_abandoned_rescans(&mut self) {
         self.rescans.retain(|ticket, state| {
@@ -904,11 +956,18 @@ where
         chain: Chain,
         request: RescanRequest,
         start: u32,
-        end: u32,
+        end_height: &AtomicU32,
         blocks: &mpsc::Sender<Block>,
         scanned: &AtomicU32,
         manager: &mpsc::Sender<ManagerRequest>,
     ) -> Result<(), FilterManError> {
+        // The consumer keeps feeding its wallet the blocks that connect while we scan, and a
+        // wallet only sees a spend if it already knows the output being spent. A block that
+        // connected during the scan and spends an output we deliver later would leave that
+        // output looking unspent forever. So a rescan that wasn't given an end isn't over until
+        // it caught up with the tip: those blocks are delivered again, after the historical ones.
+        let follows_tip = request.end_height.is_none();
+        let mut end = end_height.load(Ordering::Relaxed);
         let mut batch_start = start;
         let mut matching_blocks = tracing::enabled!(tracing::Level::DEBUG).then(Vec::new);
         loop {
@@ -1010,6 +1069,18 @@ where
 
             scanned.store(batch_end - start + 1, Ordering::Relaxed);
 
+            if batch_end == end && follows_tip {
+                let tip = chain.get_height().map_err(FilterManError::chain)?;
+                if tip > end {
+                    debug!(
+                        end,
+                        tip, "compact-filter rescan is catching up with the tip"
+                    );
+                    end = tip;
+                    end_height.store(tip, Ordering::Relaxed);
+                }
+            }
+
             if batch_end == end {
                 if let Some(matching_blocks) = matching_blocks {
                     debug!(
@@ -1062,12 +1133,8 @@ where
             // of the old block matched with the new block's hash gives false negatives.
             for (height, block_hash) in heights.clone().zip(&block_hashes) {
                 // A height missing from the store was just dropped by a reorg or a repair.
-                match store.get_block_hash(height) {
-                    Ok(stored_hash) if stored_hash == *block_hash => {}
-                    Ok(_) | Err(FlatFilterStoreError::NotFound) => {
-                        return Err(FilterManError::StaleFilterHeaders(height));
-                    }
-                    Err(error) => return Err(error.into()),
+                if !Self::stores_header_for(&mut *store, height, *block_hash)? {
+                    return Err(FilterManError::StaleFilterHeaders(height));
                 }
             }
             heights
@@ -1096,8 +1163,12 @@ where
             let (first, expected, received_filters) = response
                 .map_err(FilterManError::Task)?
                 .map_err(FilterManError::node)?;
-            let validated =
-                Self::accept_filters(&store, start + first as u32, expected, received_filters);
+            let validated = Self::accept_filters(
+                &store,
+                start + first as u32,
+                &block_hashes[first..first + expected],
+                received_filters,
+            );
             let accepted = match validated {
                 Ok(accepted) => accepted,
                 Err(error) => {
@@ -1136,9 +1207,10 @@ where
     fn accept_filters(
         store: &Mutex<Store>,
         first_height: u32,
-        expected: usize,
+        block_hashes: &[BlockHash],
         received: Vec<BlockFilter>,
     ) -> Result<Vec<BlockFilter>, FilterManError> {
+        let expected = block_hashes.len();
         if received.len() != expected {
             return Err(FilterManError::InvalidFilterCount {
                 expected,
@@ -1149,6 +1221,12 @@ where
         let mut store = store.lock()?;
         for (offset, filter) in received.iter().enumerate() {
             let height = first_height + offset as u32;
+            // The store may have been truncated, or refilled for another branch, during the
+            // round trip. That isn't the peer's fault and isn't fatal: the caller retries once
+            // the store caught up.
+            if !Self::stores_header_for(&mut *store, height, block_hashes[offset])? {
+                return Err(FilterManError::StaleFilterHeaders(height));
+            }
             Self::validate_filter(&mut *store, height, filter)?;
             // A crafted header can vouch for a crafted filter, so this isn't implied by the above.
             if !declares_plausible_element_count(filter) {
@@ -1160,6 +1238,19 @@ where
         }
 
         Ok(received)
+    }
+
+    /// Whether `store` holds a filter header at `height`, and it is the one for `block_hash`.
+    fn stores_header_for(
+        store: &mut Store,
+        height: u32,
+        block_hash: BlockHash,
+    ) -> Result<bool, FilterManError> {
+        match store.get_block_hash(height) {
+            Ok(stored_hash) => Ok(stored_hash == block_hash),
+            Err(FlatFilterStoreError::NotFound) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn validate_filter(
@@ -1266,8 +1357,11 @@ where
             }
             Some(stored_height) if stored_height.saturating_add(1) == height => {
                 if expected_checkpoint.is_some_and(|expected| expected != filter_header) {
+                    // Either the checkpoint or the headers below are wrong. The next
+                    // synchronization compares fresh checkpoints with what is stored.
                     drop(store);
-                    self.distrust_from(height)?;
+                    let by = self.checkpoints_stop_hash.map(Contradicted::Checkpoints);
+                    self.contradicted_at(height, by)?;
                     return Err(FilterManError::InvalidHeaders(format!(
                         "locally built filter disagrees with checkpoint at height {height}"
                     )));
@@ -1334,6 +1428,8 @@ where
             self.apply_headers(start, stop, stop_hash, headers)?;
         }
 
+        // Fresh checkpoints and every batch agreed with what is stored.
+        self.suspect_height = None;
         let height = self.store.lock()?.get_height()?;
         info!(?height, "compact filter headers synchronized");
         Ok(())
@@ -1412,6 +1508,7 @@ where
         }
 
         self.checkpoints = response.filter_headers;
+        self.checkpoints_stop_hash = Some(stop_hash);
         Ok(())
     }
 
@@ -1443,6 +1540,36 @@ where
         self.publish_height()
     }
 
+    /// A message from a peer contradicts the headers stored at `height`.
+    ///
+    /// The stored chain has been checked before (against an earlier checkpoint set, and by every
+    /// filter validated against it), so one message isn't enough to throw it away: a single
+    /// lying `cfcheckpt` would make us delete and download the whole chain again. The first
+    /// strike only forgets the checkpoints, so the next synchronization fetches them again. If
+    /// what it gets contradicts the same height, the headers go.
+    ///
+    /// Either way the peer behind `by` gets reported: we can't tell whether it or the peer our
+    /// headers came from is wrong, which is why a report costs a peer half a ban, not a whole
+    /// one. It also keeps a liar from stalling us by contradicting a different height each time.
+    fn contradicted_at(
+        &mut self,
+        height: u32,
+        by: Option<Contradicted>,
+    ) -> Result<(), FilterManError> {
+        self.unreported.extend(by);
+        self.checkpoints.clear();
+        if self.suspect_height.replace(height) != Some(height) {
+            warn!(
+                height,
+                "a peer contradicts the stored compact filter headers; asking again"
+            );
+            return Ok(());
+        }
+
+        self.suspect_height = None;
+        self.distrust_from(height)
+    }
+
     fn verify_stored_checkpoints(&mut self) -> Result<(), FilterManError> {
         let Some(stored_tip) = self.store.lock()?.get_height()? else {
             return Ok(());
@@ -1459,7 +1586,8 @@ where
                 break;
             }
             if self.store.lock()?.get_filter_header(height)? != *checkpoint {
-                self.distrust_from(height)?;
+                let by = self.checkpoints_stop_hash.map(Contradicted::Checkpoints);
+                self.contradicted_at(height, by)?;
                 return Err(FilterManError::InvalidHeaders(format!(
                     "stored filter header disagrees with checkpoint at height {height}"
                 )));
@@ -1526,7 +1654,7 @@ where
         if response.previous_filter_header != previous_header {
             // Either the peer lies or what we stored is wrong; a fresh start settles it.
             if start > 0 {
-                self.distrust_from(start)?;
+                self.contradicted_at(start, Some(Contradicted::Headers(stop_hash)))?;
             }
             return Err(FilterManError::InvalidHeaders(format!(
                 "filter headers do not connect at height {start}"
@@ -2431,6 +2559,92 @@ mod tests {
         );
     }
 
+    /// A chain whose tip the test can move while a rescan runs.
+    #[derive(Clone)]
+    struct GrowingChain {
+        hashes: Arc<Mutex<Vec<BlockHash>>>,
+    }
+
+    impl FilterChain for GrowingChain {
+        type Error = MockError;
+
+        fn get_height(&self) -> Result<u32, Self::Error> {
+            Ok(self.hashes.lock().unwrap().len() as u32 - 1)
+        }
+
+        fn get_block_hash(&self, height: u32) -> Result<BlockHash, Self::Error> {
+            self.hashes
+                .lock()
+                .unwrap()
+                .get(height as usize)
+                .copied()
+                .ok_or(MockError("unknown height"))
+        }
+    }
+
+    #[tokio::test]
+    async fn rescan_without_an_end_catches_up_with_blocks_connected_meanwhile() {
+        let (_file, store, first_chain, mut node, block, _filter) = setup();
+        let script = block.txdata[0].output[0].script_pubkey.clone();
+        // A child of the stored block, paying to the same script.
+        let mut second_block = block.clone();
+        second_block.header.prev_blockhash = block.block_hash();
+        let second_hash = second_block.block_hash();
+        let second_filter = BlockFilter::new_script_filter(&second_block, |outpoint| {
+            Err::<ScriptBuf, _>(bitcoin::bip158::Error::UtxoMissing(*outpoint))
+        })
+        .unwrap();
+        Arc::make_mut(&mut node.blocks).insert(second_hash, second_block.clone());
+        Arc::make_mut(&mut node.filters).insert(second_hash, second_filter);
+
+        // The rescan starts with the tip at height 0. Its first request fails, which holds it
+        // for a second: enough for the second block to connect.
+        node.filter_failures.store(1, Ordering::Relaxed);
+        let chain = GrowingChain {
+            hashes: Arc::new(Mutex::new(vec![first_chain.hashes[0]])),
+        };
+        let manager = FiltersMan::new(store, node, chain.clone());
+        let handle = manager.get_handle();
+        let new_blocks = manager.block_consumer();
+        let task = tokio::spawn(manager.main_loop());
+
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script.clone()]))
+            .await
+            .unwrap();
+        // The second block connects: the chain moves and the manager is told, as in production.
+        chain.hashes.lock().unwrap().push(second_hash);
+        new_blocks.on_block(&second_block, 1, Some(&HashMap::new()));
+
+        let (matched, progress) = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut matched = Vec::new();
+            loop {
+                matched.extend(handle.get_blocks(ticket).await.unwrap());
+                let progress = handle.get_progress(ticket).await.unwrap();
+                if handle.get_info(ticket).await.unwrap() == RescanStatus::Finished {
+                    break (matched, progress);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Delivered in chain order, the late block after the historical one.
+        assert_eq!(matched.len(), 2);
+        assert_eq!(matched[1], second_block);
+        assert_eq!(progress.end_height, 1);
+
+        // A rescan that names its end stays within it.
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script]).with_range(None, Some(0)))
+            .await
+            .unwrap();
+        assert_eq!(drain_rescan(&handle, ticket).await.0.len(), 1);
+
+        task.abort();
+    }
+
     #[tokio::test]
     async fn finished_and_cancelled_rescans_are_forgotten() {
         let (_file, store, chain, node, second_block) = setup_two_blocks();
@@ -2477,7 +2691,7 @@ mod tests {
                 page_size: 1,
                 first_status: true,
                 start: 0,
-                end: 0,
+                end: Arc::new(AtomicU32::new(0)),
                 scanned: Arc::new(AtomicU32::new(0)),
             }
         };
@@ -2566,19 +2780,141 @@ mod tests {
         };
         let node = MockNode::new(HashMap::new(), HashMap::new());
         let mut manager = FiltersMan::new(store, node, chain);
-        manager.checkpoints = vec![FilterHeader::from_byte_array([1; 32])];
+        let lying = vec![FilterHeader::from_byte_array([1; 32])];
 
+        // First strike: one message isn't worth the whole chain. Only the checkpoints go, so
+        // the next synchronization asks for them again.
+        manager.checkpoints = lying.clone();
+        manager.checkpoints_stop_hash = Some(mock_block_hash(7));
         assert!(matches!(
             manager.verify_stored_checkpoints(),
             Err(FilterManError::InvalidHeaders(_))
         ));
+        assert!(manager.checkpoints.is_empty());
+        // Whoever served those checkpoints gets reported, whichever side turns out to be wrong.
+        assert_eq!(
+            manager.unreported,
+            vec![Contradicted::Checkpoints(mock_block_hash(7))]
+        );
+        assert_eq!(
+            manager.store.lock().unwrap().get_height().unwrap(),
+            Some(CHECKPOINT_INTERVAL + 5)
+        );
 
-        // Nothing below the first checkpoint can be trusted, so everything goes; and the next
-        // synchronization asks for the checkpoints again instead of failing the same way.
+        // Second strike at the same height: nothing below the first checkpoint can be trusted,
+        // so everything goes.
+        manager.checkpoints = lying;
+        assert!(manager.verify_stored_checkpoints().is_err());
         assert_eq!(manager.store.lock().unwrap().get_height().unwrap(), None);
         assert!(manager.checkpoints.is_empty());
         assert_eq!(manager.get_handle().get_height(), None);
         assert!(manager.verify_stored_checkpoints().is_ok());
+    }
+
+    #[test]
+    fn filters_arriving_after_the_store_was_truncated_are_retryable() {
+        let (_file, mut store, _chain, _node, block, filter) = setup();
+        store.truncate(None).unwrap();
+
+        let result = FiltersMan::<FlatFilterStore, MockChain, MockNode>::accept_filters(
+            &Mutex::new(store),
+            0,
+            &[block.block_hash()],
+            vec![filter],
+        );
+
+        // Not `Store(NotFound)`, which would end the rescan, nor `InvalidFilter`, which would
+        // blame the peer.
+        assert!(matches!(result, Err(FilterManError::StaleFilterHeaders(0))));
+    }
+
+    /// `block` and a child of it, with the `cfheaders` a peer would serve for `heights`.
+    fn linked_pair(block: &Block, first_height: u32) -> (Block, BlockFilter, CFHeaders) {
+        let mut child = block.clone();
+        child.header.prev_blockhash = block.block_hash();
+        let filter_of = |block: &Block| {
+            BlockFilter::new_script_filter(block, |outpoint| {
+                Err::<ScriptBuf, _>(bitcoin::bip158::Error::UtxoMissing(*outpoint))
+            })
+            .unwrap()
+        };
+        let parent_filter = filter_of(block);
+        let child_filter = filter_of(&child);
+        let parent_header = parent_filter.filter_header(&FilterHeader::all_zeros());
+
+        let response = if first_height == 0 {
+            CFHeaders {
+                filter_type: BASIC_FILTER_TYPE,
+                stop_hash: child.block_hash(),
+                previous_filter_header: FilterHeader::all_zeros(),
+                filter_hashes: vec![
+                    bitcoin::FilterHash::hash(&parent_filter.content),
+                    bitcoin::FilterHash::hash(&child_filter.content),
+                ],
+            }
+        } else {
+            CFHeaders {
+                filter_type: BASIC_FILTER_TYPE,
+                stop_hash: child.block_hash(),
+                previous_filter_header: parent_header,
+                filter_hashes: vec![bitcoin::FilterHash::hash(&child_filter.content)],
+            }
+        };
+        (child, child_filter, response)
+    }
+
+    #[tokio::test]
+    async fn connected_block_whose_parent_is_still_missing_after_a_sync_is_refused() {
+        let (_file, store, mut chain, mut node, block, _filter) = setup();
+        let (child, _, response) = linked_pair(&block, 1);
+        // The chain and the peers agree on `child` at height 1, so the sync succeeds. The block
+        // we are handed claims another parent than the one stored at height 0.
+        Arc::make_mut(&mut chain.hashes).push(child.block_hash());
+        Arc::make_mut(&mut node.header_responses).insert((1, child.block_hash()), response);
+        let mut orphan = child.clone();
+        orphan.header.prev_blockhash = child.block_hash();
+        let mut manager = FiltersMan::new(store, node, chain);
+
+        let result = manager
+            .process_connected_block(ConnectedBlock {
+                block: orphan,
+                height: 1,
+                spent_utxos: HashMap::new(),
+            })
+            .await;
+
+        assert!(matches!(result, Err(FilterManError::InvalidHeaders(_))));
+    }
+
+    #[tokio::test]
+    async fn connected_block_is_accepted_once_a_sync_repaired_its_parent() {
+        let (file, _store, mut chain, mut node, block, _filter) = setup();
+        let (child, child_filter, response) = linked_pair(&block, 0);
+        Arc::make_mut(&mut chain.hashes).push(child.block_hash());
+        Arc::make_mut(&mut node.header_responses).insert((0, child.block_hash()), response);
+        // The store describes a branch that was reorged out: another block at height 0.
+        drop(file);
+        let file = NamedTempFile::new().unwrap();
+        let mut store = FlatFilterStore::new(file.path()).unwrap();
+        store
+            .put_filter_header(mock_block_hash(99), FilterHeader::all_zeros())
+            .unwrap();
+        store.flush().unwrap();
+        let mut manager = FiltersMan::new(store, node, chain);
+
+        manager
+            .process_connected_block(ConnectedBlock {
+                block: child.clone(),
+                height: 1,
+                spent_utxos: HashMap::new(),
+            })
+            .await
+            .unwrap();
+
+        let mut store = manager.store.lock().unwrap();
+        assert_eq!(store.get_block_hash(0).unwrap(), block.block_hash());
+        assert_eq!(store.get_block_hash(1).unwrap(), child.block_hash());
+        assert_eq!(store.get_filter(1).unwrap(), Some(child_filter));
     }
 
     #[tokio::test]
@@ -2605,6 +2941,36 @@ mod tests {
             manager.process_connected_block(connected()).await.unwrap();
         }
         assert_eq!(header_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn local_filter_replaces_a_stored_header_it_contradicts() {
+        let (_file, mut store, mut chain, node, block, filter) = setup();
+        let (child, child_filter, _) = linked_pair(&block, 1);
+        Arc::make_mut(&mut chain.hashes).push(child.block_hash());
+        // A peer gave us a wrong header for `child`.
+        store
+            .put_filter_header(child.block_hash(), FilterHeader::from_byte_array([7; 32]))
+            .unwrap();
+        store.flush().unwrap();
+        let mut manager = FiltersMan::new(store, node, chain);
+        manager.checkpoints = vec![FilterHeader::all_zeros()];
+
+        manager
+            .process_connected_block(ConnectedBlock {
+                block: child.clone(),
+                height: 1,
+                spent_utxos: HashMap::new(),
+            })
+            .await
+            .unwrap();
+
+        let parent_header = filter.filter_header(&FilterHeader::all_zeros());
+        assert_eq!(
+            manager.store.lock().unwrap().get_filter_header(1).unwrap(),
+            child_filter.filter_header(&parent_header)
+        );
+        assert!(manager.checkpoints.is_empty());
     }
 
     #[test]

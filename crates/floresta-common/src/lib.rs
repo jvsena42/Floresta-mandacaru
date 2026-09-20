@@ -75,6 +75,26 @@ pub trait ChainMethods {
         async {}
     }
 
+    /// Like [`report_invalid_cfilters`](Self::report_invalid_cfilters), for the `cfheaders`
+    /// returned by [`get_cfilters_headers`](Self::get_cfilters_headers) up to `stop_hash`.
+    fn report_invalid_cfheaders(
+        &self,
+        stop_hash: bitcoin::BlockHash,
+    ) -> impl core::future::Future<Output = ()> + Send {
+        let _ = stop_hash;
+        async {}
+    }
+
+    /// Like [`report_invalid_cfilters`](Self::report_invalid_cfilters), for the checkpoints
+    /// returned by [`get_cfcheckpt`](Self::get_cfcheckpt) through `stop_hash`.
+    fn report_invalid_cfcheckpt(
+        &self,
+        stop_hash: bitcoin::BlockHash,
+    ) -> impl core::future::Future<Output = ()> + Send {
+        let _ = stop_hash;
+        async {}
+    }
+
     /// Returns BIP157 filter-header checkpoints through `stop_hash`.
     fn get_cfcheckpt(
         &self,

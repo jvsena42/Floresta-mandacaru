@@ -491,6 +491,11 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
         transaction_to_cache: CachedTransaction,
     ) {
         if let Some(address) = self.address_map.get_mut(&hash) {
+            // Whether the address changed and has to be written back. A transaction we already
+            // list can still change it: one that spends from and pays to the same script, or
+            // pays it twice, touches the address once per input and output.
+            let mut changed = false;
+
             // This transaction is spending from this address, so we should remove the UTXO
             if is_spend {
                 assert!(value <= address.balance);
@@ -507,6 +512,7 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                     let utxo = address.utxos.remove(idx);
                     self.utxo_index.remove(&utxo);
                 }
+                changed = true;
             } else {
                 // This transaction is creating a new utxo for this address
                 let utxo = OutPoint {
@@ -520,11 +526,15 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                     address.utxos.push(utxo);
                     self.utxo_index.insert(utxo, hash);
                     address.balance += value;
+                    changed = true;
                 }
             }
 
             if !address.transactions.contains(&transaction_to_cache.hash) {
                 address.transactions.push(transaction_to_cache.hash);
+                changed = true;
+            }
+            if changed {
                 self.database.update(address);
             }
         }
@@ -1079,6 +1089,82 @@ mod test {
 
         assert_eq!(address.transactions.len(), 2);
         assert_eq!(address.utxos.len(), 1);
+    }
+
+    #[test]
+    fn test_redelivered_self_spend_is_persisted() {
+        use bitcoin::Amount;
+        use bitcoin::Block;
+        use bitcoin::OutPoint;
+        use bitcoin::Sequence;
+        use bitcoin::Transaction;
+        use bitcoin::TxIn;
+        use bitcoin::TxOut;
+        use bitcoin::Witness;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version;
+
+        let spk = ScriptBuf::from_hex("00142b6a2924aa9b1b115d1ac3098b0ba0e6ed510f2a")
+            .expect("Valid address");
+        let script_hash = get_spk_hash(&spk);
+        let pay_to_us = |value| TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: spk.clone(),
+        };
+        let spending = |previous_output| TxIn {
+            previous_output,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        };
+        let transaction = |input, output| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![input],
+            output: vec![output],
+        };
+        let block_with = |tx| {
+            let mut block: Block = deserialize_from_str(BLOCK_FIRST_UTXO);
+            block.txdata = vec![tx];
+            block
+        };
+
+        // `funding` pays us; `self_spend` spends that output and pays the change back to the
+        // same script.
+        let funding = transaction(spending(OutPoint::null()), pay_to_us(10_000));
+        let funding_outpoint = OutPoint {
+            txid: funding.compute_txid(),
+            vout: 0,
+        };
+        let self_spend = transaction(spending(funding_outpoint), pay_to_us(9_000));
+        let change_outpoint = OutPoint {
+            txid: self_spend.compute_txid(),
+            vout: 0,
+        };
+
+        let cache = get_test_cache();
+        cache.cache_address(spk);
+
+        // The spending block connects while a rescan is still on its way to the funding one,
+        // so the spend goes unnoticed; the rescan then delivers both, in order.
+        cache.block_process(&block_with(self_spend.clone()), 2);
+        cache.block_process(&block_with(funding), 1);
+        cache.block_process(&block_with(self_spend), 2);
+
+        let inner = cache.inner.read().unwrap();
+        let in_memory = inner.address_map.get(&script_hash).unwrap();
+        assert_eq!(in_memory.utxos, vec![change_outpoint]);
+        assert_eq!(in_memory.balance, 9_000);
+
+        // What a restart would load. The spend was for a transaction the address already
+        // listed (it received its change first), which used to skip the write.
+        let persisted = crate::AddressCacheDatabase::load(&inner.database).unwrap();
+        let persisted = persisted
+            .iter()
+            .find(|address| address.script_hash == script_hash)
+            .unwrap();
+        assert_eq!(persisted.utxos, vec![change_outpoint]);
+        assert_eq!(persisted.balance, 9_000);
     }
 
     #[test]
