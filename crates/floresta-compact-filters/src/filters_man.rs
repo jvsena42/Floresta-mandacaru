@@ -64,6 +64,10 @@ const SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 /// usually lands on another peer; a batch that never validates means our header chain is off.
 const MAX_INVALID_BATCH_ATTEMPTS: u32 = 5;
 
+/// A rescan nobody asked about for this long was abandoned by its consumer (consumers poll many
+/// times per second). It is dropped so its task stops instead of holding a page of blocks forever.
+const RESCAN_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// Bits a BIP158 basic filter spends on each element, at the very least: a Golomb-Rice code with
 /// `P = 19` is a unary quotient of one bit or more followed by a 19-bit remainder.
 const MIN_BITS_PER_FILTER_ELEMENT: u64 = 20;
@@ -243,6 +247,10 @@ pub enum FilterManError {
         end: u32,
     },
 
+    /// The stored filter header at this height is for a block that left the best chain. The
+    /// store catches up on its own, so the request can be retried.
+    StaleFilterHeaders(u32),
+
     /// A rescan range is outside the current best chain or is reversed.
     InvalidRescanRange {
         /// Requested first height.
@@ -307,6 +315,10 @@ impl Display for FilterManError {
             Self::FiltersNotSynced { filters, end } => write!(
                 f,
                 "filter headers are synchronized up to {filters:?}, can't rescan up to {end} yet"
+            ),
+            Self::StaleFilterHeaders(height) => write!(
+                f,
+                "the filter header stored at height {height} is for a block that was reorged out"
             ),
             Self::InvalidRescanRange { start, end, tip } => write!(
                 f,
@@ -409,6 +421,9 @@ enum ManagerRequest {
         ticket: RescanTicket,
         response: oneshot::Sender<Result<RescanProgress, FilterManError>>,
     },
+    CancelRescan {
+        ticket: RescanTicket,
+    },
     Filter {
         height: u32,
         response: oneshot::Sender<Result<BlockFilter, FilterManError>>,
@@ -417,8 +432,12 @@ enum ManagerRequest {
 
 struct RescanState {
     blocks: mpsc::Receiver<Block>,
-    failure: oneshot::Receiver<String>,
-    failure_message: Option<String>,
+    /// Sent by the rescan task as its last action, after its last block.
+    outcome: oneshot::Receiver<Result<(), String>>,
+    /// The received `outcome`, kept because the channel only yields it once.
+    result: Option<Result<(), String>>,
+    /// Last time the consumer asked about this rescan, to tell abandoned ones apart.
+    last_polled: Instant,
     page_size: usize,
     first_status: bool,
     start: u32,
@@ -453,6 +472,15 @@ impl FilterManHandle {
         let (response, receiver) = oneshot::channel();
         self.send(ManagerRequest::RescanBlocks { ticket, response }, receiver)
             .await
+    }
+
+    /// Stops `ticket` and frees what it holds. Consumers that give up on a rescan before it
+    /// reports [`RescanStatus::Finished`] or a failure should call this.
+    pub async fn cancel_rescan(&self, ticket: RescanTicket) {
+        let _ = self
+            .sender
+            .send(ManagerRequest::CancelRescan { ticket })
+            .await;
     }
 
     /// Returns how far `ticket` has gone through its height range.
@@ -561,6 +589,15 @@ where
         self
     }
 
+    /// Publishes the store height after a step that may have failed halfway, e.g. between a
+    /// truncation and the write that follows it. Whatever mutation path ran, and however it
+    /// ended, the published height can't stay ahead of the store.
+    fn republish_height(&self) {
+        if let Err(error) = self.publish_height() {
+            warn!(%error, "could not publish the compact filter header height");
+        }
+    }
+
     fn publish_height(&self) -> Result<(), FilterManError> {
         let height = self.store.lock()?.get_height()?;
         self.published_height
@@ -588,6 +625,7 @@ where
         if let Err(error) = self.sync().await {
             warn!(%error, "initial compact-filter synchronization failed; will retry");
         }
+        self.republish_height();
 
         let mut sync_interval = tokio::time::interval(SYNC_INTERVAL);
         sync_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -599,25 +637,28 @@ where
                     let Some(request) = request else {
                         return Ok(());
                     };
-                    self.handle_request(request).await;
+                    self.handle_request(request);
                 }
                 connected = self.connected_blocks.recv() => {
                     if let Some(connected) = connected {
                         if let Err(error) = self.process_connected_block(connected).await {
                             warn!(%error, "failed to build compact filter for connected block");
                         }
+                        self.republish_height();
                     }
                 }
                 _ = sync_interval.tick() => {
+                    self.prune_abandoned_rescans();
                     if let Err(error) = self.sync().await {
                         warn!(%error, "periodic compact-filter synchronization failed");
                     }
+                    self.republish_height();
                 }
             }
         }
     }
 
-    async fn handle_request(&mut self, request: ManagerRequest) {
+    fn handle_request(&mut self, request: ManagerRequest) {
         match request {
             ManagerRequest::Rescan { request, response } => {
                 let _ = response.send(self.start_rescan(request));
@@ -631,15 +672,20 @@ where
             ManagerRequest::RescanProgress { ticket, response } => {
                 let _ = response.send(self.rescan_progress(ticket));
             }
+            ManagerRequest::CancelRescan { ticket } => {
+                // Dropping the receiver is what stops the rescan task.
+                self.rescans.remove(&ticket);
+            }
             ManagerRequest::Filter { height, response } => {
-                let result = Self::fetch_filter(
-                    self.store.clone(),
-                    self.node.clone(),
-                    self.chain.clone(),
-                    height,
-                )
-                .await;
-                let _ = response.send(result);
+                // Fetched off the manager loop: the round trip to a peer would otherwise hold
+                // back every other request.
+                let store = self.store.clone();
+                let node = self.node.clone();
+                let chain = self.chain.clone();
+                tokio::spawn(async move {
+                    let result = Self::fetch_filter(store, node, chain, height).await;
+                    let _ = response.send(result);
+                });
             }
         }
     }
@@ -656,12 +702,19 @@ where
             Some(height) if height >= 0 => height.unsigned_abs(),
             Some(offset) => tip.saturating_sub(offset.unsigned_abs()),
         };
-        // A range that ends before the default start is scanned from genesis: the caller asked
-        // for blocks the default exists to skip, so it doesn't apply.
         let default_start = if default_start <= end {
             default_start
-        } else {
+        } else if request.end_height.is_some() {
+            // The caller named an end before the default start: they asked for blocks the
+            // default exists to skip, so it doesn't apply and the range starts at genesis.
             0
+        } else if request.start_height.is_none() {
+            // Nothing was named and the chain hasn't reached the default start. No block can
+            // hold wallet history yet; scanning from genesis instead would download every
+            // filter there is for nothing.
+            return Ok(self.finished_rescan(tip));
+        } else {
+            default_start
         };
         let start = request.start_height.unwrap_or(default_start);
         if start > end || end > tip {
@@ -685,14 +738,15 @@ where
         let ticket = RescanTicket(self.next_ticket);
         self.next_ticket = self.next_ticket.wrapping_add(1);
         let (sender, blocks) = mpsc::channel(page_size);
-        let (failure_sender, failure) = oneshot::channel();
+        let (outcome_sender, outcome) = oneshot::channel();
         let scanned = Arc::new(AtomicU32::new(0));
         self.rescans.insert(
             ticket,
             RescanState {
                 blocks,
-                failure,
-                failure_message: None,
+                outcome,
+                result: None,
+                last_polled: Instant::now(),
                 page_size,
                 first_status: true,
                 start,
@@ -705,14 +759,38 @@ where
         let node = self.node.clone();
         let chain = self.chain.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                Self::run_rescan(store, node, chain, request, start, end, &sender, &scanned).await
-            {
-                let _ = failure_sender.send(error.to_string());
-            }
+            let result =
+                Self::run_rescan(store, node, chain, request, start, end, &sender, &scanned).await;
+            // After the last block, so an `Ok` outcome means every match is already queued.
+            let _ = outcome_sender.send(result.map_err(|error| error.to_string()));
         });
 
         Ok(ticket)
+    }
+
+    /// Registers a rescan that has nothing to scan, so the consumer sees it finish right away.
+    fn finished_rescan(&mut self, tip: u32) -> RescanTicket {
+        let ticket = RescanTicket(self.next_ticket);
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        let (_, blocks) = mpsc::channel(1);
+        let (outcome_sender, outcome) = oneshot::channel();
+        let _ = outcome_sender.send(Ok(()));
+        self.rescans.insert(
+            ticket,
+            RescanState {
+                blocks,
+                outcome,
+                result: None,
+                last_polled: Instant::now(),
+                page_size: 1,
+                first_status: true,
+                start: tip,
+                end: tip,
+                scanned: Arc::new(AtomicU32::new(1)),
+            },
+        );
+
+        ticket
     }
 
     fn rescan_status(&mut self, ticket: RescanTicket) -> Result<RescanStatus, FilterManError> {
@@ -720,33 +798,33 @@ where
             .rescans
             .get_mut(&ticket)
             .ok_or(FilterManError::RescanNotFound(ticket))?;
+        state.last_polled = Instant::now();
 
-        // Sampled first: the rescan task sends its last block (or its failure) and only then
-        // drops the sender. Looking at the queue before the closed flag could miss that block
-        // and still see the channel closed, reporting a finished rescan with a match unread.
-        let closed = state.blocks.is_closed();
-        if let Some(error) = Self::rescan_failure(state) {
-            return Err(FilterManError::RescanFailed(error));
-        }
-        if !state.blocks.is_empty() {
-            return Ok(RescanStatus::Available);
-        }
-        if closed {
-            return Ok(RescanStatus::Finished);
-        }
-        if state.first_status {
-            state.first_status = false;
-            return Ok(RescanStatus::Started);
-        }
+        // The outcome is sampled before the queue: the rescan task sends it after its last
+        // block, so once it reads `Ok` an empty queue really means every match was consumed.
+        // Anything short of an explicit `Ok` (a failure, or a task that died) is not a finish.
+        let status = match Self::rescan_outcome(state) {
+            Some(Err(error)) => Err(FilterManError::RescanFailed(error)),
+            _ if !state.blocks.is_empty() => return Ok(RescanStatus::Available),
+            Some(Ok(())) => Ok(RescanStatus::Finished),
+            None if state.first_status => {
+                state.first_status = false;
+                return Ok(RescanStatus::Started);
+            }
+            None => return Ok(RescanStatus::Waiting),
+        };
 
-        Ok(RescanStatus::Waiting)
+        // Reported to the consumer, so the rescan is over.
+        self.rescans.remove(&ticket);
+        status
     }
 
     fn rescan_progress(&mut self, ticket: RescanTicket) -> Result<RescanProgress, FilterManError> {
         let state = self
             .rescans
-            .get(&ticket)
+            .get_mut(&ticket)
             .ok_or(FilterManError::RescanNotFound(ticket))?;
+        state.last_polled = Instant::now();
 
         Ok(RescanProgress {
             start_height: state.start,
@@ -760,12 +838,14 @@ where
             .rescans
             .get_mut(&ticket)
             .ok_or(FilterManError::RescanNotFound(ticket))?;
-        let mut blocks = Vec::with_capacity(state.page_size);
+        state.last_polled = Instant::now();
 
-        if let Some(error) = Self::rescan_failure(state) {
+        if let Some(Err(error)) = Self::rescan_outcome(state) {
+            self.rescans.remove(&ticket);
             return Err(FilterManError::RescanFailed(error));
         }
 
+        let mut blocks = Vec::with_capacity(state.page_size);
         for _ in 0..state.page_size {
             match state.blocks.try_recv() {
                 Ok(block) => blocks.push(block),
@@ -778,14 +858,30 @@ where
         Ok(blocks)
     }
 
-    fn rescan_failure(state: &mut RescanState) -> Option<String> {
-        if state.failure_message.is_none() {
-            if let Ok(error) = state.failure.try_recv() {
-                state.failure_message = Some(error);
-            }
+    fn rescan_outcome(state: &mut RescanState) -> Option<Result<(), String>> {
+        if state.result.is_none() {
+            state.result = match state.outcome.try_recv() {
+                Ok(outcome) => Some(outcome),
+                Err(oneshot::error::TryRecvError::Empty) => None,
+                // The task went away without an outcome: it panicked or was aborted.
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    Some(Err("rescan task stopped unexpectedly".to_owned()))
+                }
+            };
         }
 
-        state.failure_message.clone()
+        state.result.clone()
+    }
+
+    /// Drops the rescans whose consumer stopped asking about them.
+    fn prune_abandoned_rescans(&mut self) {
+        self.rescans.retain(|ticket, state| {
+            let abandoned = state.last_polled.elapsed() > RESCAN_IDLE_TIMEOUT;
+            if abandoned {
+                warn!(?ticket, "dropping abandoned compact-filter rescan");
+            }
+            !abandoned
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -819,7 +915,9 @@ where
                 .await
                 {
                     Ok(filters) => break filters,
-                    Err(FilterManError::Node(error)) => {
+                    Err(
+                        error @ (FilterManError::Node(_) | FilterManError::StaleFilterHeaders(_)),
+                    ) => {
                         warn!(
                             %error,
                             start = batch_start,
@@ -861,6 +959,9 @@ where
                 }
 
                 let block = loop {
+                    if blocks.is_closed() {
+                        return Err(FilterManError::ManagerStopped);
+                    }
                     match node.get_block(block_hash).await {
                         Ok(Some(block)) => break block,
                         Ok(None) => {
@@ -929,7 +1030,20 @@ where
         }
 
         let mut filters = {
-            let store = store.lock()?;
+            let mut store = store.lock()?;
+            // The cache and the headers filters are validated against are keyed by height. After
+            // a reorg they describe the old branch until the store is reconciled, and a filter
+            // of the old block matched with the new block's hash gives false negatives.
+            for (height, block_hash) in heights.clone().zip(&block_hashes) {
+                // A height missing from the store was just dropped by a reorg or a repair.
+                match store.get_block_hash(height) {
+                    Ok(stored_hash) if stored_hash == *block_hash => {}
+                    Ok(_) | Err(FlatFilterStoreError::NotFound) => {
+                        return Err(FilterManError::StaleFilterHeaders(height));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             heights
                 .clone()
                 .map(|height| store.get_filter(height))
@@ -1031,6 +1145,22 @@ where
             self.sync().await?;
         }
 
+        // Block notifications are dropped while we are busy, so the entry below this block may
+        // belong to a branch that was reorged out. Chaining onto it would store a header that
+        // no filter ever validates against.
+        if height > 0 && !self.stores_parent_of(&connected)? {
+            if self.synced_recently_failed() {
+                debug!(height, "not building a filter: header sync is failing");
+                return Ok(());
+            }
+            self.sync().await?;
+            if !self.stores_parent_of(&connected)? {
+                return Err(FilterManError::InvalidHeaders(format!(
+                    "the filter header below height {height} is not for the block's parent"
+                )));
+            }
+        }
+
         let block_hash = connected.block.block_hash();
         let mut store = self.store.lock()?;
         let previous_header = if height == 0 {
@@ -1053,7 +1183,16 @@ where
                 let stored_header = store.get_filter_header(height)?;
                 if stored_hash == block_hash {
                     if stored_header != filter_header {
-                        return Err(FilterManError::InvalidFilter(height));
+                        // Both chain onto the same previous header, so they differ in the
+                        // filter hash, and ours comes from a block we validated. Everything
+                        // above was chained onto the wrong header and is fetched again.
+                        warn!(
+                            height,
+                            "stored filter header disagrees with the local filter"
+                        );
+                        store.truncate(height.checked_sub(1))?;
+                        store.put_filter_header(block_hash, filter_header)?;
+                        self.checkpoints.clear();
                     }
                 } else {
                     store.truncate(height.checked_sub(1))?;
@@ -1064,6 +1203,8 @@ where
             }
             Some(stored_height) if stored_height.saturating_add(1) == height => {
                 if expected_checkpoint.is_some_and(|expected| expected != filter_header) {
+                    drop(store);
+                    self.distrust_from(height)?;
                     return Err(FilterManError::InvalidHeaders(format!(
                         "locally built filter disagrees with checkpoint at height {height}"
                     )));
@@ -1092,6 +1233,16 @@ where
     fn synced_recently_failed(&self) -> bool {
         self.last_sync_failure
             .is_some_and(|failed_at| failed_at.elapsed() < SYNC_RETRY_INTERVAL)
+    }
+
+    fn stores_parent_of(&self, connected: &ConnectedBlock) -> Result<bool, FilterManError> {
+        let mut store = self.store.lock()?;
+        let parent_height = connected.height - 1;
+        if store.get_height()?.is_none_or(|tip| tip < parent_height) {
+            return Ok(false);
+        }
+
+        Ok(store.get_block_hash(parent_height)? == connected.block.header.prev_blockhash)
     }
 
     /// Synchronizes filter headers and BIP157 checkpoints to the current best-chain tip.
@@ -1201,6 +1352,34 @@ where
         Ok(())
     }
 
+    /// Forgets the filter headers from the checkpoint interval containing `height` onwards, and
+    /// the checkpoints with them, so the next synchronization fetches both again.
+    ///
+    /// Headers and checkpoints each come from a single peer. When they disagree with each other,
+    /// or with a filter we built ourselves, we can't tell which one is wrong, and keeping either
+    /// would make every later synchronization fail the same way forever. Both are cheap to fetch.
+    fn distrust_from(&mut self, height: u32) -> Result<(), FilterManError> {
+        let last_trusted = (height.saturating_sub(1) / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
+        let keep = (last_trusted > 0).then_some(last_trusted);
+        warn!(
+            height,
+            ?keep,
+            "compact filter headers are inconsistent; fetching them again"
+        );
+
+        {
+            let mut store = self.store.lock()?;
+            if store
+                .get_height()?
+                .is_some_and(|tip| keep.is_none_or(|keep| tip > keep))
+            {
+                store.truncate(keep)?;
+            }
+        }
+        self.checkpoints.clear();
+        self.publish_height()
+    }
+
     fn verify_stored_checkpoints(&mut self) -> Result<(), FilterManError> {
         let Some(stored_tip) = self.store.lock()?.get_height()? else {
             return Ok(());
@@ -1217,6 +1396,7 @@ where
                 break;
             }
             if self.store.lock()?.get_filter_header(height)? != *checkpoint {
+                self.distrust_from(height)?;
                 return Err(FilterManError::InvalidHeaders(format!(
                     "stored filter header disagrees with checkpoint at height {height}"
                 )));
@@ -1281,6 +1461,10 @@ where
             self.store.lock()?.get_filter_header(start - 1)?
         };
         if response.previous_filter_header != previous_header {
+            // Either the peer lies or what we stored is wrong; a fresh start settles it.
+            if start > 0 {
+                self.distrust_from(start)?;
+            }
             return Err(FilterManError::InvalidHeaders(format!(
                 "filter headers do not connect at height {start}"
             )));
@@ -1302,6 +1486,9 @@ where
                     .get(checkpoint_index)
                     .is_some_and(|checkpoint| *checkpoint != current_header)
                 {
+                    // A bad checkpoint set would otherwise reject every honest batch until
+                    // the tip crosses the next interval.
+                    self.checkpoints.clear();
                     return Err(FilterManError::InvalidHeaders(format!(
                         "filter header disagrees with checkpoint at height {height}"
                     )));
@@ -1313,6 +1500,14 @@ where
                 .get_block_hash(height)
                 .map_err(FilterManError::chain)?;
             entries.push((block_hash, current_header));
+        }
+
+        // The hashes were read after the round trip. If the chain moved meanwhile, they belong
+        // to another branch than the headers, which were computed for `stop_hash`.
+        if entries.last().is_some_and(|(hash, _)| *hash != stop_hash) {
+            return Err(FilterManError::InvalidHeaders(format!(
+                "best chain changed while fetching filter headers up to {stop}"
+            )));
         }
 
         let mut store = self.store.lock()?;
@@ -1653,13 +1848,19 @@ mod tests {
         (file, store, chain, node, second_block)
     }
 
-    async fn drain_rescan(handle: &FilterManHandle, ticket: RescanTicket) -> Vec<Block> {
+    /// Consumes `ticket` to the end. The progress is read along the way, since a rescan is
+    /// forgotten once it was reported as finished.
+    async fn drain_rescan(
+        handle: &FilterManHandle,
+        ticket: RescanTicket,
+    ) -> (Vec<Block>, RescanProgress) {
         tokio::time::timeout(Duration::from_secs(2), async {
             let mut matched = Vec::new();
             loop {
                 matched.extend(handle.get_blocks(ticket).await.unwrap());
+                let progress = handle.get_progress(ticket).await.unwrap();
                 if handle.get_info(ticket).await.unwrap() == RescanStatus::Finished {
-                    break matched;
+                    break (matched, progress);
                 }
                 tokio::task::yield_now().await;
             }
@@ -1681,22 +1882,17 @@ mod tests {
             .rescan(RescanRequest::new(vec![script.clone()]))
             .await
             .unwrap();
-        assert_eq!(drain_rescan(&handle, ticket).await, vec![second_block]);
-        assert_eq!(
-            handle.get_progress(ticket).await.unwrap(),
-            RescanProgress {
-                start_height: 1,
-                end_height: 1,
-                scanned: 1,
-            }
-        );
+        let (matched, progress) = drain_rescan(&handle, ticket).await;
+        assert_eq!(matched, vec![second_block]);
+        assert_eq!((progress.start_height, progress.end_height), (1, 1));
+        assert!(progress.scanned <= 1);
 
         // An explicit start height wins over the default one.
         let ticket = handle
             .rescan(RescanRequest::new(vec![script]).with_range(Some(0), None))
             .await
             .unwrap();
-        assert_eq!(drain_rescan(&handle, ticket).await.len(), 2);
+        assert_eq!(drain_rescan(&handle, ticket).await.0.len(), 2);
 
         task.abort();
     }
@@ -1713,9 +1909,39 @@ mod tests {
             .rescan(RescanRequest::new(vec![script.clone()]))
             .await
             .unwrap();
-        drain_rescan(&handle, ticket).await;
-        let progress = handle.get_progress(ticket).await.unwrap();
+        let (_, progress) = drain_rescan(&handle, ticket).await;
         assert_eq!((progress.start_height, progress.end_height), (0, 1));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn default_start_above_the_tip_scans_nothing() {
+        let (_file, store, chain, node, second_block) = setup_two_blocks();
+        let script = second_block.txdata[0].output[0].script_pubkey.clone();
+        let filter_requests = node.filter_requests.clone();
+        // The tip is at height 1.
+        let manager = FiltersMan::new(store, node, chain).with_default_rescan_start(Some(2));
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+
+        // With nothing named, falling back to genesis would download every filter for blocks
+        // that can't hold wallet history.
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script.clone()]))
+            .await
+            .unwrap();
+        let (matched, _) = drain_rescan(&handle, ticket).await;
+        assert!(matched.is_empty());
+        assert_eq!(filter_requests.load(Ordering::Relaxed), 0);
+
+        // An explicit start above the tip stays an invalid range.
+        assert!(matches!(
+            handle
+                .rescan(RescanRequest::new(vec![script]).with_range(Some(2), None))
+                .await,
+            Err(FilterManError::InvalidRescanRange { .. })
+        ));
 
         task.abort();
     }
@@ -1732,8 +1958,8 @@ mod tests {
             .rescan(RescanRequest::new(vec![script]).with_range(None, Some(0)))
             .await
             .unwrap();
-        assert_eq!(drain_rescan(&handle, ticket).await.len(), 1);
-        let progress = handle.get_progress(ticket).await.unwrap();
+        let (matched, progress) = drain_rescan(&handle, ticket).await;
+        assert_eq!(matched.len(), 1);
         assert_eq!((progress.start_height, progress.end_height), (0, 0));
 
         task.abort();
@@ -2085,6 +2311,156 @@ mod tests {
             store.get_filter_header(0).unwrap(),
             expected.filter_header(&FilterHeader::all_zeros())
         );
+    }
+
+    #[tokio::test]
+    async fn finished_and_cancelled_rescans_are_forgotten() {
+        let (_file, store, chain, node, second_block) = setup_two_blocks();
+        let script = second_block.txdata[0].output[0].script_pubkey.clone();
+        let manager = FiltersMan::new(store, node, chain);
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script.clone()]))
+            .await
+            .unwrap();
+        drain_rescan(&handle, ticket).await;
+        assert!(matches!(
+            handle.get_info(ticket).await,
+            Err(FilterManError::RescanNotFound(_))
+        ));
+
+        // Two matches but a one-block page nobody consumes: the task would wait forever.
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script]).with_max_blocks_per_page(1))
+            .await
+            .unwrap();
+        handle.cancel_rescan(ticket).await;
+        assert!(matches!(
+            handle.get_info(ticket).await,
+            Err(FilterManError::RescanNotFound(_))
+        ));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rescan_task_that_dies_is_a_failure_and_idle_rescans_are_pruned() {
+        let (_file, store, chain, node, _block, _filter) = setup();
+        let mut manager = FiltersMan::new(store, node, chain);
+        let state = |outcome, last_polled| {
+            let (_block_sender, blocks) = mpsc::channel(1);
+            RescanState {
+                blocks,
+                outcome,
+                result: None,
+                last_polled,
+                page_size: 1,
+                first_status: true,
+                start: 0,
+                end: 0,
+                scanned: Arc::new(AtomicU32::new(0)),
+            }
+        };
+
+        // Both senders dropped without an outcome, as after a panic. Not a finished rescan.
+        let (outcome_sender, outcome) = oneshot::channel();
+        drop(outcome_sender);
+        manager
+            .rescans
+            .insert(RescanTicket(7), state(outcome, Instant::now()));
+        assert!(matches!(
+            manager.rescan_status(RescanTicket(7)),
+            Err(FilterManError::RescanFailed(_))
+        ));
+        assert!(manager.rescans.is_empty());
+
+        let (_live_sender, live) = oneshot::channel();
+        let (_idle_sender, idle) = oneshot::channel();
+        let long_ago = Instant::now() - RESCAN_IDLE_TIMEOUT - Duration::from_secs(1);
+        manager
+            .rescans
+            .insert(RescanTicket(8), state(live, Instant::now()));
+        manager
+            .rescans
+            .insert(RescanTicket(9), state(idle, long_ago));
+        manager.prune_abandoned_rescans();
+        assert!(manager.rescans.contains_key(&RescanTicket(8)));
+        assert!(!manager.rescans.contains_key(&RescanTicket(9)));
+    }
+
+    #[tokio::test]
+    async fn refuses_filters_while_the_store_describes_another_branch() {
+        let (_file, store, mut chain, node, block, _filter) = setup();
+        let mut reorged = block.clone();
+        reorged.header.nonce = reorged.header.nonce.wrapping_add(1);
+        Arc::make_mut(&mut chain.hashes)[0] = reorged.block_hash();
+        let filter_requests = node.filter_requests.clone();
+        let manager = FiltersMan::new(store, node, chain);
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+
+        assert!(matches!(
+            handle.get_filter(0).await,
+            Err(FilterManError::StaleFilterHeaders(0))
+        ));
+        assert_eq!(filter_requests.load(Ordering::Relaxed), 0);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn connected_block_is_not_chained_onto_another_branch() {
+        let (_file, store, mut chain, node, block, _filter) = setup();
+        // Height 1 builds on a block at height 0 that isn't the one we stored a header for.
+        let mut other_parent = block.clone();
+        other_parent.header.nonce = other_parent.header.nonce.wrapping_add(1);
+        let mut child = block.clone();
+        child.header.prev_blockhash = other_parent.block_hash();
+        Arc::make_mut(&mut chain.hashes).push(child.block_hash());
+        let mut manager = FiltersMan::new(store, node, chain);
+
+        let result = manager
+            .process_connected_block(ConnectedBlock {
+                block: child,
+                height: 1,
+                spent_utxos: HashMap::new(),
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(manager.store.lock().unwrap().get_height().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn checkpoint_mismatch_drops_the_interval_and_the_checkpoints() {
+        let file = NamedTempFile::new().unwrap();
+        let mut store = FlatFilterStore::new(file.path()).unwrap();
+        for height in 0..=CHECKPOINT_INTERVAL + 5 {
+            store
+                .put_filter_header(mock_block_hash(height), FilterHeader::all_zeros())
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let chain = MockChain {
+            hashes: Arc::new((0..=CHECKPOINT_INTERVAL + 5).map(mock_block_hash).collect()),
+        };
+        let node = MockNode::new(HashMap::new(), HashMap::new());
+        let mut manager = FiltersMan::new(store, node, chain);
+        manager.checkpoints = vec![FilterHeader::from_byte_array([1; 32])];
+
+        assert!(matches!(
+            manager.verify_stored_checkpoints(),
+            Err(FilterManError::InvalidHeaders(_))
+        ));
+
+        // Nothing below the first checkpoint can be trusted, so everything goes; and the next
+        // synchronization asks for the checkpoints again instead of failing the same way.
+        assert_eq!(manager.store.lock().unwrap().get_height().unwrap(), None);
+        assert!(manager.checkpoints.is_empty());
+        assert_eq!(manager.get_handle().get_height(), None);
+        assert!(manager.verify_stored_checkpoints().is_ok());
     }
 
     #[tokio::test]

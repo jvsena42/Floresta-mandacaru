@@ -203,10 +203,19 @@ impl FlatFilterStore {
             .create(true)
             .truncate(false)
             .open(file)?;
-        let len = file.metadata()?.len();
+        let mut len = file.metadata()?.len();
 
-        if len % FilterHeaderEntry::SERIALIZED_SIZE != 0 {
-            return Err(FlatFilterStoreError::CorruptedFile);
+        // Records are appended without an fsync, so a process killed mid-write (or a full disk)
+        // leaves a partial one at the end. The file only caches data peers serve: drop the torn
+        // record and let synchronization fetch it again, rather than refusing to start forever.
+        let torn = len % FilterHeaderEntry::SERIALIZED_SIZE;
+        if torn != 0 {
+            len -= torn;
+            tracing::warn!(
+                torn_bytes = torn,
+                "dropping a partially written record from the filter-header store"
+            );
+            file.set_len(len)?;
         }
 
         let reader = BufReader::new(file.try_clone()?);
@@ -431,19 +440,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_partial_filter_header_record() {
+    fn drops_partially_written_trailing_record() {
         let file = NamedTempFile::new().unwrap();
+        {
+            let mut store = FlatFilterStore::new(file.path()).unwrap();
+            store
+                .put_filter_header(entry(1).block_hash, entry(1).filter_header)
+                .unwrap();
+            store.flush().unwrap();
+        }
+        // A second record was being appended when the process died.
         OpenOptions::new()
             .write(true)
             .open(file.path())
             .unwrap()
-            .set_len(FilterHeaderEntry::SERIALIZED_SIZE - 1)
+            .set_len(2 * FilterHeaderEntry::SERIALIZED_SIZE - 1)
             .unwrap();
 
-        assert!(matches!(
-            FlatFilterStore::new(file.path()),
-            Err(FlatFilterStoreError::CorruptedFile)
-        ));
+        let mut store = FlatFilterStore::new(file.path()).unwrap();
+        assert_eq!(store.get_height().unwrap(), Some(0));
+        assert_eq!(store.get_block_hash(0).unwrap(), entry(1).block_hash);
+        assert_eq!(
+            file.as_file().metadata().unwrap().len(),
+            FilterHeaderEntry::SERIALIZED_SIZE
+        );
+
+        // Appending continues on a record boundary.
+        store
+            .put_filter_header(entry(2).block_hash, entry(2).filter_header)
+            .unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.get_block_hash(1).unwrap(), entry(2).block_hash);
     }
 
     #[test]
