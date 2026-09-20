@@ -165,7 +165,7 @@ where
             self.maybe_open_connection(service_flags::UTREEXO.into())?;
         }
 
-        if !self.has_compact_filters_peer() {
+        if self.wants_compact_filters && !self.has_compact_filters_peer() {
             // Only churn an existing slot if the address manager actually has a
             // compact-filters candidate to dial. Otherwise we'd disconnect a healthy
             // regular peer and fill the slot with another non-CF peer, making no
@@ -747,19 +747,6 @@ where
 
                     PeerMessages::Disconnected(idx) => {
                         self.handle_disconnection(peer, idx)?;
-                    }
-
-                    PeerMessages::Addr(addresses) => {
-                        debug!("Got {} addresses from peer {}", addresses.len(), peer);
-                        let addresses: Vec<_> =
-                            addresses.into_iter().map(|addr| addr.into()).collect();
-
-                        self.address_man.push_addresses(&addresses);
-                    }
-
-                    PeerMessages::BlockFilter((hash, _filter)) => {
-                        debug!("Got a block filter for block {hash} from peer {peer}");
-                        // TODO
                     }
 
                     _ => unreachable!(

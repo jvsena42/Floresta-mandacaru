@@ -487,6 +487,7 @@ where
                 );
 
                 if let Some(request) = request {
+                    self.last_filter_progress.insert(peer, Instant::now());
                     let filters = self
                         .inflight_filter_batches
                         .get_mut(&request)
@@ -561,6 +562,7 @@ where
         for request in orphaned {
             debug!("Peer {peer} left with a pending user request: {request:?}");
             self.inflight_filter_batches.remove(&request);
+            self.last_filter_progress.remove(&peer);
             // Dropping the responder is what reports the failure.
             self.inflight_user_requests.remove(&request);
         }
@@ -758,8 +760,17 @@ where
         let timed_out_user_requests = self
             .inflight_user_requests
             .iter()
-            .filter(|(_, (_, sent_at, _))| {
-                now.duration_since(*sent_at).as_secs() > T::REQUEST_TIMEOUT
+            .filter(|(request, (peer, sent_at, _))| {
+                // For filter batches, a peer that keeps delivering is alive (see
+                // `last_filter_progress`).
+                let last_activity = match request {
+                    UserRequest::GetCFilters { .. } => self
+                        .last_filter_progress
+                        .get(peer)
+                        .map_or(*sent_at, |progress| progress.max(sent_at).to_owned()),
+                    _ => *sent_at,
+                };
+                now.duration_since(last_activity).as_secs() > T::REQUEST_TIMEOUT
             })
             .map(|(request, _)| request.clone())
             .collect::<Vec<_>>();
@@ -933,14 +944,18 @@ where
                 inflight.1
             }
 
+            // One sample per batch, taken on its first filter: the rest of the batch streams in
+            // over seconds, and a batch queued behind others on the same peer only starts when
+            // the previous one ends. Anything else makes serving us filters look like slowness.
             PeerMessages::BlockFilter((block_hash, _)) => self
                 .inflight_user_requests
                 .iter()
                 .find_map(|(request, (request_peer, sent_at, _))| match request {
                     UserRequest::GetCFilters { block_hashes, .. }
-                        if block_hashes.contains(block_hash) && *request_peer == peer =>
+                        if block_hashes.first() == Some(block_hash) && *request_peer == peer =>
                     {
-                        Some(*sent_at)
+                        let progress = self.last_filter_progress.get(&peer).copied();
+                        Some(progress.map_or(*sent_at, |progress| progress.max(*sent_at)))
                     }
                     _ => None,
                 })?,
