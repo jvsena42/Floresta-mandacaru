@@ -9,6 +9,13 @@ on:
     schedule:
         - cron: "0 12 * * 1" # Monday, 12:00:00 UTC
 
+# A push over a branch (a rebase, a rebuilt stack of PRs) supersedes the runs of the commits it
+# replaced. Cancel those instead of letting them queue ahead of the new ones. Runs on master
+# are never cancelled, so every merged commit keeps its full result.
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 permissions: {}
 
 jobs:
