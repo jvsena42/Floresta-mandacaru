@@ -65,6 +65,14 @@ Returns a JSON object with the following fields:
 
 - `size_on_disk` - (numeric) The total size, in bytes, of the chain-store files persisted by Floresta. See the note below on what this value represents.
 
+- `filters` - (numeric, optional) Height up to which compact block filter headers are synchronized. They are synchronized from genesis, so progress is `filters / headers`. `0` while nothing is stored yet; absent when the node runs without compact filters.
+
+- `rescan_in_progress` - (boolean) Whether a wallet rescan (`rescanblockchain`, or the one started by `loaddescriptor`) is running. Filter headers reaching the tip does not mean the wallet was scanned.
+
+- `rescan_blocks_processed` - (numeric, optional) Blocks of the running rescan's height range whose filter was already checked. It advances one filter batch (1,000 blocks) at a time. Absent when no rescan is running.
+
+- `rescan_blocks_total` - (numeric, optional) Blocks in the running rescan's height range. `0` until the rescan has a range, e.g. while it waits for the filter headers. Absent when no rescan is running.
+
 
 ### Error Enum `CommandError`
 
@@ -82,4 +90,5 @@ Returns a JSON object with the following fields:
 - `signet_challenge` is hardcoded to `null`. Floresta does not currently expose the signet challenge script.
 - `blocks`, `headers`, `difficulty`, `mediantime`, `bits`, `target`, and `chainwork` are dynamically calculated and behave identically to Bitcoin Core.
 - `verificationprogress` is time-based, unlike Bitcoin Core's transaction-weighted estimate, so the two will not return identical values for the same chain state. Since the denominator tracks the current clock, a stalled node reports a declining value instead of holding at 1.0.
+- `filters` and the `rescan_*` fields are not part of Bitcoin Core's response. The rescan counters count blocks *checked*, not blocks that matched: a rescan fetches its filters from peers in batches, so it can't know upfront how many blocks will match.
 - `size_on_disk` is the sum, in bytes, of Floresta's chainstore files: the main-chain header records, the fork-header records, the block index, the metadata file, and the accumulator file.

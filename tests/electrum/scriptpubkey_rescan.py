@@ -45,12 +45,19 @@ def _start_nodes_with_history(add_node_with_extra_args, node_manager):
     return florestad, historical_outputs
 
 
-def _wait_for_rescan(electrum, script, endpoint, log):
-    history = {}
+def _wait_for_rescan(electrum, coinbase_txid, endpoint, log):
+    """Wait until the rescan caches `coinbase_txid`.
+
+    Polls by txid on purpose: every scriptpubkey endpoint queues an unknown script for a
+    rescan, so polling with one of them would make the test pass even if `endpoint` didn't.
+    """
 
     def rescan_finished():
-        history["value"] = electrum.get_scriptpubkey_history(script)
-        return bool(history["value"])
+        try:
+            electrum.get_transaction(coinbase_txid)
+        except ValueError:
+            return False
+        return True
 
     log.info("Waiting for %s to trigger a historical rescan", endpoint)
     wait_until(
@@ -59,7 +66,6 @@ def _wait_for_rescan(electrum, script, endpoint, log):
         interval=2,
         error_msg=f"{endpoint} did not trigger an Electrum rescan",
     )
-    return history["value"]
 
 
 @pytest.mark.electrum
@@ -88,7 +94,8 @@ def test_scriptpubkey_endpoints_rescan(
         else:
             assert initial_result is None
 
-        history = _wait_for_rescan(florestad.electrum, script, endpoint, log)
+        _wait_for_rescan(florestad.electrum, coinbase_txid, endpoint, log)
+        history = florestad.electrum.get_scriptpubkey_history(script)
         assert history[0]["tx_hash"] == coinbase_txid
         balance = florestad.electrum.get_scriptpubkey_balance(script)
         assert balance["confirmed"] > 0

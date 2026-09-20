@@ -473,7 +473,9 @@ impl Florestad {
         // second `start()` call — OnceLock guarantees the first winner sticks.
         let _ = self.blockchain_state.set(blockchain_state.clone());
 
-        remove_legacy_filter_store(datadir);
+        // Off the runtime thread: unlinking 10+ GB can take a while on a phone's flash.
+        let legacy_datadir = datadir.to_path_buf();
+        task::spawn_blocking(move || remove_legacy_filter_store(&legacy_datadir));
 
         // If this network already allows pow fraud proofs, we should use it instead of assumeutreexo
         let assume_utreexo = match self.config.assume_utreexo {
