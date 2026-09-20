@@ -22,6 +22,7 @@ use floresta_compact_filters::filters_man::FilterManError;
 use floresta_compact_filters::filters_man::FiltersMan;
 use floresta_compact_filters::filters_man::RescanRequest;
 use floresta_compact_filters::filters_man::RescanStatus;
+use floresta_compact_filters::filters_man::declares_plausible_element_count;
 use floresta_wire::node_interface::ChainMethods;
 use libfuzzer_sys::arbitrary::Arbitrary;
 use libfuzzer_sys::arbitrary::Unstructured;
@@ -243,6 +244,12 @@ fuzz_target!(|input: FuzzInput| {
         if input.missing_filter {
             assert!(matches!(filter_result, Err(FilterManError::Node(_))));
         } else if input.invalid_header {
+            assert!(matches!(
+                filter_result,
+                Err(FilterManError::InvalidFilter(0))
+            ));
+        } else if !declares_plausible_element_count(&filter) {
+            // The header vouches for it, but its element count can't fit in its bytes.
             assert!(matches!(
                 filter_result,
                 Err(FilterManError::InvalidFilter(0))

@@ -5,6 +5,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use bitcoin::BlockHash;
 use bitcoin::Transaction;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::AddrV2Message;
@@ -508,6 +509,7 @@ where
                         if let Some((_, _, responder)) =
                             self.inflight_user_requests.remove(&request)
                         {
+                            self.remember_filter_server(block_hash, peer);
                             let _ = responder.send(NodeResponse::CFilters(filters));
                         }
                     }
@@ -547,6 +549,36 @@ where
             }
             _ => Ok(Some(msg)),
         }
+    }
+
+    /// How many served filter batches we remember the sender of.
+    const REMEMBERED_FILTER_SERVERS: usize = 64;
+
+    fn remember_filter_server(&mut self, stop_hash: BlockHash, peer: PeerId) {
+        if self.recent_filter_servers.len() >= Self::REMEMBERED_FILTER_SERVERS {
+            self.recent_filter_servers.pop_front();
+        }
+        self.recent_filter_servers.push_back((stop_hash, peer));
+    }
+
+    /// Penalizes the peer that served the filter batch ending at `stop_hash`, which the
+    /// consumer found invalid. Two such batches ban it, so the consumer's retries reach another
+    /// peer. It isn't banned outright: the filter-header chain the batch was checked against
+    /// came from a peer too, and may be the one that is wrong.
+    pub(crate) fn punish_filter_server(&mut self, stop_hash: BlockHash) -> Result<(), WireError> {
+        let Some(position) = self
+            .recent_filter_servers
+            .iter()
+            .position(|(hash, _)| *hash == stop_hash)
+        else {
+            return Ok(());
+        };
+        let Some((_, peer)) = self.recent_filter_servers.remove(position) else {
+            return Ok(());
+        };
+
+        warn!("Peer {peer} served compact filters that failed validation");
+        self.increase_banscore(peer, self.max_banscore.div_ceil(2))
     }
 
     /// Fails every user request waiting on `peer`, so the caller retries right away instead of

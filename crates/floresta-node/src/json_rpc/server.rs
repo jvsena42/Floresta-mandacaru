@@ -145,12 +145,25 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         // Always persist the descriptor; only kick off a rescan if one isn't
         // already running. Otherwise ask the running one for a follow-up pass:
         // it took its addresses before this descriptor was cached.
-        let Some(tracker) = self.rescan.try_start() else {
-            debug!(
-                "rescan already in progress; descriptor cached, a follow-up rescan will cover it"
-            );
-            self.rescan.request_followup();
-            return Ok(true);
+        let tracker = match self.rescan.try_start() {
+            Some(tracker) => tracker,
+            None => {
+                debug!(
+                    "rescan already in progress; descriptor cached, a follow-up rescan will cover it"
+                );
+                self.rescan.request_followup();
+
+                // The running rescan may have ended between our failed claim and the request,
+                // after it last looked for one. Then nobody is left to take it: run it ourselves.
+                let Some(tracker) = self.rescan.try_start() else {
+                    return Ok(true);
+                };
+                if !self.rescan.take_followup() {
+                    // Whoever ended in between saw the request and is running the follow-up.
+                    return Ok(true);
+                }
+                tracker
+            }
         };
 
         let addresses = self.wallet.get_cached_addresses();
@@ -226,6 +239,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 .await
                 {
                     error!(?error, "wallet rescan failed");
+                    tracker.fail(format!("{error:?}"));
                 }
                 drop(tracker);
 
@@ -563,6 +577,7 @@ pub(super) struct RescanState {
     blocks_processed: Arc<AtomicU32>,
     blocks_total: Arc<AtomicU32>,
     followup_requested: Arc<AtomicBool>,
+    last_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl RescanState {
@@ -573,6 +588,8 @@ impl RescanState {
             .ok()?;
         self.blocks_processed.store(0, Ordering::SeqCst);
         self.blocks_total.store(0, Ordering::SeqCst);
+        // A new rescan supersedes the outcome of the previous one.
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Some(RescanTracker(self.clone()))
     }
 
@@ -583,6 +600,15 @@ impl RescanState {
 
     fn take_followup(&self) -> bool {
         self.followup_requested.swap(false, Ordering::SeqCst)
+    }
+
+    /// Why the last wallet rescan failed, until another one starts. Without it a failed rescan
+    /// looks exactly like a completed one: `rescan_in_progress` just goes back to `false`.
+    pub(super) fn last_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// `(blocks scanned, blocks to scan)` of the running rescan, if any.
@@ -602,6 +628,10 @@ impl RescanState {
 pub(super) struct RescanTracker(RescanState);
 
 impl RescanTracker {
+    fn fail(&self, error: String) {
+        *self.0.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+    }
+
     fn report(&self, progress: &RescanProgress) {
         let total = progress.end_height - progress.start_height + 1;
         self.0.blocks_total.store(total, Ordering::SeqCst);
@@ -1081,6 +1111,19 @@ mod rescan_state_tests {
         drop(tracker);
         let _tracker = state.try_start().unwrap();
         assert_eq!(state.progress(), Some((0, 0)));
+    }
+
+    #[test]
+    fn a_failure_is_reported_until_the_next_rescan() {
+        let state = RescanState::default();
+        let tracker = state.try_start().unwrap();
+        tracker.fail("no valid filters".to_owned());
+        drop(tracker);
+        assert_eq!(state.progress(), None);
+        assert_eq!(state.last_error().as_deref(), Some("no valid filters"));
+
+        let _tracker = state.try_start().unwrap();
+        assert_eq!(state.last_error(), None);
     }
 
     #[test]

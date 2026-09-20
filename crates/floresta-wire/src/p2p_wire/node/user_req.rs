@@ -5,6 +5,7 @@ use std::time::Instant;
 use bitcoin::Block;
 use bitcoin::p2p::ServiceFlags;
 use floresta_chain::ChainBackend;
+use floresta_common::try_and_log;
 use tokio::sync::oneshot;
 use tracing::debug;
 use tracing::info;
@@ -227,6 +228,11 @@ where
                         .insert(user_req, (peer, Instant::now(), responder));
                 }
 
+                return;
+            }
+
+            UserRequest::ReportInvalidCFilters { stop_hash } => {
+                try_and_log!(self.punish_filter_server(stop_hash));
                 return;
             }
 

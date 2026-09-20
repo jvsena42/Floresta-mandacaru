@@ -15,6 +15,7 @@ mod user_req;
 use core::fmt::Debug;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::path::PathBuf;
@@ -290,6 +291,11 @@ pub struct NodeCommon<Chain: ChainBackend> {
     /// when its peer stopped making progress, not when its answer takes long to complete.
     pub(crate) last_filter_progress: HashMap<PeerId, Instant>,
 
+    /// Which peer served the latest filter batches, keyed by the batch's last block hash, so a
+    /// consumer that finds a batch invalid can have its sender held accountable. Filters can only
+    /// be validated by whoever keeps the filter-header chain, which isn't us.
+    pub(crate) recent_filter_servers: VecDeque<(BlockHash, PeerId)>,
+
     /// Whether some consumer asked for compact-filter data through the node handle. Until then
     /// we don't spend a peer slot on a compact-filters peer.
     pub(crate) wants_compact_filters: bool,
@@ -386,6 +392,7 @@ where
                 inflight_filter_batches: HashMap::new(),
                 last_filter_progress: HashMap::new(),
                 wants_compact_filters: false,
+                recent_filter_servers: VecDeque::new(),
                 peer_id_count: 0,
                 peers: HashMap::new(),
                 last_block_request: chain.get_validation_index().expect("Invalid chain"),

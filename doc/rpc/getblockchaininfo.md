@@ -73,6 +73,8 @@ Returns a JSON object with the following fields:
 
 - `rescan_blocks_total` - (numeric, optional) Blocks in the running rescan's height range. `0` until the rescan has a range, e.g. while it waits for the filter headers. Absent when no rescan is running.
 
+- `rescan_error` - (string, optional) Why the last wallet rescan failed. `rescan_in_progress` going back to `false` does not tell a completed rescan from a failed one; this does. Cleared when another rescan starts.
+
 
 ### Error Enum `CommandError`
 

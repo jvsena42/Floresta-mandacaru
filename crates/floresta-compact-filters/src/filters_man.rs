@@ -60,8 +60,9 @@ const RESCAN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// of them would otherwise start a synchronization that fails right away.
 const SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How many times a rescan asks again for a batch whose filters failed validation. A retry
-/// usually lands on another peer; a batch that never validates means our header chain is off.
+/// How many times a rescan asks again for a batch whose filters failed validation. Each failure
+/// is reported to the node, which sheds the peer on its second one, so the attempts reach more
+/// than one peer. A batch that still doesn't validate means our header chain is off.
 const MAX_INVALID_BATCH_ATTEMPTS: u32 = 5;
 
 /// A rescan nobody asked about for this long was abandoned by its consumer (consumers poll many
@@ -78,7 +79,7 @@ const MIN_BITS_PER_FILTER_ELEMENT: u64 = 20;
 /// The count comes from a peer, and the filter header we validate filters against was handed to
 /// us by a peer as well, so both can be crafted: the product then overflows, which panics in
 /// builds with overflow checks and silently corrupts the match otherwise.
-fn declares_plausible_element_count(filter: &BlockFilter) -> bool {
+pub fn declares_plausible_element_count(filter: &BlockFilter) -> bool {
     let mut content = filter.content.as_slice();
     let Ok(VarInt(elements)) = VarInt::consensus_decode(&mut content) else {
         // No count to read: matching treats that as an empty filter.
@@ -424,6 +425,10 @@ enum ManagerRequest {
     CancelRescan {
         ticket: RescanTicket,
     },
+    /// A rescan couldn't get valid filters for the batch starting at `height` from anyone.
+    DistrustHeaders {
+        height: u32,
+    },
     Filter {
         height: u32,
         response: oneshot::Sender<Result<BlockFilter, FilterManError>>,
@@ -672,6 +677,11 @@ where
             ManagerRequest::RescanProgress { ticket, response } => {
                 let _ = response.send(self.rescan_progress(ticket));
             }
+            ManagerRequest::DistrustHeaders { height } => {
+                if let Err(error) = self.distrust_from(height) {
+                    warn!(%error, "could not drop inconsistent compact filter headers");
+                }
+            }
             ManagerRequest::CancelRescan { ticket } => {
                 // Dropping the receiver is what stops the rescan task.
                 self.rescans.remove(&ticket);
@@ -758,9 +768,12 @@ where
         let store = self.store.clone();
         let node = self.node.clone();
         let chain = self.chain.clone();
+        let manager = self.request_sender.clone();
         tokio::spawn(async move {
-            let result =
-                Self::run_rescan(store, node, chain, request, start, end, &sender, &scanned).await;
+            let result = Self::run_rescan(
+                store, node, chain, request, start, end, &sender, &scanned, &manager,
+            )
+            .await;
             // After the last block, so an `Ok` outcome means every match is already queued.
             let _ = outcome_sender.send(result.map_err(|error| error.to_string()));
         });
@@ -894,6 +907,7 @@ where
         end: u32,
         blocks: &mpsc::Sender<Block>,
         scanned: &AtomicU32,
+        manager: &mpsc::Sender<ManagerRequest>,
     ) -> Result<(), FilterManError> {
         let mut batch_start = start;
         let mut matching_blocks = tracing::enabled!(tracing::Level::DEBUG).then(Vec::new);
@@ -942,14 +956,26 @@ where
                         );
                         tokio::time::sleep(RESCAN_RETRY_INTERVAL).await;
                     }
+                    Err(
+                        error @ (FilterManError::InvalidFilter(_)
+                        | FilterManError::InvalidFilterCount { .. }),
+                    ) => {
+                        // Every attempt was reported to the node, which sheds a peer after two
+                        // bad batches, so by now more than one peer disagreed with our headers.
+                        // The headers are the likelier culprit: have them fetched again, or
+                        // every later rescan of this range fails the same way.
+                        let _ = manager
+                            .send(ManagerRequest::DistrustHeaders {
+                                height: batch_start,
+                            })
+                            .await;
+                        return Err(error);
+                    }
                     Err(error) => return Err(error),
                 }
             };
 
-            for (offset, (block_hash, filter)) in filters.into_iter().enumerate() {
-                if !declares_plausible_element_count(&filter) {
-                    return Err(FilterManError::InvalidFilter(batch_start + offset as u32));
-                }
+            for (block_hash, filter) in filters {
                 let matches = filter.match_any(
                     &block_hash,
                     request.scripts.iter().map(|script| script.as_bytes()),
@@ -1070,20 +1096,26 @@ where
             let (first, expected, received_filters) = response
                 .map_err(FilterManError::Task)?
                 .map_err(FilterManError::node)?;
-            if received_filters.len() != expected {
-                return Err(FilterManError::InvalidFilterCount {
-                    expected,
-                    received: received_filters.len(),
-                });
-            }
-
-            let mut store = store.lock()?;
-            for (offset, filter) in received_filters.into_iter().enumerate() {
-                let index = first + offset;
-                let height = start + index as u32;
-                Self::validate_filter(&mut *store, height, &filter)?;
-                store.put_filter(height, filter.clone())?;
-                filters[index] = Some(filter);
+            let validated =
+                Self::accept_filters(&store, start + first as u32, expected, received_filters);
+            let accepted = match validated {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    // Whoever served this chunk is either misbehaving or disagrees with the
+                    // header chain we hold. Let the node know, so a retry goes somewhere else.
+                    if matches!(
+                        error,
+                        FilterManError::InvalidFilter(_)
+                            | FilterManError::InvalidFilterCount { .. }
+                    ) {
+                        let stop_hash = block_hashes[first + expected - 1];
+                        node.report_invalid_cfilters(stop_hash).await;
+                    }
+                    return Err(error);
+                }
+            };
+            for (offset, filter) in accepted.into_iter().enumerate() {
+                filters[first + offset] = Some(filter);
             }
         }
 
@@ -1097,6 +1129,37 @@ where
                 )
             })
             .collect())
+    }
+
+    /// Validates the filters a peer returned for the `expected` heights from `first_height` on,
+    /// and caches them. Nothing is cached unless the whole chunk is valid.
+    fn accept_filters(
+        store: &Mutex<Store>,
+        first_height: u32,
+        expected: usize,
+        received: Vec<BlockFilter>,
+    ) -> Result<Vec<BlockFilter>, FilterManError> {
+        if received.len() != expected {
+            return Err(FilterManError::InvalidFilterCount {
+                expected,
+                received: received.len(),
+            });
+        }
+
+        let mut store = store.lock()?;
+        for (offset, filter) in received.iter().enumerate() {
+            let height = first_height + offset as u32;
+            Self::validate_filter(&mut *store, height, filter)?;
+            // A crafted header can vouch for a crafted filter, so this isn't implied by the above.
+            if !declares_plausible_element_count(filter) {
+                return Err(FilterManError::InvalidFilter(height));
+            }
+        }
+        for (offset, filter) in received.iter().enumerate() {
+            store.put_filter(first_height + offset as u32, filter.clone())?;
+        }
+
+        Ok(received)
     }
 
     fn validate_filter(
@@ -1590,6 +1653,7 @@ mod tests {
         filter_requests: Arc<AtomicUsize>,
         filter_failures: Arc<AtomicUsize>,
         short_filter_responses: Arc<AtomicUsize>,
+        invalid_reports: Arc<AtomicUsize>,
         active_filter_requests: Arc<AtomicUsize>,
         max_filter_requests: Arc<AtomicUsize>,
         header_requests: Arc<AtomicUsize>,
@@ -1611,6 +1675,7 @@ mod tests {
                 header_requests: Arc::new(AtomicUsize::new(0)),
                 filter_failures: Arc::new(AtomicUsize::new(0)),
                 short_filter_responses: Arc::new(AtomicUsize::new(0)),
+                invalid_reports: Arc::new(AtomicUsize::new(0)),
                 active_filter_requests: Arc::new(AtomicUsize::new(0)),
                 max_filter_requests: Arc::new(AtomicUsize::new(0)),
                 checkpoint_requests: Arc::new(AtomicUsize::new(0)),
@@ -1683,6 +1748,10 @@ mod tests {
             };
             self.active_filter_requests.fetch_sub(1, Ordering::Relaxed);
             result
+        }
+
+        async fn report_invalid_cfilters(&self, _stop_hash: BlockHash) {
+            self.invalid_reports.fetch_add(1, Ordering::Relaxed);
         }
 
         async fn get_cfcheckpt(&self, stop_hash: BlockHash) -> Result<CFCheckpt, Self::Error> {
@@ -1996,7 +2065,8 @@ mod tests {
         for height in 0..count {
             let height = height as u32;
             let block_hash = mock_block_hash(height);
-            let filter = BlockFilter::new(&height.to_le_bytes());
+            // Distinct per height, and declaring zero elements so the content stays plausible.
+            let filter = BlockFilter::new(&[&[0][..], &height.to_le_bytes()].concat());
             previous_header = filter.filter_header(&previous_header);
             store
                 .put_filter_header(block_hash, previous_header)
@@ -2094,7 +2164,8 @@ mod tests {
             .await
             .unwrap();
 
-        let failure = tokio::time::timeout(Duration::from_secs(2), async {
+        // The batch is retried a few times, a second apart, before the rescan gives up.
+        let failure = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match handle.get_info(ticket).await {
                     Err(error) => break error,
@@ -2115,6 +2186,7 @@ mod tests {
         let (_file, store, chain, node, block, _filter) = setup();
         node.short_filter_responses.store(1, Ordering::Relaxed);
         let filter_requests = node.filter_requests.clone();
+        let invalid_reports = node.invalid_reports.clone();
         let script = block.txdata[0].output[0].script_pubkey.clone();
         let manager = FiltersMan::new(store, node, chain);
         let handle = manager.get_handle();
@@ -2139,6 +2211,52 @@ mod tests {
 
         assert_eq!(matched, vec![block]);
         assert_eq!(filter_requests.load(Ordering::Relaxed), 2);
+        // The node heard about the bad batch, so it can send the retry to another peer.
+        assert_eq!(invalid_reports.load(Ordering::Relaxed), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn batch_that_never_validates_drops_the_headers_it_was_checked_against() {
+        let (_file, store, chain, node, block, _filter) = setup();
+        node.short_filter_responses
+            .store(usize::MAX, Ordering::Relaxed);
+        let invalid_reports = node.invalid_reports.clone();
+        let script = block.txdata[0].output[0].script_pubkey.clone();
+        let manager = FiltersMan::new(store, node, chain);
+        let handle = manager.get_handle();
+        let task = tokio::spawn(manager.main_loop());
+        let ticket = handle
+            .rescan(RescanRequest::new(vec![script]))
+            .await
+            .unwrap();
+
+        // The attempts are a second apart.
+        let failure = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Err(error) = handle.get_info(ticket).await {
+                    break error;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(failure, FilterManError::RescanFailed(_)));
+
+        // Every attempt was reported; with all of them failing, the headers are the suspect.
+        assert_eq!(
+            invalid_reports.load(Ordering::Relaxed),
+            MAX_INVALID_BATCH_ATTEMPTS as usize
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.get_height().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
         task.abort();
     }
 
