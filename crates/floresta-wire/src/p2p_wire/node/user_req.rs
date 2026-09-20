@@ -59,6 +59,13 @@ where
             return;
         }
 
+        // Requests are tracked by value. Overwriting the entry of an identical one would orphan
+        // its responder and hand its replies to the wrong batch, so fail the newcomer instead.
+        if self.inflight_user_requests.contains_key(&user_req) {
+            debug!("Dropping user request {user_req:?}: an identical one is in flight");
+            return;
+        }
+
         debug!("Performing user request {user_req:?}");
 
         let req = match user_req {
@@ -195,6 +202,35 @@ where
 
                 let peer = self.send_to_fast_peer(req, ServiceFlags::COMPACT_FILTERS);
                 if let Ok(peer) = peer {
+                    self.inflight_user_requests
+                        .insert(user_req, (peer, Instant::now(), responder));
+                }
+
+                return;
+            }
+
+            UserRequest::GetCFilters {
+                start_height,
+                ref block_hashes,
+            } => {
+                let Some(stop_hash) = block_hashes.last().copied() else {
+                    let _ = responder.send(NodeResponse::CFilters(Vec::new()));
+                    return;
+                };
+                let request = NodeRequest::GetFilter((stop_hash, start_height));
+                if let Ok(peer) = self.send_to_fast_peer(request, ServiceFlags::COMPACT_FILTERS) {
+                    self.inflight_filter_batches
+                        .insert(user_req.clone(), Vec::with_capacity(block_hashes.len()));
+                    self.inflight_user_requests
+                        .insert(user_req, (peer, Instant::now(), responder));
+                }
+
+                return;
+            }
+
+            UserRequest::GetCFCheckpt { stop_hash } => {
+                let request = NodeRequest::GetCFCheckpt(stop_hash);
+                if let Ok(peer) = self.send_to_fast_peer(request, ServiceFlags::COMPACT_FILTERS) {
                     self.inflight_user_requests
                         .insert(user_req, (peer, Instant::now(), responder));
                 }

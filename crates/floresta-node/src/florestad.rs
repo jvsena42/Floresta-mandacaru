@@ -13,6 +13,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use bitcoin::Address;
 pub use bitcoin::Network;
@@ -20,21 +21,20 @@ use bitcoin::ScriptBuf;
 pub use floresta_chain::AssumeUtreexoValue;
 pub use floresta_chain::AssumeValidArg;
 use floresta_chain::BlockchainError;
+use floresta_chain::BlockchainInterface;
 use floresta_chain::ChainParams;
 use floresta_chain::ChainState;
 use floresta_chain::FlatChainStore as ChainStore;
 use floresta_chain::FlatChainStoreConfig;
 pub use floresta_chain::SnapshotError;
 pub use floresta_chain::UtreexoSnapshot;
-use floresta_chain::pruned_utreexo::BlockchainInterface;
+use floresta_chain::pruned_utreexo::IBDState;
 use floresta_chain::pruned_utreexo::merkle::ConsensusMerkle;
 #[cfg(feature = "json-rpc")]
 use floresta_common::NetworkExt;
 use floresta_common::try_and_log;
-#[cfg(feature = "compact-filters")]
-use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
-#[cfg(feature = "compact-filters")]
-use floresta_compact_filters::network_filters::NetworkFilters;
+use floresta_compact_filters::FlatFilterStore;
+use floresta_compact_filters::filters_man::FiltersMan;
 use floresta_domain::mempool::MempoolBase;
 use floresta_electrum::electrum_protocol::ElectrumServer;
 use floresta_electrum::electrum_protocol::client_accept_loop;
@@ -54,8 +54,7 @@ use rcgen::KeyPair;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task;
-#[cfg(feature = "metrics")]
-use tokio::time::Duration;
+use tokio::time::sleep;
 #[cfg(feature = "metrics")]
 use tokio::time::{self};
 use tokio_rustls::TlsAcceptor;
@@ -139,21 +138,19 @@ pub struct Config {
     /// The network we are running in, it may be one of: bitcoin, signet, regtest or testnet.
     pub network: Network,
 
-    /// Whether we should build and store compact block filters
+    /// Whether compact-filter headers should be synchronized for historical rescans.
     ///
-    /// Those filters are used for rescanning our wallet for historical transactions. If you don't
-    /// have this on, the only way to find historical transactions is to download all blocks, which
-    /// is very inefficient and resource/time consuming. But keep in mind that filters will take
-    /// up disk space.
+    /// Every filter header is persisted, while only a bounded number of full filters are cached.
     pub cfilters: bool,
 
-    /// If we are using block filters, we may not need to download the whole chain of filters, as
-    /// our wallets may not have been created at the beginning of the chain. With this option, we
-    /// can make a rough estimate of the block height we need to start downloading filters.
+    /// Wallet birthday: the height compact-filter rescans start from when the caller doesn't
+    /// give an explicit one. Filter headers are always synchronized from genesis, but a rescan
+    /// downloads every full filter in its range, so skipping the blocks mined before the wallet
+    /// existed saves most of that bandwidth.
     ///
-    /// If the value is negative, it's relative to the current tip. For example, if the current tip
-    /// is at height 1000, and we set this value to -100, we will start downloading filters from
-    /// height 900.
+    /// If the value is negative, it's relative to the tip at the time of the rescan. For
+    /// example, if the current tip is at height 1000, and we set this value to -100, rescans
+    /// start from height 900.
     pub filters_start_height: Option<i32>,
 
     #[cfg(feature = "zmq-server")]
@@ -318,68 +315,27 @@ impl fmt::Display for DumpError {
 
 impl core::error::Error for DumpError {}
 
-/// Reads the `filters_start_height` value that was applied when the on-disk
-/// compact-filter store was last initialized. Returns `None` when the sidecar
-/// file is absent or unreadable, which we treat as "no value previously applied".
-#[cfg(feature = "compact-filters")]
-fn read_applied_filter_start_height(path: &Path) -> Option<i32> {
-    let bytes = fs::read(path).ok()?;
-    bytes.try_into().ok().map(i32::from_le_bytes)
-}
+/// Files written by the pre-`FiltersMan` compact-filter store, which persisted
+/// every full filter and grew past 10 GB on mainnet. Nothing reads them anymore.
+const LEGACY_FILTER_STORE_FILES: [&str; 3] =
+    ["cfilters", "cfilters-index", "cfilters-start-height"];
 
-/// Persists the `filters_start_height` value that was applied to the on-disk
-/// compact-filter store, so a future startup can detect a config change and
-/// reset the store. Removes the sidecar when `value` is `None`.
-#[cfg(feature = "compact-filters")]
-fn write_applied_filter_start_height(path: &Path, value: Option<i32>) -> std::io::Result<()> {
-    match value {
-        Some(v) => fs::write(path, v.to_le_bytes()),
-        None => match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        },
-    }
-}
-
-/// Resolves a user-supplied `filters_start_height` value to an absolute chain
-/// height. Negative values are interpreted as "tip minus N" offsets, anchored
-/// to `chain_tip` at the moment of resolution. `None` is returned for `None`
-/// inputs (filters from genesis).
-#[cfg(feature = "compact-filters")]
-fn resolve_filter_start_height(value: Option<i32>, chain_tip: u32) -> Option<u32> {
-    match value {
-        None => None,
-        Some(v) if v >= 0 => Some(v as u32),
-        Some(v) => Some(chain_tip.saturating_sub((-v) as u32)),
-    }
-}
-
-/// Returns `true` when the existing compact-filter store, populated for
-/// `previously_applied`, already covers the range required by `configured` —
-/// i.e. no wipe is needed. A store populated for an *earlier* (lower) start
-/// height contains every filter the new (higher) start height could need;
-/// only the inverse, going to an earlier start, requires re-downloading.
-///
-/// `None` and negative offset-from-tip values are treated conservatively
-/// (they trigger a wipe on mismatch) because their effective absolute height
-/// depends on context this function does not have.
-#[cfg(feature = "compact-filters")]
-fn store_covers_configured_range(configured: Option<i32>, previously_applied: Option<i32>) -> bool {
-    if configured == previously_applied {
-        return true;
-    }
-    // Only optimize the unambiguous case where both sides are absolute,
-    // non-negative heights and the new lower bound is at or above the old.
-    let absolute = |v: Option<i32>| -> Option<u32> {
-        match v {
-            Some(h) if h >= 0 => Some(h as u32),
-            _ => None,
+/// Reclaims the disk space held by the legacy full-filter store.
+fn remove_legacy_filter_store(datadir: &Path) {
+    for name in LEGACY_FILTER_STORE_FILES {
+        let path = datadir.join(name);
+        let removed = match fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path),
+            Ok(_) => fs::remove_file(&path),
+            Err(_) => continue,
+        };
+        match removed {
+            Ok(()) => info!("Removed legacy compact-filter store at {}", path.display()),
+            Err(e) => warn!(
+                "Could not remove legacy compact-filter store at {}: {e}",
+                path.display()
+            ),
         }
-    };
-    match (absolute(configured), absolute(previously_applied)) {
-        (Some(c), Some(p)) => c >= p,
-        _ => false,
     }
 }
 
@@ -517,79 +473,7 @@ impl Florestad {
         // second `start()` call — OnceLock guarantees the first winner sticks.
         let _ = self.blockchain_state.set(blockchain_state.clone());
 
-        #[cfg(feature = "compact-filters")]
-        let cfilters = if self.config.cfilters {
-            // Block Filters
-            let cfilters_path: PathBuf = datadir.join("cfilters");
-            let cfilters_index_path: PathBuf = datadir.join("cfilters-index");
-            let cfilters_start_path: PathBuf = datadir.join("cfilters-start-height");
-
-            // `filters_start_height` is only consumed once, when the on-disk
-            // store is empty. When the user moves to an *earlier* start height
-            // (e.g. an older wallet birthday), the store must be wiped so the
-            // new range gets downloaded; the saved height alone would skip
-            // those earlier filters. When the new start height is at or after
-            // the previously applied one, the existing store already contains
-            // every filter the new range needs and we keep it — a wipe in that
-            // direction silently discards already-matched wallet history.
-            let configured = self.config.filters_start_height;
-            let previously_applied = if cfilters_path.exists() && !cfilters_start_path.exists() {
-                // Migration: pre-existing store from an older daemon that
-                // didn't track the applied value. Adopt the current config as
-                // the baseline so we don't wipe a synced store on upgrade.
-                write_applied_filter_start_height(&cfilters_start_path, configured)
-                    .map_err(|e| FlorestadError::CouldNotLoadCompactFiltersStore(e.into()))?;
-                configured
-            } else {
-                read_applied_filter_start_height(&cfilters_start_path)
-            };
-
-            if !store_covers_configured_range(configured, previously_applied) {
-                info!(
-                    "filters_start_height moved earlier (was {previously_applied:?}, now {configured:?}); resetting compact filter store to fetch the broader range"
-                );
-                let _ = fs::remove_file(&cfilters_path);
-                let _ = fs::remove_file(&cfilters_index_path);
-                write_applied_filter_start_height(&cfilters_start_path, configured)
-                    .map_err(|e| FlorestadError::CouldNotLoadCompactFiltersStore(e.into()))?;
-            } else if configured != previously_applied {
-                info!(
-                    "filters_start_height moved later (was {previously_applied:?}, now {configured:?}); keeping existing filter store and updating sidecar"
-                );
-                write_applied_filter_start_height(&cfilters_start_path, configured)
-                    .map_err(|e| FlorestadError::CouldNotLoadCompactFiltersStore(e.into()))?;
-            }
-
-            let filter_store = FlatFiltersStore::new(cfilters_path);
-            let cfilters = Arc::new(NetworkFilters::new(filter_store));
-
-            let height = cfilters
-                .get_height()
-                .map_err(FlorestadError::CouldNotLoadCompactFiltersStore)?;
-
-            info!("Loaded compact filters store at height {height}");
-            Some(cfilters)
-        } else {
-            None
-        };
-
-        #[cfg(not(feature = "compact-filters"))]
-        let cfilters = None;
-
-        // Only consumed by the json-rpc server (see `getblockchaininfo`'s
-        // `filters_start`); unused when that feature is off.
-        #[cfg(feature = "compact-filters")]
-        #[cfg_attr(not(feature = "json-rpc"), allow(unused_variables))]
-        let cfilters_start_resolved: Option<u32> = if self.config.cfilters {
-            let chain_tip = blockchain_state.get_height().unwrap_or(0);
-            resolve_filter_start_height(self.config.filters_start_height, chain_tip)
-        } else {
-            None
-        };
-
-        #[cfg(not(feature = "compact-filters"))]
-        #[cfg_attr(not(feature = "json-rpc"), allow(unused_variables))]
-        let cfilters_start_resolved: Option<u32> = None;
+        remove_legacy_filter_store(datadir);
 
         // If this network already allows pow fraud proofs, we should use it instead of assumeutreexo
         let assume_utreexo = match self.config.assume_utreexo {
@@ -634,10 +518,8 @@ impl Florestad {
             proxy,
             datadir: datadir.into(),
             fixed_peers: self.config.connect.clone(),
-            compact_filters: self.config.cfilters,
             assume_utreexo: picked,
             backfill: self.config.backfill,
-            filter_start_height: self.config.filters_start_height,
             user_agent: self.config.user_agent.clone(),
             allow_v1_fallback: self.config.allow_v1_fallback,
             ..Default::default()
@@ -658,7 +540,6 @@ impl Florestad {
             config,
             blockchain_state.clone(),
             mempool,
-            cfilters.clone(),
             kill_signal.clone(),
             AddressMan::new(None, &ReachableNetworks::SUPPORTED),
         )
@@ -684,6 +565,31 @@ impl Florestad {
         info!("Starting server");
         let wallet = Arc::new(wallet);
 
+        let filter_handle = if self.config.cfilters {
+            let path = datadir.join("cfilter_headers.dat");
+            let store = FlatFilterStore::new(&path)
+                .map_err(FlorestadError::CouldNotLoadCompactFiltersStore)?;
+            let manager =
+                FiltersMan::new(store, chain_provider.get_handle(), blockchain_state.clone())
+                    .with_default_rescan_start(self.config.filters_start_height);
+            blockchain_state.subscribe(manager.block_consumer());
+            let handle = manager.get_handle();
+            let filter_chain = blockchain_state.clone();
+
+            task::spawn(async move {
+                while filter_chain.ibd_state() == IBDState::HeadersSync {
+                    sleep(Duration::from_secs(1)).await;
+                }
+                info!("Starting compact-filter synchronization");
+                if let Err(error) = manager.main_loop().await {
+                    error!(%error, "Compact-filter manager stopped");
+                }
+            });
+            Some(handle)
+        } else {
+            None
+        };
+
         // JSON-RPC
         #[cfg(feature = "json-rpc")]
         {
@@ -691,10 +597,9 @@ impl Florestad {
                 blockchain_state.clone(),
                 wallet.clone(),
                 chain_provider.get_handle(),
+                filter_handle.clone(),
                 self.stop_signal.clone(),
                 self.config.network,
-                cfilters.clone(),
-                cfilters_start_resolved,
                 self.config
                     .json_rpc_address
                     .as_ref()
@@ -717,8 +622,8 @@ impl Florestad {
         let electrum_server = ElectrumServer::new(
             wallet,
             blockchain_state,
-            cfilters,
             chain_provider.get_handle(),
+            filter_handle,
         )
         .map_err(FlorestadError::CouldNotCreateElectrumServer)?;
 
@@ -1133,80 +1038,26 @@ impl From<Config> for Florestad {
     }
 }
 
-#[cfg(all(test, feature = "compact-filters"))]
-mod filter_start_height_sidecar_tests {
-    use std::env;
+#[cfg(test)]
+mod legacy_filter_store_tests {
+    use std::fs;
 
-    use super::read_applied_filter_start_height;
-    use super::store_covers_configured_range;
-    use super::write_applied_filter_start_height;
-
-    fn tmp_path(name: &str) -> std::path::PathBuf {
-        let mut p = env::temp_dir();
-        p.push(format!(
-            "floresta-filter-start-{}-{}",
-            std::process::id(),
-            name
-        ));
-        let _ = std::fs::remove_file(&p);
-        p
-    }
+    use super::remove_legacy_filter_store;
 
     #[test]
-    fn missing_file_reads_as_none() {
-        let p = tmp_path("missing");
-        assert_eq!(read_applied_filter_start_height(&p), None);
-    }
+    fn removes_legacy_files_and_keeps_the_header_store() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("cfilters"), b"filters").unwrap();
+        fs::create_dir(dir.path().join("cfilters-index")).unwrap();
+        fs::write(dir.path().join("cfilters-index").join("0"), b"index").unwrap();
+        fs::write(dir.path().join("cfilter_headers.dat"), b"headers").unwrap();
 
-    #[test]
-    fn write_then_read_roundtrips() {
-        let p = tmp_path("roundtrip");
-        write_applied_filter_start_height(&p, Some(800_000)).unwrap();
-        assert_eq!(read_applied_filter_start_height(&p), Some(800_000));
-        write_applied_filter_start_height(&p, Some(-100)).unwrap();
-        assert_eq!(read_applied_filter_start_height(&p), Some(-100));
-        let _ = std::fs::remove_file(&p);
-    }
+        remove_legacy_filter_store(dir.path());
+        // Idempotent once everything is gone.
+        remove_legacy_filter_store(dir.path());
 
-    #[test]
-    fn writing_none_removes_file() {
-        let p = tmp_path("clears");
-        write_applied_filter_start_height(&p, Some(123)).unwrap();
-        write_applied_filter_start_height(&p, None).unwrap();
-        assert_eq!(read_applied_filter_start_height(&p), None);
-        // Removing again must be idempotent.
-        write_applied_filter_start_height(&p, None).unwrap();
-    }
-
-    #[test]
-    fn covers_when_configured_at_or_after_previously_applied() {
-        // Identical → trivially covered, no wipe.
-        assert!(store_covers_configured_range(Some(800_000), Some(800_000)));
-        // Moving start later — store has more than we need, keep it.
-        assert!(store_covers_configured_range(Some(929_690), Some(822_375)));
-        // Same boundary on both ends → covered.
-        assert!(store_covers_configured_range(Some(0), Some(0)));
-    }
-
-    #[test]
-    fn does_not_cover_when_configured_moves_earlier() {
-        // User moves wallet birthday earlier → need filters we don't have.
-        assert!(!store_covers_configured_range(Some(822_375), Some(929_690)));
-        assert!(!store_covers_configured_range(Some(0), Some(800_000)));
-    }
-
-    #[test]
-    fn conservatively_wipes_on_none_or_negative_transitions() {
-        // Negative offsets-from-tip can't be compared without the current
-        // tip; behave like the original wipe-on-mismatch logic.
-        assert!(!store_covers_configured_range(Some(-100), Some(800_000)));
-        assert!(!store_covers_configured_range(Some(800_000), Some(-100)));
-        assert!(!store_covers_configured_range(Some(-50), Some(-100)));
-        // None ↔ Some transitions are also ambiguous (None defaults to "from
-        // genesis-ish" but the store may have been started elsewhere); wipe.
-        assert!(!store_covers_configured_range(Some(800_000), None));
-        assert!(!store_covers_configured_range(None, Some(800_000)));
-        // Both None: nothing changed, treat as covered.
-        assert!(store_covers_configured_range(None, None));
+        assert!(!dir.path().join("cfilters").exists());
+        assert!(!dir.path().join("cfilters-index").exists());
+        assert!(dir.path().join("cfilter_headers.dat").exists());
     }
 }

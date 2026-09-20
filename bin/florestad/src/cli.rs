@@ -109,7 +109,7 @@ pub struct Cli {
     pub rpc_address: Option<String>,
 
     #[arg(long, value_name = "HEIGHT")]
-    /// Download block filters starting at this height. Negative numbers are relative to the current tip.
+    /// Wallet birthday: compact-filter rescans start at this height unless told otherwise. Negative numbers are relative to the current tip.
     pub filters_start_height: Option<i32>,
 
     #[arg(long, default_value_t = false)]
