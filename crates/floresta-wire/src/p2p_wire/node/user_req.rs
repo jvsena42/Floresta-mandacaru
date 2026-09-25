@@ -209,10 +209,16 @@ where
                     stop_hash,
                 };
 
-                let peer = self.send_to_fast_peer(req, ServiceFlags::COMPACT_FILTERS);
-                if let Ok(peer) = peer {
-                    self.inflight_user_requests
-                        .insert(user_req, (peer, Instant::now(), responder));
+                match self.send_to_fast_peer(req, ServiceFlags::COMPACT_FILTERS) {
+                    Ok(peer) => {
+                        self.inflight_user_requests
+                            .insert(user_req, (peer, Instant::now(), responder));
+                    }
+                    Err(error) => {
+                        debug!(
+                            "Dropping user request {user_req:?}: no peer to send it to ({error:?})"
+                        )
+                    }
                 }
 
                 return;
@@ -228,11 +234,18 @@ where
                     return;
                 };
                 let request = NodeRequest::GetFilter((stop_hash, start_height));
-                if let Ok(peer) = self.send_to_fast_peer(request, ServiceFlags::COMPACT_FILTERS) {
-                    self.inflight_filter_batches
-                        .insert(user_req.clone(), Vec::with_capacity(block_hashes.len()));
-                    self.inflight_user_requests
-                        .insert(user_req, (peer, Instant::now(), responder));
+                match self.send_to_fast_peer(request, ServiceFlags::COMPACT_FILTERS) {
+                    Ok(peer) => {
+                        self.inflight_filter_batches
+                            .insert(user_req.clone(), Vec::with_capacity(block_hashes.len()));
+                        self.inflight_user_requests
+                            .insert(user_req, (peer, Instant::now(), responder));
+                    }
+                    Err(error) => {
+                        debug!(
+                            "Dropping user request {user_req:?}: no peer to send it to ({error:?})"
+                        )
+                    }
                 }
 
                 return;
@@ -244,19 +257,30 @@ where
             UserRequest::GetCFCheckpt { stop_hash } => {
                 self.wants_compact_filters = true;
                 let request = NodeRequest::GetCFCheckpt(stop_hash);
-                if let Ok(peer) = self.send_to_fast_peer(request, ServiceFlags::COMPACT_FILTERS) {
-                    self.inflight_user_requests
-                        .insert(user_req, (peer, Instant::now(), responder));
+                match self.send_to_fast_peer(request, ServiceFlags::COMPACT_FILTERS) {
+                    Ok(peer) => {
+                        self.inflight_user_requests
+                            .insert(user_req, (peer, Instant::now(), responder));
+                    }
+                    Err(error) => {
+                        debug!(
+                            "Dropping user request {user_req:?}: no peer to send it to ({error:?})"
+                        )
+                    }
                 }
 
                 return;
             }
         };
 
-        let peer = self.send_to_fast_peer(req, ServiceFlags::NONE);
-        if let Ok(peer) = peer {
-            self.inflight_user_requests
-                .insert(user_req, (peer, Instant::now(), responder));
+        match self.send_to_fast_peer(req, ServiceFlags::NONE) {
+            Ok(peer) => {
+                self.inflight_user_requests
+                    .insert(user_req, (peer, Instant::now(), responder));
+            }
+            Err(error) => {
+                debug!("Dropping user request {user_req:?}: no peer to send it to ({error:?})")
+            }
         }
     }
 

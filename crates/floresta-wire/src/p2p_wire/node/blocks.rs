@@ -98,8 +98,15 @@ where
             return Ok(());
         }
 
-        let peer =
-            self.send_to_fast_peer(NodeRequest::GetBlock(blocks.clone()), ServiceFlags::NETWORK)?;
+        let height = blocks
+            .iter()
+            .filter_map(|hash| self.known_height(hash))
+            .max();
+        let peer = self.send_to_fast_peer_at_height(
+            NodeRequest::GetBlock(blocks.clone()),
+            ServiceFlags::NETWORK,
+            height,
+        )?;
 
         for block in blocks.iter() {
             self.inflight
@@ -125,14 +132,20 @@ where
         let txdata_len = block.txdata.len();
         debug!("Received block {block_hash} from peer {peer}, with {txdata_len} txs");
 
+        let height = self.known_height(&block_hash);
+        if let Some(height) = height {
+            self.note_peer_height(peer, height);
+        }
+
         self.blocks
             .insert(block_hash, InflightBlock::new(block, peer));
 
         // We only need auxiliary utreexo data if there are non-coinbase transactions
         if txdata_len != 1 {
-            let utreexo_peer = self.send_to_fast_peer(
+            let utreexo_peer = self.send_to_fast_peer_at_height(
                 NodeRequest::GetBlockProof((block_hash, Bitmap::new(), Bitmap::new())),
                 service_flags::UTREEXO.into(),
+                height,
             )?;
 
             self.inflight.insert(
@@ -203,9 +216,10 @@ where
             .collect::<Vec<_>>();
 
         for block_hash in pending_blocks {
-            let peer = self.send_to_fast_peer(
+            let peer = self.send_to_fast_peer_at_height(
                 NodeRequest::GetBlockProof((block_hash, Bitmap::new(), Bitmap::new())),
                 service_flags::UTREEXO.into(),
+                self.known_height(&block_hash),
             )?;
 
             self.inflight.insert(

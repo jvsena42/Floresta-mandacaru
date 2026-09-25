@@ -34,6 +34,7 @@ use crate::node::InflightRequests;
 use crate::node::MAX_ADDRV2_ADDRESSES;
 use crate::node::NodeNotification;
 use crate::node::NodeRequest;
+use crate::node::PeerStatus;
 use crate::node::UtreexoNode;
 use crate::node::chain_selector_ctx::ChainSelector;
 use crate::node::periodic_job;
@@ -175,11 +176,10 @@ where
                 .has_address_for_service(ServiceFlags::COMPACT_FILTERS);
 
             if has_cf_candidate && self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
-                self.peers
-                    .values()
-                    .filter(|peer| peer.is_regular_peer())
-                    .choose(&mut rng())
-                    .and_then(|p| p.channel.send(NodeRequest::Shutdown).ok());
+                if let Some(peer) = self.expendable_regular_peer() {
+                    // The peer task may be gone already; nothing to do about it here
+                    let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
+                }
             }
 
             self.maybe_open_connection(ServiceFlags::COMPACT_FILTERS)?;
@@ -359,6 +359,10 @@ where
 
         self.last_block_request = self.chain.get_validation_index().unwrap_or(0);
 
+        // Blocks mined while we were catching up are only announced once, and that may have
+        // happened already: ask instead of waiting for the next block or the stale-tip timer.
+        try_and_log!(self.request_headers());
+
         let mut ticker = time::interval(RunningNode::MAINTENANCE_TICK);
         // If we fall behind, don't "catch up" by running maintenance repeatedly
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -508,8 +512,25 @@ where
             return Ok(());
         }
 
-        self.request_blocks(blocks)?;
+        // One getdata per batch, each to a peer of its own: a single slow or silent peer
+        // then holds back one batch, not everything we missed.
+        for batch in blocks.chunks(RunningNode::BLOCKS_PER_GETDATA) {
+            self.request_blocks(batch.to_vec())?;
+        }
         Ok(())
+    }
+
+    /// A regular peer we can drop to make room for another kind of connection. Utreexo peers
+    /// are scarce, so they are only picked when nothing else is left.
+    fn expendable_regular_peer(&self) -> Option<PeerId> {
+        let utreexo: ServiceFlags = service_flags::UTREEXO.into();
+        let regular_peers = || self.peers.iter().filter(|(_, peer)| peer.is_regular_peer());
+
+        regular_peers()
+            .filter(|(_, peer)| !peer.services.has(utreexo))
+            .choose(&mut rng())
+            .or_else(|| regular_peers().choose(&mut rng()))
+            .map(|(id, _)| *id)
     }
 
     /// If we think our tip is stale, we may disconnect one peer and try to get a new one.
@@ -548,6 +569,46 @@ where
         Ok(())
     }
 
+    /// Asks `peer` for headers when it claims more blocks than we have and no headers request
+    /// is pending. Peers only announce blocks mined after they connected, so this is the only
+    /// way to learn about blocks mined while we were down, asleep or still catching up.
+    fn request_headers_if_behind(
+        &mut self,
+        peer: PeerId,
+        peer_height: u32,
+    ) -> Result<(), WireError> {
+        if self.inflight.contains_key(&InflightRequests::Headers) {
+            return Ok(());
+        }
+
+        let (our_height, _) = self.chain.get_best_block()?;
+        if peer_height <= our_height {
+            return Ok(());
+        }
+
+        debug!("peer={peer} has {peer_height} blocks and we have {our_height}, asking for headers");
+        let locator = self.chain.get_block_locator()?;
+        self.send_to_peer(peer, NodeRequest::GetHeaders(locator))?;
+        self.inflight
+            .insert(InflightRequests::Headers, (peer, Instant::now()));
+
+        Ok(())
+    }
+
+    /// Asks a fast peer for headers, unless a headers request is pending.
+    fn request_headers(&mut self) -> Result<(), WireError> {
+        if self.inflight.contains_key(&InflightRequests::Headers) {
+            return Ok(());
+        }
+
+        let locator = self.chain.get_block_locator()?;
+        let peer = self.send_to_fast_peer(NodeRequest::GetHeaders(locator), ServiceFlags::NONE)?;
+        self.inflight
+            .insert(InflightRequests::Headers, (peer, Instant::now()));
+
+        Ok(())
+    }
+
     fn handle_new_block(&mut self, block: BlockHash, peer: u32) -> Result<(), WireError> {
         if self.inflight.contains_key(&InflightRequests::Headers) {
             return Ok(());
@@ -566,7 +627,7 @@ where
         Ok(())
     }
 
-    async fn handle_notification(
+    pub(crate) async fn handle_notification(
         &mut self,
         notification: NodeNotification,
     ) -> Result<(), WireError> {
@@ -632,6 +693,10 @@ where
                         }
 
                         if self.chain.get_block_header(&block).is_ok() {
+                            // A known block: the peer has it, whatever its handshake said
+                            if let Some(height) = self.known_height(&block) {
+                                self.note_peer_height(peer, height);
+                            }
                             return Ok(());
                         }
 
@@ -661,12 +726,16 @@ where
 
                             // this peer got us a new block, we should disconnect one of our regular peers
                             // and keep this one.
+                            let utreexo: ServiceFlags = service_flags::UTREEXO.into();
                             let peer_to_disconnect = self
                                 .peers
                                 .iter()
                                 // Don't disconnect manual connections
                                 .filter(|(_, info)| info.is_regular_peer())
-                                .min_by_key(|(k, _)| self.get_peer_score(**k))
+                                // Utreexo peers are scarce, keep them over the others
+                                .min_by_key(|(k, info)| {
+                                    (info.services.has(utreexo), self.get_peer_score(**k))
+                                })
                                 .map(|(peer, _)| *peer);
 
                             // disconnect the peer with the lowest score
@@ -718,20 +787,55 @@ where
                             self.chain.accept_header(*header)?;
 
                             // Call it again, since `accept_header` might reorg the chain
-                            let (_, best_hash) = self.chain.get_best_block()?;
+                            let (best_height, best_hash) = self.chain.get_best_block()?;
+                            let block_hash = header.block_hash();
 
-                            // this is a fork block, don't request the actual block.
-                            if header.prev_blockhash != best_hash {
+                            // A header that did not become our tip is a fork (or stale) block,
+                            // don't request the actual block.
+                            if block_hash != best_hash {
                                 continue;
                             }
 
-                            self.send_to_peer(
-                                peer,
-                                NodeRequest::GetBlock(vec![header.block_hash()]),
-                            )?;
+                            self.note_peer_height(peer, best_height);
+                            let announcers = self
+                                .context
+                                .last_invs
+                                .get(&block_hash)
+                                .map(|(_, peers)| peers.clone())
+                                .unwrap_or_default();
+                            for announcer in announcers {
+                                self.note_peer_height(announcer, best_height);
+                            }
+
+                            // Only the last few blocks are fetched right here; a long
+                            // headers message (we slept) is left to `ask_missed_block`, which
+                            // spreads the blocks over peers and bounds what is in memory.
+                            let behind =
+                                best_height.saturating_sub(self.chain.get_validation_index()?);
+                            if behind > RunningNode::BLOCKS_PER_GETDATA as u32
+                                || self.blocks.contains_key(&block_hash)
+                                || self
+                                    .inflight
+                                    .contains_key(&InflightRequests::Blocks(block_hash))
+                            {
+                                continue;
+                            }
+
+                            let serves_blocks = self.peers.get(&peer).is_some_and(|peer| {
+                                peer.has_any_service(&[
+                                    ServiceFlags::NETWORK,
+                                    ServiceFlags::NETWORK_LIMITED,
+                                ])
+                            });
+                            if !serves_blocks {
+                                self.request_blocks(vec![block_hash])?;
+                                continue;
+                            }
+
+                            self.send_to_peer(peer, NodeRequest::GetBlock(vec![block_hash]))?;
 
                             self.inflight.insert(
-                                InflightRequests::Blocks(header.block_hash()),
+                                InflightRequests::Blocks(block_hash),
                                 (peer, Instant::now()),
                             );
                         }
@@ -742,7 +846,16 @@ where
                             "handshake with peer={peer} succeeded feeler={:?}",
                             version.kind
                         );
+                        let peer_height = version.blocks;
                         self.handle_peer_ready(peer, version)?;
+
+                        // The handshake may have turned the peer into a feeler or dropped it
+                        let kept = self.peers.get(&peer).is_some_and(|peer| {
+                            peer.is_long_lived() && peer.state == PeerStatus::Ready
+                        });
+                        if kept {
+                            self.request_headers_if_behind(peer, peer_height)?;
+                        }
                     }
 
                     PeerMessages::Disconnected(idx) => {
