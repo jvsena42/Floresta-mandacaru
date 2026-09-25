@@ -702,6 +702,11 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
     /// So the rescan runs in its own task and this only collects what it found so far: clients
     /// keep being served meanwhile.
     fn drive_rescan(&mut self) {
+        // Addresses the wallet derived past its gap limit after a transaction landed
+        // near the end of the derived range: they are watched already, their past is not.
+        self.addresses_to_scan
+            .extend(self.address_cache.take_addresses_pending_rescan());
+
         let Some(mut rescan) = self.active_rescan.take() else {
             self.maybe_start_rescan();
             return;
@@ -959,8 +964,14 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
     }
 
     fn wallet_notify(&self, transactions: &[(Transaction, TxOut)]) {
+        // A script touched more than once in a block (spent from and paid, or paid twice)
+        // gets one notification: the status already covers the whole block.
+        let mut notified = HashSet::new();
         for (_, out) in transactions {
             let hash = get_spk_hash(&out.script_pubkey);
+            if !notified.insert(hash) {
+                continue;
+            }
             if let Some(client) = self.client_addresses.get(&hash) {
                 let history = self.address_cache.get_address_history(&hash);
 

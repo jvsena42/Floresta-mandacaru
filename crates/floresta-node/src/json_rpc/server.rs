@@ -226,9 +226,11 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let rescan = self.rescan.clone();
 
         tokio::spawn(async move {
+            // Whether `addresses` came from the wallet's pending-rescan queue
+            let mut from_queue = false;
             loop {
                 if let Err(error) = Self::rescan_with_block_filters(
-                    addresses,
+                    addresses.clone(),
                     chain.clone(),
                     wallet.clone(),
                     filters.clone(),
@@ -239,6 +241,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 .await
                 {
                     error!(?error, "wallet rescan failed");
+                    if from_queue {
+                        // Not lost: the next rescan, or the Electrum server, takes them again
+                        wallet.requeue_addresses_pending_rescan(addresses.clone());
+                    }
                     // The same wording a caller of the RPC would have got.
                     let rpc_error = error.rpc_error();
                     tracker.fail(match rpc_error.data.as_ref().and_then(Value::as_str) {
@@ -250,17 +256,28 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
                 // Checked after the slot is free: a `loaddescriptor` that loses the
                 // race for it from here on finds it free and rescans by itself.
-                if !rescan.take_followup() {
+                let followup = rescan.take_followup();
+                // Addresses derived past the gap limit by what this pass found: they
+                // may have history in the very range we just scanned.
+                let extended = wallet.take_addresses_pending_rescan();
+                if !followup && extended.is_empty() {
                     break;
                 }
                 let Some(next) = rescan.try_start() else {
                     // Whoever took the slot read the addresses after the follow-up
-                    // was requested, so the new descriptor is covered.
+                    // was requested, so the new descriptor is covered. The extended
+                    // addresses may not be: leave them for the next rescan.
+                    wallet.requeue_addresses_pending_rescan(extended);
                     break;
                 };
                 tracker = next;
-                addresses = wallet.get_cached_addresses();
-                (start, stop) = (None, None);
+                from_queue = !followup;
+                if followup {
+                    addresses = wallet.get_cached_addresses();
+                    (start, stop) = (None, None);
+                } else {
+                    addresses = extended;
+                }
             }
         });
     }
