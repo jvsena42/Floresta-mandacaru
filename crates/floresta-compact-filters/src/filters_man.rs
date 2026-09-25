@@ -65,9 +65,11 @@ const SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 /// than one peer. A batch that still doesn't validate means our header chain is off.
 const MAX_INVALID_BATCH_ATTEMPTS: u32 = 5;
 
-/// A rescan nobody asked about for this long was abandoned by its consumer (consumers poll many
-/// times per second). It is dropped so its task stops instead of holding a page of blocks forever.
-const RESCAN_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// A rescan nobody asked about for this many consecutive [`SYNC_INTERVAL`] ticks was abandoned by
+/// its consumer (consumers poll many times per second). It is dropped so its task stops instead of
+/// holding a page of blocks forever. Counting ticks rather than time keeps a device that slept
+/// (its clock jumps ahead on resume, the consumer never got to poll) from losing its rescan.
+const RESCAN_IDLE_TICKS: u32 = 20;
 
 /// Bits a BIP158 basic filter spends on each element, at the very least: a Golomb-Rice code with
 /// `P = 19` is a unary quotient of one bit or more followed by a 19-bit remainder.
@@ -441,8 +443,10 @@ struct RescanState {
     outcome: oneshot::Receiver<Result<(), String>>,
     /// The received `outcome`, kept because the channel only yields it once.
     result: Option<Result<(), String>>,
-    /// Last time the consumer asked about this rescan, to tell abandoned ones apart.
-    last_polled: Instant,
+    /// Whether the consumer asked about this rescan since the last tick.
+    polled: bool,
+    /// Consecutive ticks the consumer went without asking, to tell abandoned rescans apart.
+    idle_ticks: u32,
     page_size: usize,
     first_status: bool,
     start: u32,
@@ -682,24 +686,25 @@ where
                 }
                 connected = self.connected_blocks.recv() => {
                     if let Some(connected) = connected {
-                        let busy_since = Instant::now();
                         if let Err(error) = self.process_connected_block(connected).await {
                             warn!(%error, "failed to build compact filter for connected block");
                         }
                         self.republish_height();
                         self.report_contradictions().await;
-                        self.excuse_rescan_consumers(busy_since);
                     }
                 }
                 _ = sync_interval.tick() => {
+                    // Requests queued while the previous arm ran are the consumer's polls for
+                    // this interval; serve them before judging who went quiet.
+                    while let Ok(request) = self.requests.try_recv() {
+                        self.handle_request(request);
+                    }
                     self.prune_abandoned_rescans();
-                    let busy_since = Instant::now();
                     if let Err(error) = self.sync().await {
                         warn!(%error, "periodic compact-filter synchronization failed");
                     }
                     self.republish_height();
                     self.report_contradictions().await;
-                    self.excuse_rescan_consumers(busy_since);
                 }
             }
         }
@@ -799,7 +804,8 @@ where
                 blocks,
                 outcome,
                 result: None,
-                last_polled: Instant::now(),
+                polled: true,
+                idle_ticks: 0,
                 page_size,
                 first_status: true,
                 start,
@@ -837,7 +843,8 @@ where
                 blocks,
                 outcome,
                 result: None,
-                last_polled: Instant::now(),
+                polled: true,
+                idle_ticks: 0,
                 page_size: 1,
                 first_status: true,
                 start: tip,
@@ -854,14 +861,16 @@ where
             .rescans
             .get_mut(&ticket)
             .ok_or(FilterManError::RescanNotFound(ticket))?;
-        state.last_polled = Instant::now();
+        state.polled = true;
 
         // The outcome is sampled before the queue: the rescan task sends it after its last
         // block, so once it reads `Ok` an empty queue really means every match was consumed.
         // Anything short of an explicit `Ok` (a failure, or a task that died) is not a finish.
+        // Blocks matched before a failure are still handed out first: a consumer that resumes
+        // from where the scan got to must have seen them.
         let status = match Self::rescan_outcome(state) {
-            Some(Err(error)) => Err(FilterManError::RescanFailed(error)),
             _ if !state.blocks.is_empty() => return Ok(RescanStatus::Available),
+            Some(Err(error)) => Err(FilterManError::RescanFailed(error)),
             Some(Ok(())) => Ok(RescanStatus::Finished),
             None if state.first_status => {
                 state.first_status = false;
@@ -880,7 +889,7 @@ where
             .rescans
             .get_mut(&ticket)
             .ok_or(FilterManError::RescanNotFound(ticket))?;
-        state.last_polled = Instant::now();
+        state.polled = true;
 
         Ok(RescanProgress {
             start_height: state.start,
@@ -894,11 +903,14 @@ where
             .rescans
             .get_mut(&ticket)
             .ok_or(FilterManError::RescanNotFound(ticket))?;
-        state.last_polled = Instant::now();
+        state.polled = true;
 
-        if let Some(Err(error)) = Self::rescan_outcome(state) {
-            self.rescans.remove(&ticket);
-            return Err(FilterManError::RescanFailed(error));
+        // A failure is surfaced once the blocks matched before it were all handed out
+        if state.blocks.is_empty() {
+            if let Some(Err(error)) = Self::rescan_outcome(state) {
+                self.rescans.remove(&ticket);
+                return Err(FilterManError::RescanFailed(error));
+            }
         }
 
         let mut blocks = Vec::with_capacity(state.page_size);
@@ -929,19 +941,16 @@ where
         state.result.clone()
     }
 
-    /// The manager doesn't serve requests while it synchronizes, so time spent there says
-    /// nothing about whether a consumer is still around.
-    fn excuse_rescan_consumers(&mut self, busy_since: Instant) {
-        let busy_for = busy_since.elapsed();
-        for state in self.rescans.values_mut() {
-            state.last_polled += busy_for;
-        }
-    }
-
-    /// Drops the rescans whose consumer stopped asking about them.
+    /// Drops the rescans whose consumer stopped asking about them. Called once per tick, after
+    /// the manager served requests for a whole interval.
     fn prune_abandoned_rescans(&mut self) {
         self.rescans.retain(|ticket, state| {
-            let abandoned = state.last_polled.elapsed() > RESCAN_IDLE_TIMEOUT;
+            if core::mem::take(&mut state.polled) {
+                state.idle_ticks = 0;
+            } else {
+                state.idle_ticks += 1;
+            }
+            let abandoned = state.idle_ticks >= RESCAN_IDLE_TICKS;
             if abandoned {
                 warn!(?ticket, "dropping abandoned compact-filter rescan");
             }
@@ -2679,15 +2688,16 @@ mod tests {
 
     #[tokio::test]
     async fn rescan_task_that_dies_is_a_failure_and_idle_rescans_are_pruned() {
-        let (_file, store, chain, node, _block, _filter) = setup();
+        let (_file, store, chain, node, block, _filter) = setup();
         let mut manager = FiltersMan::new(store, node, chain);
-        let state = |outcome, last_polled| {
+        let state = |outcome, idle_ticks| {
             let (_block_sender, blocks) = mpsc::channel(1);
             RescanState {
                 blocks,
                 outcome,
                 result: None,
-                last_polled,
+                polled: false,
+                idle_ticks,
                 page_size: 1,
                 first_status: true,
                 start: 0,
@@ -2699,27 +2709,57 @@ mod tests {
         // Both senders dropped without an outcome, as after a panic. Not a finished rescan.
         let (outcome_sender, outcome) = oneshot::channel();
         drop(outcome_sender);
-        manager
-            .rescans
-            .insert(RescanTicket(7), state(outcome, Instant::now()));
+        manager.rescans.insert(RescanTicket(7), state(outcome, 0));
         assert!(matches!(
             manager.rescan_status(RescanTicket(7)),
             Err(FilterManError::RescanFailed(_))
         ));
         assert!(manager.rescans.is_empty());
 
+        // A block matched before the failure is handed out before the failure is reported
+        let (block_sender, blocks) = mpsc::channel(1);
+        block_sender.try_send(block.clone()).unwrap();
+        let (outcome_sender, outcome) = oneshot::channel();
+        outcome_sender.send(Err("boom".to_owned())).unwrap();
+        let mut failed = state(outcome, 0);
+        failed.blocks = blocks;
+        manager.rescans.insert(RescanTicket(6), failed);
+        assert!(matches!(
+            manager.rescan_status(RescanTicket(6)),
+            Ok(RescanStatus::Available)
+        ));
+        assert_eq!(manager.rescan_blocks(RescanTicket(6)).unwrap().len(), 1);
+        assert!(matches!(
+            manager.rescan_blocks(RescanTicket(6)),
+            Err(FilterManError::RescanFailed(_))
+        ));
+        assert!(manager.rescans.is_empty());
+
         let (_live_sender, live) = oneshot::channel();
         let (_idle_sender, idle) = oneshot::channel();
-        let long_ago = Instant::now() - RESCAN_IDLE_TIMEOUT - Duration::from_secs(1);
+        manager.rescans.insert(RescanTicket(8), state(live, 0));
         manager
             .rescans
-            .insert(RescanTicket(8), state(live, Instant::now()));
-        manager
-            .rescans
-            .insert(RescanTicket(9), state(idle, long_ago));
+            .insert(RescanTicket(9), state(idle, RESCAN_IDLE_TICKS - 1));
+        // A consumer that keeps polling is never idle, however long the wall clock says it took
+        manager.rescans.get_mut(&RescanTicket(8)).unwrap().polled = true;
         manager.prune_abandoned_rescans();
         assert!(manager.rescans.contains_key(&RescanTicket(8)));
         assert!(!manager.rescans.contains_key(&RescanTicket(9)));
+        assert_eq!(manager.rescans[&RescanTicket(8)].idle_ticks, 0);
+
+        // Ticks without a poll add up, one poll resets them
+        for _ in 0..RESCAN_IDLE_TICKS - 1 {
+            manager.prune_abandoned_rescans();
+        }
+        assert!(manager.rescans.contains_key(&RescanTicket(8)));
+        manager.rescan_progress(RescanTicket(8)).unwrap();
+        manager.prune_abandoned_rescans();
+        assert_eq!(manager.rescans[&RescanTicket(8)].idle_ticks, 0);
+        for _ in 0..RESCAN_IDLE_TICKS {
+            manager.prune_abandoned_rescans();
+        }
+        assert!(!manager.rescans.contains_key(&RescanTicket(8)));
     }
 
     #[tokio::test]
