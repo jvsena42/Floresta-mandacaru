@@ -62,20 +62,52 @@ where
 {
     // === SENDING TO PEERS ===
 
+    /// How far behind a requested height a peer's last known height may be for it to still be
+    /// asked first: about a day of blocks, so a peer that had the tip when it connected keeps
+    /// being preferred over one that was already far behind.
+    const RECENT_HEIGHT_MARGIN: u32 = 144;
+
     /// Picks a `Ready` peer supporting `service`, biased toward lower message latency.
     ///
     /// Each candidate weight is computed as `lowest_time / time_i`. For instance, if we have two
     /// candidates with latencies of 50ms and 100ms, weights are 1.0 and 0.5 respectively, and the
     /// probability of being chosen is 2/3 and 1/3.
-    fn choose_peer_by_latency(&self, service: ServiceFlags) -> Option<(&PeerId, &LocalPeerView)> {
+    ///
+    /// With `min_height`, peers known to have reached that height come first; failing that,
+    /// peers that were within [`Self::RECENT_HEIGHT_MARGIN`] blocks of it when we last heard
+    /// (they had the tip at handshake and just haven't told us about newer blocks); the rest
+    /// only when nobody else is left. A bridge a thousand blocks behind the tip cannot serve a
+    /// proof for a block it has not seen, and the request would only time out on it.
+    fn choose_peer_by_latency(
+        &self,
+        service: ServiceFlags,
+        min_height: Option<u32>,
+    ) -> Option<(&PeerId, &LocalPeerView)> {
         // Epsilon is a small positive floor for `f64`. If by any chance a peer has extremely low
         // message latency, we clamp it to `EPS` so `lowest_time / time_i` stays finite and stable.
         const EPS: f64 = 1e-9;
 
-        let candidates: Vec<(&PeerId, &LocalPeerView, f64)> = self
-            .peers
-            .iter()
-            .filter(|(_, peer)| peer.services.has(service) && peer.state == PeerStatus::Ready)
+        let is_ready =
+            |peer: &LocalPeerView| peer.services.has(service) && peer.state == PeerStatus::Ready;
+        let ready_peers = |at_least: u32| -> Vec<(&PeerId, &LocalPeerView)> {
+            self.peers
+                .iter()
+                .filter(|(_, peer)| is_ready(peer) && peer.height >= at_least)
+                .collect()
+        };
+
+        let tiers = match min_height {
+            Some(height) => vec![height, height.saturating_sub(Self::RECENT_HEIGHT_MARGIN), 0],
+            None => vec![0],
+        };
+        let ready_peers = tiers
+            .into_iter()
+            .map(ready_peers)
+            .find(|peers| !peers.is_empty())
+            .unwrap_or_default();
+
+        let candidates: Vec<(&PeerId, &LocalPeerView, f64)> = ready_peers
+            .into_iter()
             .filter_map(|(id, peer)| {
                 // Get the average message latency from each peer
                 let Some(t) = peer.message_times.value() else {
@@ -129,13 +161,36 @@ where
         request: NodeRequest,
         required_service: ServiceFlags,
     ) -> Result<PeerId, WireError> {
+        self.send_to_fast_peer_at_height(request, required_service, None)
+    }
+
+    /// Like [`Self::send_to_fast_peer`], preferring peers known to have reached `height`.
+    pub(crate) fn send_to_fast_peer_at_height(
+        &self,
+        request: NodeRequest,
+        required_service: ServiceFlags,
+        height: Option<u32>,
+    ) -> Result<PeerId, WireError> {
         let (peer_id, peer) = self
-            .choose_peer_by_latency(required_service)
+            .choose_peer_by_latency(required_service, height)
             .ok_or(WireError::NoPeersAvailable)?;
 
         peer.channel.send(request)?;
 
         Ok(*peer_id)
+    }
+
+    /// Records that `peer` has a block at `height`: it announced or served one, so it can be
+    /// asked for anything up to there.
+    pub(crate) fn note_peer_height(&mut self, peer: PeerId, height: u32) {
+        if let Some(peer_data) = self.peers.get_mut(&peer) {
+            peer_data.height = peer_data.height.max(height);
+        }
+    }
+
+    /// The height of `hash` in our chain, if we know it.
+    pub(crate) fn known_height(&self, hash: &BlockHash) -> Option<u32> {
+        self.chain.get_block_height(hash).ok().flatten()
     }
 
     #[inline]
@@ -801,7 +856,27 @@ where
                 continue;
             }
 
-            debug!("Request timed out: {req:?}");
+            debug!("Request timed out: {req:?} peer={peer}");
+            // Only answers feed the latency average, so a peer that never answers would keep
+            // the latency it earned on its handshake and stay a preferred pick. Count the
+            // timeout as a very slow answer instead.
+            // A peer that could not serve a block it claimed to have is treated as not
+            // having it, whatever its handshake said, so its claim stops attracting the
+            // requests for that height and above.
+            let unserved_height = match &req {
+                InflightRequests::Blocks(hash) | InflightRequests::UtreexoProof(hash) => {
+                    self.known_height(hash)
+                }
+                _ => None,
+            };
+            if let Some(peer_data) = self.peers.get_mut(&peer) {
+                peer_data
+                    .message_times
+                    .add((T::REQUEST_TIMEOUT * 1_000) as f64);
+                if let Some(height) = unserved_height {
+                    peer_data.height = peer_data.height.min(height.saturating_sub(1));
+                }
+            }
             if matches!(req, InflightRequests::Headers) {
                 let stalled_for = now.duration_since(time).as_secs();
                 info!(
@@ -911,9 +986,10 @@ where
                     return Ok(());
                 }
 
-                let peer = self.send_to_fast_peer(
+                let peer = self.send_to_fast_peer_at_height(
                     NodeRequest::GetBlockProof((*block_hash, Bitmap::new(), Bitmap::new())),
                     service_flags::UTREEXO.into(),
+                    self.known_height(block_hash),
                 )?;
 
                 self.inflight.insert(
