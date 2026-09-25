@@ -1159,10 +1159,34 @@ where
             });
         }
 
+        // Every chunk is waited for, whatever happened to the others: a chunk given up on here
+        // would still be in flight at the node, which refuses an identical request, so the
+        // retry could never get it and the batch would fail on it forever. The chunks that
+        // arrived are cached, so the retry asks only for what is still missing.
+        let mut failure: Option<FilterManError> = None;
+        // The most serious failure is the one reported: an invalid chunk has to count towards
+        // the batch's attempts at validation, a dead task or store error has to end the rescan,
+        // and neither may hide behind a peer that merely went away.
+        let mut record = |error: FilterManError| {
+            warn!(%error, "compact-filter chunk failed");
+            if failure
+                .as_ref()
+                .is_none_or(|kept| Self::failure_rank(&error) > Self::failure_rank(kept))
+            {
+                failure = Some(error);
+            }
+        };
         while let Some(response) = requests.join_next().await {
-            let (first, expected, received_filters) = response
-                .map_err(FilterManError::Task)?
-                .map_err(FilterManError::node)?;
+            let (first, expected, received_filters) = match response
+                .map_err(FilterManError::Task)
+                .and_then(|response| response.map_err(FilterManError::node))
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    record(error);
+                    continue;
+                }
+            };
             let validated = Self::accept_filters(
                 &store,
                 start + first as u32,
@@ -1182,12 +1206,16 @@ where
                         let stop_hash = block_hashes[first + expected - 1];
                         node.report_invalid_cfilters(stop_hash).await;
                     }
-                    return Err(error);
+                    record(error);
+                    continue;
                 }
             };
             for (offset, filter) in accepted.into_iter().enumerate() {
                 filters[first + offset] = Some(filter);
             }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
 
         Ok(block_hashes
@@ -1200,6 +1228,17 @@ where
                 )
             })
             .collect())
+    }
+
+    /// How much a chunk failure matters to the batch: transient network trouble is retried as
+    /// is, invalid data counts as an attempt, anything else ends the rescan.
+    fn failure_rank(error: &FilterManError) -> u8 {
+        match error {
+            FilterManError::Node(_) => 0,
+            FilterManError::StaleFilterHeaders(_) => 1,
+            FilterManError::InvalidFilter(_) | FilterManError::InvalidFilterCount { .. } => 2,
+            _ => 3,
+        }
     }
 
     /// Validates the filters a peer returned for the `expected` heights from `first_height` on,
@@ -2223,6 +2262,67 @@ mod tests {
         assert_eq!(received.len(), count);
         assert_eq!(filter_requests.load(Ordering::Relaxed), 2);
         assert_eq!(max_filter_requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_chunk_does_not_cost_the_chunks_that_arrived() {
+        let file = NamedTempFile::new().unwrap();
+        let mut store = FlatFilterStore::new(file.path()).unwrap();
+        let count = 2 * FILTER_REQUEST_SIZE;
+        let mut hashes = Vec::with_capacity(count);
+        let mut filters = HashMap::with_capacity(count);
+        let mut previous_header = FilterHeader::all_zeros();
+
+        for height in 0..count {
+            let height = height as u32;
+            let block_hash = mock_block_hash(height);
+            let filter = BlockFilter::new(&[&[0][..], &height.to_le_bytes()].concat());
+            previous_header = filter.filter_header(&previous_header);
+            store
+                .put_filter_header(block_hash, previous_header)
+                .unwrap();
+            hashes.push(block_hash);
+            filters.insert(block_hash, filter);
+        }
+        store.flush().unwrap();
+
+        let chain = MockChain {
+            hashes: Arc::new(hashes),
+        };
+        let node = MockNode::new(HashMap::new(), filters);
+        // The first chunk request the node serves fails, the other one is answered
+        node.filter_failures.store(1, Ordering::Relaxed);
+        let filter_requests = node.filter_requests.clone();
+        let store = Arc::new(Mutex::new(store));
+
+        let first_attempt = FiltersMan::<FlatFilterStore, MockChain, MockNode>::fetch_filters(
+            store.clone(),
+            node.clone(),
+            chain.clone(),
+            0,
+            count as u32 - 1,
+        )
+        .await;
+        assert!(matches!(first_attempt, Err(FilterManError::Node(_))));
+        assert_eq!(filter_requests.load(Ordering::Relaxed), 2);
+        // Exactly the chunk that arrived was kept
+        let cached = (0..count as u32)
+            .filter(|height| store.lock().unwrap().get_filter(*height).unwrap().is_some())
+            .count();
+        assert_eq!(cached, FILTER_REQUEST_SIZE);
+
+        // The chunk that arrived was kept, so the retry only asks for the missing one
+        let received = FiltersMan::<FlatFilterStore, MockChain, MockNode>::fetch_filters(
+            store,
+            node,
+            chain,
+            0,
+            count as u32 - 1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(received.len(), count);
+        assert_eq!(filter_requests.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
