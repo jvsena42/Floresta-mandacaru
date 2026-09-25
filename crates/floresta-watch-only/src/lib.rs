@@ -41,21 +41,28 @@ use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::sha256::Hash;
 use floresta_common::prelude::*;
 use merkle::MerkleProof;
+use miniscript::Descriptor;
+use miniscript::DescriptorPublicKey;
 use serde::Deserialize;
 use serde::Serialize;
 use sync::RwLock;
 use tracing::error;
 
 use crate::descriptor::DescriptorError;
-use crate::descriptor::derive_addresses_from_descriptor;
-use crate::descriptor::derive_addresses_from_list_descriptors;
+use crate::descriptor::derive_addresses_from_parsed_descriptor;
+use crate::descriptor::parse_and_split_descriptor;
 use crate::descriptor::parse_xpub;
 
-/// How much descriptors to derive each time.
+/// How many addresses to derive from a descriptor each time.
 const DERIVATION_COUNT: u32 = 100;
 
 /// Initial index for address derivation.
 const INDEX_INITIAL: u32 = 0;
+
+/// How many unused addresses to keep derived past the highest one seen in a transaction
+/// (BIP 44's gap limit). Wallets stop looking after this many unused addresses in a row, so
+/// nothing can be found further out.
+const GAP_LIMIT: u32 = 20;
 
 #[derive(Debug)]
 pub enum WatchOnlyError<DatabaseError: Debug> {
@@ -185,6 +192,11 @@ pub trait AddressCacheDatabase {
     fn save_descriptor(&self, descriptor: &str) -> Result<(), Self::Error>;
     /// Get associated descriptors
     fn get_descriptors(&self) -> Result<Vec<String>, Self::Error>;
+    /// Saves the addresses derived past the gap limit that still have to be rescanned,
+    /// replacing the previous set
+    fn save_pending_rescan(&self, addresses: &[ScriptBuf]) -> Result<(), Self::Error>;
+    /// Loads the addresses that still have to be rescanned
+    fn get_pending_rescan(&self) -> Result<Vec<ScriptBuf>, Self::Error>;
     /// Get a transaction from the database
     fn get_transaction(&self, txid: &Txid) -> Result<CachedTransaction, Self::Error>;
     /// Saves a transaction to the database
@@ -193,9 +205,23 @@ pub trait AddressCacheDatabase {
     fn list_transactions(&self) -> Result<Vec<Txid>, Self::Error>;
 }
 
+/// A single (non-multipath) descriptor and how far along its addresses are derived.
+struct DescriptorWindow {
+    descriptor: Descriptor<DescriptorPublicKey>,
+    /// Addresses `0..next_index` are cached
+    next_index: u32,
+}
+
 struct AddressCacheInner<D: AddressCacheDatabase> {
     /// A database that will be used to persist all needed to get our address history
     database: D,
+    /// The descriptors we follow, split into single descriptors
+    windows: Vec<DescriptorWindow>,
+    /// Which descriptor window an address came from, and at which index
+    script_origin: HashMap<Hash, (usize, u32)>,
+    /// Addresses derived after the wallet was last scanned. Their history, if any, is still
+    /// to be found: whoever runs the next rescan takes them.
+    pending_rescan: Vec<ScriptBuf>,
     /// Maps a hash to a cached address struct, this is basically an in-memory version
     /// of our database, used for speeding up processing a block. This hash is the electrum's
     /// script hash
@@ -234,6 +260,9 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                         .output
                         .get(txin.previous_output.vout as usize)
                         .expect("Did we cache an invalid utxo?");
+
+                    // The spent output, so a subscriber to that address hears its balance changed
+                    my_transactions.push((transaction.clone(), utxo.clone()));
 
                     let merkle_block = MerkleProof::from_block(block, position as u64, merkle);
 
@@ -291,11 +320,128 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
             address_map.insert(address.script_hash, address);
         }
 
-        Self {
+        let mut inner = Self {
             database,
             address_map,
             script_set,
             utxo_index,
+            windows: Vec::new(),
+            script_origin: HashMap::new(),
+            pending_rescan: Vec::new(),
+        };
+
+        // The addresses are persisted, how far each descriptor was derived is not: walk
+        // each one until a whole batch is unknown.
+        for descriptor in inner.database.get_descriptors().unwrap_or_default() {
+            if let Err(error) = inner.track_descriptor(&descriptor) {
+                error!("Could not derive addresses for descriptor {descriptor}: {error:?}");
+            }
+        }
+
+        // Addresses derived before a shutdown whose rescan never ran
+        inner.pending_rescan = inner.database.get_pending_rescan().unwrap_or_default();
+
+        // History cached while the gap limit was not enforced (or by a rescan that ended
+        // early) may sit near the end of a window: extend now, the queue takes the rest.
+        let with_history: Vec<Hash> = inner
+            .address_map
+            .iter()
+            .filter(|(_, address)| !address.transactions.is_empty())
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in with_history {
+            inner.maybe_extend_window(&hash);
+        }
+
+        inner
+    }
+
+    /// Starts following a descriptor: derives its first addresses, or picks up where an
+    /// earlier run left off when they are already cached. Returns every cached address of
+    /// the descriptor.
+    fn track_descriptor(&mut self, descriptor: &str) -> Result<Vec<ScriptBuf>, DescriptorError> {
+        let mut addresses = Vec::new();
+
+        for descriptor in parse_and_split_descriptor(descriptor)? {
+            let window = self.windows.len();
+            self.windows.push(DescriptorWindow {
+                descriptor,
+                next_index: INDEX_INITIAL,
+            });
+
+            let first = self.peek_batch(window)?;
+            addresses.extend(self.cache_batch(window, first));
+            loop {
+                let next = self.peek_batch(window)?;
+                // Batches are always cached whole, so one known address means the batch
+                // was derived by an earlier run
+                let known = next
+                    .iter()
+                    .all(|script| self.address_map.contains_key(&get_spk_hash(script)));
+                if !known {
+                    break;
+                }
+                addresses.extend(self.cache_batch(window, next));
+            }
+        }
+
+        Ok(addresses)
+    }
+
+    /// The next [`DERIVATION_COUNT`] addresses of a descriptor window, not cached yet.
+    fn peek_batch(&self, window: usize) -> Result<Vec<ScriptBuf>, DescriptorError> {
+        let window = &self.windows[window];
+        derive_addresses_from_parsed_descriptor(
+            window.descriptor.clone(),
+            window.next_index,
+            DERIVATION_COUNT,
+        )
+    }
+
+    /// Caches a batch from [`Self::peek_batch`] and moves the window past it.
+    fn cache_batch(&mut self, window: usize, scripts: Vec<ScriptBuf>) -> Vec<ScriptBuf> {
+        let start = self.windows[window].next_index;
+
+        for (offset, script) in scripts.iter().enumerate() {
+            self.cache_address(script.clone());
+            self.script_origin
+                .insert(get_spk_hash(script), (window, start + offset as u32));
+        }
+        self.windows[window].next_index = start + DERIVATION_COUNT;
+
+        scripts
+    }
+
+    /// Keeps [`GAP_LIMIT`] unused addresses derived past the one that just saw a
+    /// transaction. Newly derived addresses are queued for a rescan.
+    fn maybe_extend_window(&mut self, script_hash: &Hash) {
+        let Some(&(window, index)) = self.script_origin.get(script_hash) else {
+            return;
+        };
+
+        let wanted = index.saturating_add(1).saturating_add(GAP_LIMIT);
+        let mut extended = false;
+        while self.windows[window].next_index < wanted {
+            match self.peek_batch(window) {
+                Ok(scripts) => {
+                    let scripts = self.cache_batch(window, scripts);
+                    self.pending_rescan.extend(scripts);
+                    extended = true;
+                }
+                Err(error) => {
+                    error!("Error deriving addresses: {error:?}");
+                    break;
+                }
+            }
+        }
+        if extended {
+            self.persist_pending_rescan();
+        }
+    }
+
+    fn persist_pending_rescan(&self) {
+        if let Err(error) = self.database.save_pending_rescan(&self.pending_rescan) {
+            error!("Could not persist the addresses pending a rescan: {error:?}");
         }
     }
 
@@ -371,35 +517,6 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
             self.database.set_cache_height(0)?;
         }
         Ok(())
-    }
-
-    fn derive_addresses(&mut self) -> Result<(), WatchOnlyError<D::Error>> {
-        let mut stats = self.database.get_stats()?;
-        let descriptors = self.database.get_descriptors()?;
-
-        let addresses = derive_addresses_from_list_descriptors(
-            &descriptors,
-            stats.derivation_index,
-            DERIVATION_COUNT,
-        )
-        .map_err(WatchOnlyError::InvalidDescriptor)?;
-
-        addresses.iter().for_each(|address| {
-            self.cache_address(address.clone());
-        });
-
-        stats.derivation_index += DERIVATION_COUNT;
-        Ok(self.database.save_stats(&stats)?)
-    }
-
-    fn maybe_derive_addresses(&mut self) {
-        let stats = self.database.get_stats().unwrap();
-        if stats.transaction_count > (stats.derivation_index as usize * DERIVATION_COUNT as usize) {
-            let res = self.derive_addresses();
-            if res.is_err() {
-                error!("Error deriving addresses: {res:?}");
-            }
-        }
     }
 
     fn find_unconfirmed(&self) -> Result<Vec<Transaction>, WatchOnlyError<D::Error>> {
@@ -583,7 +700,7 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
             e.insert(new_address);
             self.script_set.insert(hash);
         }
-        self.maybe_derive_addresses();
+        self.maybe_extend_window(&hash);
         // Confirmed transaction
         if height > 0 {
             return self.save_non_mempool_tx(
@@ -695,18 +812,36 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
             return Err(WatchOnlyError::DuplicateDescriptor(descriptor.to_string()));
         }
 
-        let address_descriptors =
-            derive_addresses_from_descriptor(descriptor, INDEX_INITIAL, DERIVATION_COUNT)
-                .map_err(WatchOnlyError::InvalidDescriptor)?;
-
-        for address in address_descriptors.clone() {
-            self.cache_address(address);
-        }
-
-        let inner = self.inner.write().expect("poisoned lock");
+        let mut inner = self.inner.write().expect("poisoned lock");
+        let addresses = inner
+            .track_descriptor(descriptor)
+            .map_err(WatchOnlyError::InvalidDescriptor)?;
         inner.database.save_descriptor(descriptor)?;
 
-        Ok(address_descriptors)
+        Ok(addresses)
+    }
+
+    /// Addresses derived since the last call because a transaction landed near the end of a
+    /// descriptor's derived range. They are followed from now on; their past history is only
+    /// found by rescanning them.
+    pub fn take_addresses_pending_rescan(&self) -> Vec<ScriptBuf> {
+        let mut inner = self.inner.write().expect("poisoned lock");
+        let addresses = core::mem::take(&mut inner.pending_rescan);
+        if !addresses.is_empty() {
+            inner.persist_pending_rescan();
+        }
+        addresses
+    }
+
+    /// Hands back addresses taken with [`Self::take_addresses_pending_rescan`] that could not
+    /// be scanned after all.
+    pub fn requeue_addresses_pending_rescan(&self, addresses: Vec<ScriptBuf>) {
+        if addresses.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write().expect("poisoned lock");
+        inner.pending_rescan.extend(addresses);
+        inner.persist_pending_rescan();
     }
 
     /// Adds an XPUB to the wallet, derives descriptors from it, saves these descriptors persistently,
@@ -770,22 +905,12 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
         inner.get_merkle_proof(txid)
     }
 
-    pub fn derive_addresses(&self) -> Result<(), WatchOnlyError<D::Error>> {
-        let mut inner = self.inner.write().expect("poisoned lock");
-        inner.derive_addresses()
-    }
-
     pub fn get_stats(&self) -> Result<Stats, WatchOnlyError<D::Error>> {
         let inner = self.inner.read().expect("poisoned lock");
         inner
             .database
             .get_stats()
             .map_err(WatchOnlyError::DatabaseError)
-    }
-
-    pub fn maybe_derive_addresses(&self) {
-        let mut inner = self.inner.write().expect("poisoned lock");
-        inner.maybe_derive_addresses()
     }
 
     pub fn find_unconfirmed(&self) -> Result<Vec<Transaction>, WatchOnlyError<D::Error>> {
@@ -869,6 +994,8 @@ mod test {
     use bitcoin::Address;
     use bitcoin::OutPoint;
     use bitcoin::ScriptBuf;
+    use bitcoin::Transaction;
+    use bitcoin::TxOut;
     use bitcoin::Txid;
     use bitcoin::address::NetworkChecked;
     use bitcoin::consensus::Decodable;
@@ -882,6 +1009,9 @@ mod test {
     use super::AddressCache;
     use super::memory_database::MemoryDatabase;
     use crate::DERIVATION_COUNT;
+    use crate::descriptor::derive_addresses_from_descriptor;
+    use crate::descriptor::derive_addresses_from_parsed_descriptor;
+    use crate::descriptor::parse_and_split_descriptor;
     use crate::merkle::MerkleProof;
 
     const BLOCK_FIRST_UTXO: &str = "00000020b4f594a390823c53557c5a449fa12413cbbae02be529c11c4eb320ff8e000000dd1211eb35ca09dc0ee519b0f79319fae6ed32c66f8bbf353c38513e2132c435474d81633c4b011e195a220002010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff0403edce01feffffff028df2052a0100000016001481113cad52683679a83e76f76f84a4cfe36f75010000000000000000776a24aa21a9ed67863b4f356b7b9f3aab7a2037615989ef844a0917fb0a1dcd6c23a383ee346b4c4fecc7daa2490047304402203768ff10a948a2dd1825cc5a3b0d336d819ea68b5711add1390b290bf3b1cba202201d15e73791b2df4c0904fc3f7c7b2f22ab77762958e9bc76c625138ad3a04d290100012000000000000000000000000000000000000000000000000000000000000000000000000002000000000101be07b18750559a418d144f1530be380aa5f28a68a0269d6b2d0e6ff3ff25f3200000000000feffffff0240420f00000000001600142b6a2924aa9b1b115d1ac3098b0ba0e6ed510f2a326f55d94c060000160014c2ed86a626ee74d854a12c9bb6a9b72a80c0ddc50247304402204c47f6783800831bd2c75f44d8430bf4d962175349dc04d690a617de6c1eaed502200ffe70188a6e5ad89871b2acb4d0f732c2256c7ed641d2934c6e84069c792abc012103ba174d9c66078cf813d0ac54f5b19b5fe75104596bdd6c1731d9436ad8776f41ecce0100";
@@ -1058,14 +1188,14 @@ mod test {
 
         // [is_cached], [push_descriptor]
         let desc = "wsh(sortedmulti(1,[54ff5a12/48h/1h/0h/2h]tpubDDw6pwZA3hYxcSN32q7a5ynsKmWr4BbkBNHydHPKkM4BZwUfiK7tQ26h7USm8kA1E2FvCy7f7Er7QXKF8RNptATywydARtzgrxuPDwyYv4x/<0;1>/*,[bcf969c0/48h/1h/0h/2h]tpubDEFdgZdCPgQBTNtGj4h6AehK79Jm4LH54JrYBJjAtHMLEAth7LuY87awx9ZMiCURFzFWhxToRJK6xp39aqeJWrG5nuW3eBnXeMJcvDeDxfp/<0;1>/*))#fuw35j0q";
-        cache.push_descriptor(desc).unwrap();
+        let derived = cache.push_descriptor(desc).unwrap();
         assert!(cache.is_cached(desc).unwrap());
 
-        // [derive_addresses]
-        cache.derive_addresses().unwrap();
+        // The receive and change chains each got their first batch
+        assert_eq!(derived.len(), 2 * DERIVATION_COUNT as usize);
         assert_eq!(
-            cache.get_stats().unwrap().derivation_index,
-            DERIVATION_COUNT
+            cache.n_cached_addresses(),
+            1 + 2 * DERIVATION_COUNT as usize
         );
     }
 
@@ -1165,6 +1295,188 @@ mod test {
             .unwrap();
         assert_eq!(persisted.utxos, vec![change_outpoint]);
         assert_eq!(persisted.balance, 9_000);
+    }
+
+    /// The public BIP 84 descriptor from the descriptor tests, receive chain only.
+    const RECEIVE_DESCRIPTOR: &str = "wpkh(xpub6CbPqb3FCEjaF4LnfMwdEAUxKhC6ZP1sJzGiMMz3mfmcjXdFPM9LB9S8HSChXW593am685964YZk8Hng1ekynqNWGRZfpo8PpDaUmyvQqvY/0/*)";
+    const MULTIPATH_DESCRIPTOR: &str = "wpkh(xpub6CbPqb3FCEjaF4LnfMwdEAUxKhC6ZP1sJzGiMMz3mfmcjXdFPM9LB9S8HSChXW593am685964YZk8Hng1ekynqNWGRZfpo8PpDaUmyvQqvY/<0;1>/*)";
+
+    fn receive_script(index: u32) -> ScriptBuf {
+        derive_addresses_from_descriptor(RECEIVE_DESCRIPTOR, index, 1)
+            .unwrap()
+            .remove(0)
+    }
+
+    /// A block whose only transaction pays `value` to `script` from nowhere in particular.
+    fn block_paying(script: ScriptBuf, value: u64) -> bitcoin::Block {
+        use bitcoin::Amount;
+        use bitcoin::Sequence;
+        use bitcoin::TxIn;
+        use bitcoin::Witness;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version;
+
+        let mut block: bitcoin::Block = deserialize_from_str(BLOCK_FIRST_UTXO);
+        block.txdata = vec![Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: script,
+            }],
+        }];
+        block
+    }
+
+    #[test]
+    fn spent_outputs_are_reported_so_their_address_can_be_notified() {
+        use bitcoin::Sequence;
+        use bitcoin::TxIn;
+        use bitcoin::Witness;
+
+        let ours = receive_script(0);
+        // A script we don't follow
+        let theirs = receive_script(1);
+        let cache = get_test_cache();
+        cache.cache_address(ours.clone());
+
+        let funding = block_paying(ours.clone(), 10_000);
+        let funding_txid = funding.txdata[0].compute_txid();
+        assert_eq!(cache.block_process(&funding, 1).len(), 1);
+
+        // Spends our only coin, paying someone else: nothing is received, but the
+        // address that lost its coin has to be told.
+        let mut spend = block_paying(theirs.clone(), 9_000);
+        spend.txdata[0].input = vec![TxIn {
+            previous_output: OutPoint {
+                txid: funding_txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }];
+        let touched = cache.block_process(&spend, 2);
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].1.script_pubkey, ours);
+        assert_eq!(touched[0].1.value.to_sat(), 10_000);
+        assert_eq!(cache.get_address_balance(&get_spk_hash(&ours)), Some(0));
+    }
+
+    #[test]
+    fn a_transaction_near_the_end_of_the_window_derives_more_addresses() {
+        let cache = get_test_cache();
+        let derived = cache.push_descriptor(MULTIPATH_DESCRIPTOR).unwrap();
+        assert_eq!(derived.len(), 200);
+        assert!(cache.take_addresses_pending_rescan().is_empty());
+
+        // Well inside the window: nothing to do
+        cache.block_process(&block_paying(receive_script(50), 1_000), 1);
+        assert_eq!(cache.n_cached_addresses(), 200);
+        assert!(cache.take_addresses_pending_rescan().is_empty());
+
+        // Fewer than GAP_LIMIT unused addresses left past index 95: derive the next batch
+        // of the receive chain, and queue it for a rescan.
+        cache.block_process(&block_paying(receive_script(95), 1_000), 2);
+        assert_eq!(cache.n_cached_addresses(), 300);
+        let pending = cache.take_addresses_pending_rescan();
+        assert_eq!(pending.len(), DERIVATION_COUNT as usize);
+        assert!(pending.contains(&receive_script(150)));
+        assert!(cache.is_address_cached(&get_spk_hash(&receive_script(199))));
+        assert!(!cache.is_address_cached(&get_spk_hash(&receive_script(200))));
+
+        // A hit far beyond the window keeps deriving until the gap is covered again
+        cache.block_process(&block_paying(receive_script(199), 1_000), 3);
+        assert_eq!(cache.take_addresses_pending_rescan().len(), 100);
+        assert!(cache.is_address_cached(&get_spk_hash(&receive_script(299))));
+    }
+
+    #[test]
+    fn derived_windows_are_rebuilt_from_the_database() {
+        use crate::kv_database::KvDatabase;
+
+        let datadir = format!("./tmp-db/{}.watch-only-windows/", rand::random::<u32>());
+        {
+            let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+            cache.push_descriptor(MULTIPATH_DESCRIPTOR).unwrap();
+            cache.block_process(&block_paying(receive_script(95), 1_000), 1);
+            assert_eq!(cache.n_cached_addresses(), 300);
+            // The extension got its rescan before the restart
+            assert_eq!(cache.take_addresses_pending_rescan().len(), 100);
+        }
+
+        let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+        assert_eq!(cache.n_cached_addresses(), 300);
+        assert!(cache.take_addresses_pending_rescan().is_empty());
+
+        // The receive chain window resumes at 200, not at 100
+        cache.block_process(&block_paying(receive_script(150), 1_000), 2);
+        assert_eq!(cache.n_cached_addresses(), 300);
+        cache.block_process(&block_paying(receive_script(185), 1_000), 3);
+        assert_eq!(cache.n_cached_addresses(), 400);
+        assert_eq!(cache.take_addresses_pending_rescan().len(), 100);
+    }
+
+    #[test]
+    fn addresses_pending_a_rescan_survive_a_restart() {
+        use crate::kv_database::KvDatabase;
+
+        let datadir = format!("./tmp-db/{}.watch-only-pending/", rand::random::<u32>());
+        {
+            let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+            cache.push_descriptor(MULTIPATH_DESCRIPTOR).unwrap();
+            // Extends the receive chain, and the app is killed before anything rescans it
+            cache.block_process(&block_paying(receive_script(95), 1_000), 1);
+        }
+
+        let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+        let pending = cache.take_addresses_pending_rescan();
+        assert_eq!(pending.len(), DERIVATION_COUNT as usize);
+        assert!(pending.contains(&receive_script(150)));
+        assert!(cache.take_addresses_pending_rescan().is_empty());
+
+        // Taken is taken, also across a restart
+        drop(cache);
+        let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+        assert!(cache.take_addresses_pending_rescan().is_empty());
+    }
+
+    #[test]
+    fn history_near_the_end_of_a_window_extends_it_at_startup() {
+        use crate::kv_database::KvDatabase;
+
+        let datadir = format!("./tmp-db/{}.watch-only-upgrade/", rand::random::<u32>());
+        {
+            // A wallet written before the gap limit was enforced: the descriptor and the
+            // first 100 addresses of each chain, with history at index 95 and nothing
+            // derived past it.
+            let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+            for descriptor in parse_and_split_descriptor(MULTIPATH_DESCRIPTOR).unwrap() {
+                for script in
+                    derive_addresses_from_parsed_descriptor(descriptor, 0, DERIVATION_COUNT)
+                        .unwrap()
+                {
+                    cache.cache_address(script);
+                }
+            }
+            cache.block_process(&block_paying(receive_script(95), 1_000), 1);
+            assert_eq!(cache.n_cached_addresses(), 200);
+            let inner = cache.inner.read().unwrap();
+            crate::AddressCacheDatabase::save_descriptor(&inner.database, MULTIPATH_DESCRIPTOR)
+                .unwrap();
+        }
+
+        let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+        assert!(cache.is_address_cached(&get_spk_hash(&receive_script(199))));
+        let pending = cache.take_addresses_pending_rescan();
+        assert_eq!(pending.len(), DERIVATION_COUNT as usize);
+        assert!(pending.contains(&receive_script(100)));
     }
 
     #[test]

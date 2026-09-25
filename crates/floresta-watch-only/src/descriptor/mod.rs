@@ -80,7 +80,7 @@ pub(crate) fn parse_xpub(xpub: &str, network: Network) -> Result<Vec<String>, De
 }
 
 /// Parses a descriptor string, validates it, and splits it into single descriptors.
-fn parse_and_split_descriptor(
+pub(crate) fn parse_and_split_descriptor(
     descriptor: &str,
 ) -> Result<Vec<Descriptor<DescriptorPublicKey>>, DescriptorError> {
     let descriptor = Descriptor::<DescriptorPublicKey>::from_str(descriptor)?;
@@ -94,6 +94,7 @@ fn parse_and_split_descriptor(
 /// Derives addresses from a list of descriptors.
 /// Parses each descriptor, validates it, and derives the specified number of addresses
 /// starting from the given index.
+#[cfg(test)]
 pub(crate) fn derive_addresses_from_list_descriptors(
     descriptors: &[String],
     index: u32,
@@ -109,6 +110,7 @@ pub(crate) fn derive_addresses_from_list_descriptors(
 
 /// Derives addresses from a single descriptor string.
 /// Splits the descriptor into single descriptors and derives addresses for each one.
+#[cfg(test)]
 pub(crate) fn derive_addresses_from_descriptor(
     descriptor: &str,
     index: u32,
@@ -128,7 +130,7 @@ pub(crate) fn derive_addresses_from_descriptor(
 
 /// Derives addresses from a parsed descriptor.
 /// Generates the specified number of addresses starting from the given index.
-fn derive_addresses_from_parsed_descriptor(
+pub(crate) fn derive_addresses_from_parsed_descriptor(
     descriptor: Descriptor<DescriptorPublicKey>,
     index: u32,
     quantity: u32,

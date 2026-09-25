@@ -9,6 +9,7 @@ use core::fmt;
 use core::fmt::Display;
 use core::fmt::Formatter;
 
+use bitcoin::ScriptBuf;
 use bitcoin::Txid;
 use bitcoin::hashes::sha256;
 use floresta_common::prelude::sync::RwLock;
@@ -26,6 +27,7 @@ struct Inner {
     stats: Stats,
     height: u32,
     descriptors: Vec<String>,
+    pending_rescan: Vec<ScriptBuf>,
 }
 
 #[derive(Debug)]
@@ -121,6 +123,17 @@ impl AddressCacheDatabase for MemoryDatabase {
         self.get_inner_mut().map(|mut inner| {
             inner.descriptors.push(descriptor.into());
         })
+    }
+
+    /// Replace the addresses still to be rescanned.
+    fn save_pending_rescan(&self, addresses: &[ScriptBuf]) -> Result<()> {
+        self.get_inner_mut()?.pending_rescan = addresses.to_vec();
+        Ok(())
+    }
+
+    /// Get the addresses still to be rescanned.
+    fn get_pending_rescan(&self) -> Result<Vec<ScriptBuf>> {
+        Ok(self.get_inner()?.pending_rescan.clone())
     }
 
     /// Get the [`MemoryDatabase`]'s descriptors.
