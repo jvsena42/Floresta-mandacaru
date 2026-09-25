@@ -307,6 +307,7 @@ fn validate_many_inputs_block_benchmark(c: &mut Criterion) {
 }
 
 fn chainstore_checksum_benchmark(c: &mut Criterion) {
+    use floresta_chain::BestChain;
     use floresta_chain::ChainStore;
     use floresta_chain::DiskBlockHeader;
 
@@ -327,6 +328,17 @@ fn chainstore_checksum_benchmark(c: &mut Criterion) {
                 .update_block_index(height, header.block_hash())
                 .unwrap();
         });
+
+        // The checksum covers the headers up to the best block: record it like the node does
+        let tip = headers.last().unwrap();
+        chainstore
+            .save_height(&BestChain {
+                best_block: tip.block_hash(),
+                depth: (headers.len() - 1) as u32,
+                validation_index: tip.block_hash(),
+                alternative_tips: Vec::new(),
+            })
+            .unwrap();
 
         chainstore
     };
