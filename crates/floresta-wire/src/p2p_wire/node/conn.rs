@@ -591,29 +591,34 @@ where
             return Ok(());
         }
         let peers_count = self.peer_id_count;
-        for added_peer in self.added_peers.clone() {
-            let matching_peer = self
+        let now = Instant::now();
+        for index in 0..self.added_peers.len() {
+            let added_peer = &self.added_peers[index];
+            let connected = self
                 .peers
                 .values()
-                .find(|peer| *peer.address.as_bitcoin_socket_addr() == added_peer.address);
-
-            if matching_peer.is_none() {
-                let address = LocalAddress::new(
-                    added_peer.address.clone(),
-                    0,
-                    AddressState::Tried(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                    ),
-                    ServiceFlags::NONE,
-                    peers_count as usize,
-                );
-
-                // Finally, open the connection with the node
-                self.open_connection(ConnectionKind::Manual, address, added_peer.v1_fallback)?
+                .any(|peer| *peer.address.as_bitcoin_socket_addr() == added_peer.address);
+            if connected || !added_peer.due(now) {
+                continue;
             }
+
+            let address = LocalAddress::new(
+                added_peer.address.clone(),
+                0,
+                AddressState::Tried(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                ),
+                ServiceFlags::NONE,
+                peers_count as usize,
+            );
+            let v1_fallback = added_peer.v1_fallback;
+            self.added_peers[index].note_attempt(now);
+
+            // Finally, open the connection with the node
+            self.open_connection(ConnectionKind::Manual, address, v1_fallback)?
         }
         Ok(())
     }
