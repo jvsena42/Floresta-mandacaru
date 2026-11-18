@@ -903,16 +903,26 @@ where
                 );
             }
             if let Some(peer_data) = self.peers.get(&peer) {
+                let kind = peer_data.kind;
+                let idx = peer_data.address.id;
+
                 // Do not disconnect peers on missing address replies, except for
                 // short-lived connections.
-                if matches!(req, InflightRequests::GetAddresses) && !peer_data.kind.is_short_lived()
-                {
+                if matches!(req, InflightRequests::GetAddresses) && !kind.is_short_lived() {
                     continue;
                 }
 
                 // Disconnect peers on timeout unless they are manual (and completed handshake).
-                if !peer_data.kind.is_manual() || matches!(req, InflightRequests::Connect(_)) {
-                    let idx = peer_data.address.id;
+                let is_connect = matches!(req, InflightRequests::Connect(_));
+                let mut disconnect = !kind.is_manual() || is_connect;
+                // Contexts that only want a fast re-issue keep a slow peer, at a cost.
+                if disconnect && !T::DISCONNECT_ON_TIMEOUT && !is_connect && !kind.is_short_lived()
+                {
+                    disconnect = false;
+                    try_and_log!(self.increase_banscore(peer, 1));
+                }
+
+                if disconnect {
                     let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
 
                     // Remove the peer before retrying, without waiting for its task to stop.

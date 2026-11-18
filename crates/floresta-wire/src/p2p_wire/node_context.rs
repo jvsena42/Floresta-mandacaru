@@ -34,6 +34,13 @@ pub trait NodeContext {
     /// How long we wait for a peer to respond to our request
     const REQUEST_TIMEOUT: u64;
 
+    /// Whether a non-manual peer that lets a request time out is disconnected.
+    ///
+    /// Contexts with a deliberately short [`Self::REQUEST_TIMEOUT`] turn this off: they only
+    /// want the request re-issued to another peer, and a peer that is merely slow on a poor
+    /// link is penalized instead of dropped.
+    const DISCONNECT_ON_TIMEOUT: bool = true;
+
     /// Max number of simultaneous connections we initiates we are willing to hold
     const MAX_OUTGOING_PEERS: usize = 10;
 

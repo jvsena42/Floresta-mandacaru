@@ -125,6 +125,24 @@ mod tests {
     }
 
     #[tokio::test]
+    // Verifies that the chain selector's short header timeout re-issues the request
+    // without dropping the slow peer, which is only penalized.
+    async fn test_chain_selector_timeout_keeps_slow_peer() {
+        let mut node = latency_node::<ChainSelector>();
+        let expired_time = Instant::now() - Duration::from_secs(ChainSelector::REQUEST_TIMEOUT + 1);
+        node.inflight
+            .insert(InflightRequests::Headers, (0, expired_time));
+
+        node.check_for_timeout().unwrap();
+
+        assert!(node.peers.contains_key(&0));
+        assert_eq!(node.peers[&0].banscore, 1);
+        let (peer, sent_at) = node.inflight[&InflightRequests::Headers];
+        assert!(sent_at > expired_time);
+        assert!(node.peers.contains_key(&peer));
+    }
+
+    #[tokio::test]
     // Verifies that address timeouts preserve ordinary peers and manual data requests
     // are retried, while short-lived and handshake timeouts still disconnect in every context.
     async fn test_address_timeout() {

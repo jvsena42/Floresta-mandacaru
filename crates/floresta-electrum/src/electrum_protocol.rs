@@ -677,9 +677,10 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             )
             .await
             {
-                // Take in new blocks before each request. Otherwise, clients
-                // that send a request at least once a second hold them back.
+                // Take in new blocks and rescan results before each request. Otherwise,
+                // clients that send a request at least once a second hold them back.
                 self.handle_blocks(blocks);
+                self.drive_rescan();
 
                 if let Some(message) = request {
                     self.handle_message(message).await?;

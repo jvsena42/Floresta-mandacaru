@@ -946,7 +946,7 @@ version = "0.5.1"
 dependencies = [
  "bitcoin",
  "floresta-chain",
- "floresta-common 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "floresta-common",
  "floresta-compact-filters",
  "floresta-domain",
  "floresta-electrum",
@@ -969,7 +969,7 @@ dependencies = [
  "bitcoin_hashes 1.1.0",
  "bitcoinkernel",
  "criterion",
- "floresta-common 1.0.0",
+ "floresta-common",
  "floresta-metrics",
  "hex",
  "lru",
@@ -992,7 +992,7 @@ dependencies = [
  "anyhow",
  "bitcoin",
  "clap",
- "floresta-common 1.0.0",
+ "floresta-common",
  "floresta-rpc",
  "serde_json",
 ]
@@ -1007,24 +1007,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "floresta-common"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3718d865bd8345a920619eaa4a150f8e75cf70582354d67306b899075f9f40b"
-dependencies = [
- "bitcoin",
- "hashbrown 0.17.1",
- "spin",
- "tracing",
-]
-
-[[package]]
 name = "floresta-compact-filters"
 version = "0.5.1"
 dependencies = [
  "bitcoin",
  "floresta-chain",
- "floresta-common 1.0.0",
+ "floresta-common",
  "tempfile",
  "tokio",
  "tracing",
@@ -1044,7 +1032,7 @@ version = "0.5.1"
 dependencies = [
  "bitcoin",
  "floresta-chain",
- "floresta-common 1.0.0",
+ "floresta-common",
  "floresta-compact-filters",
  "floresta-domain",
  "floresta-mempool",
@@ -1084,7 +1072,7 @@ dependencies = [
  "ahash",
  "bitcoin",
  "floresta-chain",
- "floresta-common 1.0.0",
+ "floresta-common",
  "floresta-domain",
  "rand 0.10.2",
  "rustreexo",
@@ -1110,7 +1098,7 @@ dependencies = [
  "bitcoin",
  "dns-lookup",
  "floresta-chain",
- "floresta-common 1.0.0",
+ "floresta-common",
  "floresta-compact-filters",
  "floresta-domain",
  "floresta-electrum",
@@ -1169,7 +1157,7 @@ version = "0.5.1"
 dependencies = [
  "bitcoin",
  "floresta-chain",
- "floresta-common 1.0.0",
+ "floresta-common",
  "floresta-domain",
  "kv",
  "miniscript",
@@ -1189,7 +1177,7 @@ dependencies = [
  "derive_more",
  "dns-lookup",
  "floresta-chain",
- "floresta-common 1.0.0",
+ "floresta-common",
  "floresta-domain",
  "floresta-mempool",
  "floresta-metrics",
@@ -1214,7 +1202,7 @@ dependencies = [
  "clap",
  "console-subscriber",
  "dirs",
- "floresta-common 1.0.0",
+ "floresta-common",
  "floresta-node",
  "libc",
  "tokio",

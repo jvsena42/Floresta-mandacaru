@@ -34,7 +34,7 @@ required-features = ["chain", "common", "watch-only-memory-database"]
 
 [dependencies]
 floresta-chain = { path = "../floresta-chain", optional = true, default-features = false }
-floresta-common = { version = "=1.0.0", optional = true, default-features = false }
+floresta-common = { path = "../floresta-common", optional = true, default-features = false }
 floresta-compact-filters = { path = "../floresta-compact-filters", optional = true, default-features = false }
 floresta-domain = { path = "../floresta-domain", optional = true, default-features = false }
 floresta-electrum = { path = "../floresta-electrum", optional = true, default-features = false }

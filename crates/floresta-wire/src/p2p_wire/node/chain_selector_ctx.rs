@@ -159,6 +159,10 @@ impl ChainSelector {
 impl NodeContext for ChainSelector {
     const REQUEST_TIMEOUT: u64 = 10; // Detect stalled IBD peers quickly so we re-issue to a fresh fast peer
 
+    // A 2,000-header batch can take over 10 s on a phone's cellular link; dropping every
+    // peer that slow would churn the whole outbound set during header sync.
+    const DISCONNECT_ON_TIMEOUT: bool = false;
+
     // Since we don't have any peers when chain selection starts, we use a more aggressive batch
     // size to make sure we get to our `MAX_OUTGOING_CONNECTIONS` ASAP
     const NEW_CONNECTIONS_BATCH_SIZE: usize = 12;
