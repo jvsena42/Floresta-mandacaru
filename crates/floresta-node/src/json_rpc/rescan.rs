@@ -33,7 +33,8 @@ type Result<T> = std::result::Result<T, JsonRpcError>;
 
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     /// Runs a tracked wallet rescan in the background, followed by one more
-    /// pass over every cached address for each descriptor loaded meanwhile.
+    /// pass over every cached address for each descriptor loaded meanwhile, and
+    /// by a pass over the addresses the wallet derived while scanning.
     pub(super) fn spawn_wallet_rescan(
         &self,
         filters: FilterManHandle,
@@ -47,8 +48,11 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let rescan = self.rescan.clone();
 
         tokio::spawn(async move {
+            // Addresses taken from the wallet's pending-rescan queue that the current pass
+            // covers: handed back if it fails, so the next rescan takes them again.
+            let mut taken: Vec<ScriptBuf> = Vec::new();
             loop {
-                if let Err(error) = Self::rescan_with_block_filters(
+                let result = Self::rescan_with_block_filters(
                     addresses,
                     chain.clone(),
                     wallet.clone(),
@@ -57,8 +61,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                     stop,
                     Some(&tracker),
                 )
-                .await
-                {
+                .await;
+                let failed = result.is_err();
+                if let Err(error) = result {
                     error!(?error, "wallet rescan failed");
                     // The same wording a caller of the RPC would have got.
                     let rpc_error = error.rpc_error();
@@ -66,31 +71,62 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                         Some(detail) => format!("{}: {detail}", rpc_error.message),
                         None => rpc_error.message,
                     });
+                    Self::requeue(&wallet, std::mem::take(&mut taken));
                 }
                 drop(tracker);
 
                 // Checked after the slot is free: a `loaddescriptor` that loses the
                 // race for it from here on finds it free and rescans by itself.
-                if !rescan.take_followup() {
+                let followup = rescan.take_followup();
+                // Addresses derived past the horizon by what this pass found: they may
+                // have history in the very range just scanned. After a failure they stay
+                // queued instead, or a rescan that keeps failing would never stop.
+                let derived = if failed {
+                    Vec::new()
+                } else {
+                    wallet
+                        .take_addresses_pending_rescan()
+                        .unwrap_or_else(|error| {
+                            error!(%error, "could not read the addresses pending a rescan");
+                            Vec::new()
+                        })
+                };
+                if !followup && derived.is_empty() {
                     break;
                 }
                 let Some(next) = rescan.try_start() else {
                     // Whoever took the slot read the addresses after the follow-up
-                    // was requested, so the new descriptor is covered.
+                    // was requested, so the new descriptor is covered. The derived
+                    // addresses may not be: leave them for the next rescan.
+                    Self::requeue(&wallet, derived);
                     break;
                 };
-                addresses = match wallet.get_cached_addresses() {
-                    Ok(addresses) => addresses,
-                    Err(error) => {
-                        error!(%error, "could not read the wallet's addresses for a follow-up rescan");
-                        next.fail(format!("Wallet error: {error}"));
-                        break;
-                    }
-                };
+                taken = derived;
+                if followup {
+                    // Every cached address, the derived ones included, over the whole chain
+                    addresses = match wallet.get_cached_addresses() {
+                        Ok(addresses) => addresses,
+                        Err(error) => {
+                            error!(%error, "could not read the wallet's addresses for a follow-up rescan");
+                            next.fail(format!("Wallet error: {error}"));
+                            Self::requeue(&wallet, taken);
+                            break;
+                        }
+                    };
+                    (start, stop) = (None, None);
+                } else {
+                    // Only the derived addresses, over the range just scanned
+                    addresses = taken.clone();
+                }
                 tracker = next;
-                (start, stop) = (None, None);
             }
         });
+    }
+
+    fn requeue(wallet: &AddressCache<KvDatabase>, addresses: Vec<ScriptBuf>) {
+        if let Err(error) = wallet.requeue_addresses_pending_rescan(addresses) {
+            error!(%error, "could not requeue the addresses pending a rescan");
+        }
     }
 }
 

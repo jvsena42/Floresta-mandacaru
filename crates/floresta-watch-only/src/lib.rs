@@ -156,6 +156,11 @@ pub trait AddressCacheDatabase {
     fn save_descriptor(&self, descriptor: &str) -> Result<(), Self::Error>;
     /// Get associated descriptors
     fn get_descriptors(&self) -> Result<Vec<String>, Self::Error>;
+    /// Saves the derived addresses whose history still has to be rescanned, replacing the
+    /// previous set
+    fn save_pending_rescan(&self, addresses: &[ScriptBuf]) -> Result<(), Self::Error>;
+    /// Loads the derived addresses whose history still has to be rescanned
+    fn get_pending_rescan(&self) -> Result<Vec<ScriptBuf>, Self::Error>;
     /// Get a transaction from the database
     fn get_transaction(&self, txid: &Txid) -> Result<CachedTransaction, Self::Error>;
     /// Saves a transaction to the database
@@ -178,14 +183,20 @@ struct AddressCacheInner<D: AddressCacheDatabase> {
     /// Maps the script hash of a derived address to its derivation index. Not persisted,
     /// rebuilt in [`AddressCacheInner::new`].
     derived_index: HashMap<Hash, u32>,
+    /// Addresses derived past the horizon after a payment near it. They are followed from
+    /// then on, but their history in blocks already processed is only found by a rescan:
+    /// whoever runs the next one takes them. Mirrored in the database, so an app killed
+    /// before that rescan does not lose them.
+    pending_rescan: Vec<ScriptBuf>,
 }
 
 impl<D: AddressCacheDatabase> AddressCacheInner<D>
 where
     WatchOnlyError: From<<D as AddressCacheDatabase>::Error>,
 {
-    /// Iterates through a block, finds transactions destined to ourselves.
-    /// Returns all transactions we found.
+    /// Iterates through a block, finds transactions that pay to or spend from ourselves.
+    /// Returns each of them with the output it touches: the output paying us, or the output of
+    /// ours an input spends.
     fn block_process(
         &mut self,
         block: &Block,
@@ -211,6 +222,10 @@ where
                         .output
                         .get(txin.previous_output.vout as usize)
                         .expect("Did we cache an invalid utxo?");
+
+                    // The spent output, so that a subscriber to its address hears that its
+                    // balance changed
+                    my_transactions.push((transaction.clone(), utxo.clone()));
 
                     let merkle_block = MerkleProof::from_block(block, position as u64, merkle);
 
@@ -274,7 +289,14 @@ where
             script_set,
             utxo_index,
             derived_index: HashMap::new(),
+            pending_rescan: Vec::new(),
         };
+
+        // Addresses derived before a shutdown whose rescan never ran
+        inner.pending_rescan = inner.database.get_pending_rescan().unwrap_or_else(|error| {
+            error!("Could not load the addresses pending a rescan: {error:?}");
+            Vec::new()
+        });
 
         // Wallets created before this field was maintained have 100 addresses derived and
         // a `derivation_index` of 0.
@@ -294,6 +316,19 @@ where
             inner
                 .derive_range(&descriptors, INDEX_INITIAL, stats.derivation_index)
                 .expect("Stored descriptors are valid");
+
+            // History found near the horizon before it was enforced, or by a rescan that
+            // stopped early, has not derived the next batch yet. Newly derived addresses have
+            // no history yet, so one pass is enough.
+            let used: Vec<Hash> = inner
+                .address_map
+                .values()
+                .filter(|address| !address.transactions.is_empty())
+                .map(|address| address.script_hash)
+                .collect();
+            for hash in used {
+                inner.maybe_derive_addresses(&hash);
+            }
         }
 
         inner
@@ -412,10 +447,27 @@ where
         let mut stats = self.database.get_stats()?;
         let descriptors = self.database.get_descriptors()?;
 
-        self.derive_range(&descriptors, stats.derivation_index, DERIVATION_COUNT)?;
+        let derived = self.derive_range(&descriptors, stats.derivation_index, DERIVATION_COUNT)?;
 
         stats.derivation_index += DERIVATION_COUNT;
-        Ok(self.database.save_stats(&stats)?)
+        self.database.save_stats(&stats)?;
+
+        // A payment near the horizon is often found by a rescan, or in a block that also paid
+        // the next addresses: queue them so their history in the range already scanned is
+        // looked for too. Scripts of descriptors without a wildcard come back with every
+        // batch: they are not new.
+        let derived = derived
+            .into_iter()
+            .filter(|script| self.derived_index.contains_key(&get_spk_hash(script)));
+        self.pending_rescan.extend(derived);
+        self.persist_pending_rescan();
+        Ok(())
+    }
+
+    fn persist_pending_rescan(&self) {
+        if let Err(error) = self.database.save_pending_rescan(&self.pending_rescan) {
+            error!("Could not persist the addresses pending a rescan: {error:?}");
+        }
     }
 
     /// Derives another batch if `hash` is a derived address within [`GAP_LIMIT`] of the horizon.
@@ -852,6 +904,37 @@ where
     pub fn derive_addresses(&self) -> Result<(), WatchOnlyError> {
         let mut inner = self.get_inner_write()?;
         inner.derive_addresses()
+    }
+
+    /// Takes the addresses derived past the horizon since the last call. They are followed
+    /// already; their history in blocks already processed is only found by rescanning them.
+    /// Hand them back with [`Self::requeue_addresses_pending_rescan`] if that rescan fails.
+    pub fn take_addresses_pending_rescan(&self) -> Result<Vec<ScriptBuf>, WatchOnlyError> {
+        let mut inner = self.get_inner_write()?;
+        let addresses = core::mem::take(&mut inner.pending_rescan);
+        if !addresses.is_empty() {
+            inner.database.save_pending_rescan(&[])?;
+        }
+        Ok(addresses)
+    }
+
+    /// Hands back addresses taken with [`Self::take_addresses_pending_rescan`] that could not
+    /// be rescanned after all.
+    pub fn requeue_addresses_pending_rescan(
+        &self,
+        addresses: Vec<ScriptBuf>,
+    ) -> Result<(), WatchOnlyError> {
+        if addresses.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.get_inner_write()?;
+        for address in addresses {
+            if !inner.pending_rescan.contains(&address) {
+                inner.pending_rescan.push(address);
+            }
+        }
+        inner.database.save_pending_rescan(&inner.pending_rescan)?;
+        Ok(())
     }
 
     pub fn get_stats(&self) -> Result<Stats, WatchOnlyError> {
@@ -1385,6 +1468,177 @@ mod test {
         let cache = AddressCache::new(database, ConsensusMerkle);
 
         assert_eq!(derivation_index(&cache), DERIVATION_COUNT);
+    }
+
+    /// A block whose only transaction pays `value` to `script` from `spending`, or from
+    /// nowhere in particular.
+    fn block_paying(script: &ScriptBuf, value: u64, spending: Option<OutPoint>) -> bitcoin::Block {
+        use bitcoin::Sequence;
+        use bitcoin::TxIn;
+        use bitcoin::Witness;
+
+        let mut block: bitcoin::Block = deserialize_from_str(BLOCK_FIRST_UTXO);
+        block.txdata = vec![Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: spending.unwrap_or_else(OutPoint::null),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: script.clone(),
+            }],
+        }];
+        block
+    }
+
+    fn temp_datadir(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!(
+            "./tmp-db/{}.{name}.floresta",
+            rand::random::<u32>()
+        ))
+    }
+
+    #[test]
+    fn test_spent_outputs_are_reported_for_notification() {
+        let ours = script_at(DESC_A, 0);
+        // A script we don't follow
+        let theirs = script_at(DESC_B, 0);
+        let cache = get_test_cache();
+        cache.cache_address(ours.clone()).unwrap();
+
+        let funding = block_paying(&ours, 10_000, None);
+        let funding_txid = funding.txdata[0].compute_txid();
+        assert_eq!(cache.block_process(&funding, 1).unwrap().len(), 1);
+
+        // Spends our only coin, paying someone else: nothing is received, but the address
+        // that lost its coin has to be told.
+        let spend = block_paying(
+            &theirs,
+            9_000,
+            Some(OutPoint {
+                txid: funding_txid,
+                vout: 0,
+            }),
+        );
+        let touched = cache.block_process(&spend, 2).unwrap();
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].1.script_pubkey, ours);
+        assert_eq!(touched[0].1.value.to_sat(), 10_000);
+        assert_eq!(
+            cache.get_address_balance(&get_spk_hash(&ours)).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_addresses_derived_near_the_horizon_are_queued_for_a_rescan() {
+        let single = "wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)";
+        let cache = get_test_cache();
+        cache.push_descriptor(DESC_A).unwrap();
+        cache.push_descriptor(single).unwrap();
+        // Loading a descriptor rescans all of its addresses anyway
+        assert!(cache.take_addresses_pending_rescan().unwrap().is_empty());
+
+        pay(&cache, &script_at(DESC_A, 10));
+        assert!(cache.take_addresses_pending_rescan().unwrap().is_empty());
+
+        pay(&cache, &script_at(DESC_A, 85));
+        let pending = cache.take_addresses_pending_rescan().unwrap();
+        // Only the new batch: not the script of the descriptor without a wildcard, which
+        // every batch derives again
+        assert_eq!(pending.len(), DERIVATION_COUNT as usize);
+        assert!(pending.contains(&script_at(DESC_A, 100)));
+        assert!(pending.contains(&script_at(DESC_A, 199)));
+        assert!(cache.take_addresses_pending_rescan().unwrap().is_empty());
+
+        // A failed rescan hands them back, once
+        cache
+            .requeue_addresses_pending_rescan(pending.clone())
+            .unwrap();
+        cache
+            .requeue_addresses_pending_rescan(pending.clone())
+            .unwrap();
+        assert_eq!(cache.take_addresses_pending_rescan().unwrap(), pending);
+    }
+
+    #[test]
+    fn test_addresses_pending_a_rescan_survive_a_restart() {
+        let datadir = temp_datadir("pending");
+        {
+            let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+            cache.push_descriptor(DESC_A).unwrap();
+            // Derives the next batch, and the app is killed before anything rescans it
+            pay(&cache, &script_at(DESC_A, 85));
+        }
+
+        let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+        let pending = cache.take_addresses_pending_rescan().unwrap();
+        assert_eq!(pending.len(), DERIVATION_COUNT as usize);
+        assert!(pending.contains(&script_at(DESC_A, 150)));
+        drop(cache);
+
+        // Taken is taken, also across a restart
+        let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+        assert!(cache.take_addresses_pending_rescan().unwrap().is_empty());
+        drop(cache);
+        std::fs::remove_dir_all(&datadir).unwrap();
+    }
+
+    #[test]
+    fn test_history_near_the_horizon_derives_more_at_startup() {
+        let datadir = temp_datadir("upgrade");
+        {
+            // A wallet written before the horizon was enforced: the first 100 addresses, with
+            // a payment at index 95 and nothing derived past it.
+            let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+            for script in derive_addresses_from_descriptor(DESC_A, 0, DERIVATION_COUNT).unwrap() {
+                cache.cache_address(script).unwrap();
+            }
+            pay(&cache, &script_at(DESC_A, 95));
+        }
+        KvDatabase::new(&datadir)
+            .unwrap()
+            .save_descriptor(DESC_A)
+            .unwrap();
+
+        let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+        assert_eq!(derivation_index(&cache), 2 * DERIVATION_COUNT);
+        let pending = cache.take_addresses_pending_rescan().unwrap();
+        assert_eq!(pending.len(), DERIVATION_COUNT as usize);
+        assert!(pending.contains(&script_at(DESC_A, 100)));
+        drop(cache);
+        std::fs::remove_dir_all(&datadir).unwrap();
+    }
+
+    #[test]
+    fn test_rescan_finds_the_history_of_addresses_derived_later() {
+        let cache = get_test_cache();
+        cache.push_descriptor(DESC_A).unwrap();
+
+        // Pays an address past the horizon: processed, but not ours yet
+        let early = block_paying(&script_at(DESC_A, 150), 5_000, None);
+        assert!(cache.block_process(&early, 1).unwrap().is_empty());
+
+        // A payment near the horizon derives the batch that holds index 150
+        cache
+            .block_process(&block_paying(&script_at(DESC_A, 85), 1_000, None), 2)
+            .unwrap();
+        let hash = get_spk_hash(&script_at(DESC_A, 150));
+        assert_eq!(cache.get_address_history(&hash).unwrap(), Some(Vec::new()));
+
+        // The follow-up rescan over the queued addresses matches the early block again
+        let pending = cache.take_addresses_pending_rescan().unwrap();
+        assert!(pending.contains(&script_at(DESC_A, 150)));
+        assert_eq!(cache.block_process(&early, 1).unwrap().len(), 1);
+
+        let history = cache.get_address_history(&hash).unwrap().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].hash, early.txdata[0].compute_txid());
+        assert_eq!(cache.get_address_balance(&hash).unwrap(), Some(5_000));
     }
 
     #[test]

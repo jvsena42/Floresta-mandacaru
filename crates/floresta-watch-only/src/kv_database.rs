@@ -6,6 +6,7 @@ use core::fmt::Display;
 use core::fmt::Formatter;
 use std::path::Path;
 
+use bitcoin::ScriptBuf;
 use bitcoin::Txid;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::encode::Error as EncodingError;
@@ -22,6 +23,11 @@ use super::AddressCacheDatabase;
 use super::CachedAddress;
 use super::CachedTransaction;
 use super::Stats;
+
+/// Bucket, and key in it, of the derived addresses whose history is still to be rescanned.
+/// Kept out of the addresses bucket, whose every other key [`KvDatabase::load`] reads as a
+/// [`CachedAddress`] (so a build without this bucket still opens the database).
+const PENDING_RESCAN: &str = "pending_rescan";
 
 /// A key-value database for the watch-only wallet.
 pub struct KvDatabase(Store, Bucket<'static, String, Vec<u8>>);
@@ -160,6 +166,25 @@ impl AddressCacheDatabase for KvDatabase {
         bucket.flush()?;
 
         Ok(())
+    }
+
+    /// Replace the addresses still to be rescanned in the [`KvDatabase`].
+    fn save_pending_rescan(&self, addresses: &[ScriptBuf]) -> Result<()> {
+        let store = self.0.bucket::<&[u8], Vec<u8>>(Some(PENDING_RESCAN))?;
+        store.set(&PENDING_RESCAN.as_bytes(), &serde_json::to_vec(addresses)?)?;
+        store.flush()?;
+
+        Ok(())
+    }
+
+    /// Get the addresses still to be rescanned from the [`KvDatabase`].
+    fn get_pending_rescan(&self) -> Result<Vec<ScriptBuf>> {
+        let store = self.0.bucket::<&[u8], Vec<u8>>(Some(PENDING_RESCAN))?;
+
+        if let Some(pending) = store.get(&PENDING_RESCAN.as_bytes())? {
+            return Ok(serde_json::de::from_slice(&pending)?);
+        }
+        Ok(Vec::new())
     }
 
     /// Get the [`KvDatabase`]'s descriptors.
