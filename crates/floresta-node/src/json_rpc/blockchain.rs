@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -20,40 +21,31 @@ use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::constants::genesis_block;
 use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
-use corepc_types::ScriptPubKey;
-use corepc_types::v29::GetTxOut;
-use corepc_types::v30::DeploymentInfo;
-use corepc_types::v30::GetBlockHeaderVerbose;
-use corepc_types::v30::GetBlockVerboseOne;
-use corepc_types::v30::GetBlockchainInfo;
-use corepc_types::v30::GetDeploymentInfo;
 use floresta_chain::buried_deployments_for;
 use floresta_chain::extensions::HeaderExt;
 use floresta_chain::extensions::WorkExt;
+use floresta_rpc::rpc_interfaces::BlockchainRpc;
+use floresta_rpc::rpc_types::DeploymentInfo;
+use floresta_rpc::rpc_types::GetBlockHeaderRes;
+use floresta_rpc::rpc_types::GetBlockHeaderVerbose;
+use floresta_rpc::rpc_types::GetBlockRes;
+use floresta_rpc::rpc_types::GetBlockVerboseOne;
+use floresta_rpc::rpc_types::GetBlockchainInfo;
+use floresta_rpc::rpc_types::GetBlockchainInfoRes;
+use floresta_rpc::rpc_types::GetDeploymentInfo;
+use floresta_rpc::rpc_types::GetTxOut;
+use floresta_rpc::rpc_types::ScriptPubKey;
 use floresta_wire::node_interface::ChainMethods;
 use miniscript::descriptor::checksum;
-use serde_json::Value;
-use serde_json::json;
-use tracing::debug;
 
-use super::res::GetBlockHeaderRes;
-use super::res::GetBlockchainInfoRes;
-use super::res::GetTxOutProof;
 use super::res::jsonrpc_interface::JsonRpcError;
 use super::server::RpcChain;
 use super::server::RpcImpl;
-use crate::json_rpc::res::GetBlockRes;
-use crate::json_rpc::res::RescanConfidence;
-use crate::json_rpc::server::SERIALIZATION_EXPECT_MSG;
 use crate::json_rpc::server::to_core_asm_string;
 
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     async fn get_block_inner(&self, hash: BlockHash) -> Result<Block, JsonRpcError> {
-        let is_genesis = self
-            .chain
-            .get_block_hash(0)
-            .map_err(|_| JsonRpcError::Chain)?
-            .eq(&hash);
+        let is_genesis = self.get_block_hash_inner(0)?.eq(&hash);
 
         if is_genesis {
             return Ok(genesis_block(self.network));
@@ -74,118 +66,220 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     pub fn get_block_by_txid(&self, txid: &Txid) -> Result<Block, JsonRpcError> {
         let height = self
             .wallet
-            .get_height(txid)
+            .get_height(txid)?
             .ok_or(JsonRpcError::TxNotFound)?;
-        let blockhash = self
-            .chain
-            .get_block_hash(height)
-            .map_err(|_| JsonRpcError::BlockNotFound)?;
-
+        let blockhash = self.get_block_hash_inner(height)?;
         self.chain
             .get_block(&blockhash)
             .map_err(|_| JsonRpcError::BlockNotFound)
     }
 
-    pub fn get_rescan_interval(
-        &self,
-        use_timestamp: bool,
-        start: u32,
-        stop: u32,
-        confidence: RescanConfidence,
-    ) -> Result<(u32, u32), JsonRpcError> {
-        if use_timestamp {
-            let start_height = self.get_block_height_by_timestamp(start, &confidence)?;
-
-            let stop_height = self.get_block_height_by_timestamp(stop, &RescanConfidence::Exact)?;
-
-            return Ok((start_height, stop_height));
-        }
-
-        let (tip, _) = self
-            .chain
-            .get_best_block()
-            .map_err(|_| JsonRpcError::Chain)?;
-
-        if stop > tip {
-            return Err(JsonRpcError::InvalidRescanVal);
-        }
-
-        Ok((start, stop))
+    pub(super) fn get_block_hash_inner(&self, height: u32) -> Result<BlockHash, JsonRpcError> {
+        self.chain
+            .get_block_hash(height)
+            .map_err(|_| JsonRpcError::BlockNotFound)
     }
 
-    /// Retrieves the height of the block that was mined in the given timestamp.
-    ///
-    /// `timestamp` has an alias, 0 will directly refer to the network's genesis timestamp.
-    pub fn get_block_height_by_timestamp(
+    /// Same as `get_block_header_inner` but verbose.
+    fn get_block_header_verbose_inner(
         &self,
-        timestamp: u32,
-        confidence: &RescanConfidence,
-    ) -> Result<u32, JsonRpcError> {
-        /// Simple helper to avoid code reuse.
-        fn get_block_time<BlockChain: RpcChain>(
-            provider: &RpcImpl<BlockChain>,
-            at: u32,
-        ) -> Result<u32, JsonRpcError> {
-            let hash = provider.get_block_hash(at)?;
-            let block = provider.get_block_header_inner(hash)?;
-            Ok(block.time)
+        block: &Block,
+    ) -> Result<GetBlockHeaderVerbose, JsonRpcError> {
+        let header = &block.header;
+        let height = header.get_height(&self.chain)?;
+        let median_time = header.calculate_median_time_past(&self.chain)?;
+        let chain_work = header.calculate_chain_work(&self.chain)?.to_string_hex();
+        let confirmations = header.get_confirmations(&self.chain)?;
+        let version_hex = header.get_version_hex();
+
+        let next_block_hash = header
+            .get_next_block_hash(&self.chain)?
+            .map(|h| h.to_string());
+
+        let bits = header.get_bits_hex();
+        let difficulty = header.get_difficulty();
+        let target = header.get_target_hex();
+        let previous_block_hash = (header.prev_blockhash != BlockHash::all_zeros())
+            .then_some(header.prev_blockhash.to_string());
+
+        Ok(GetBlockHeaderVerbose {
+            bits,
+            chain_work,
+            confirmations: confirmations.into(),
+            difficulty,
+            hash: header.block_hash().to_string(),
+            height: height.into(),
+            median_time: median_time.into(),
+            next_block_hash,
+            version: header.version.to_consensus(),
+            version_hex,
+            previous_block_hash,
+            merkle_root: header.merkle_root.to_string(),
+            time: header.time.into(),
+            target,
+            nonce: header.nonce.into(),
+            n_tx: block.txdata.len().try_into()?,
+        })
+    }
+
+    /// Helper method to get a block header by its hash, used by multiple rpcs.
+    pub(super) fn get_block_header_inner(&self, hash: BlockHash) -> Result<Header, JsonRpcError> {
+        self.chain
+            .get_block_header(&hash)
+            .map_err(|_| JsonRpcError::BlockNotFound)
+    }
+
+    /// Check if the script is anchor type
+    fn is_anchor_type(script: &Script) -> bool {
+        script.as_bytes().starts_with(&[0x51, 0x02, 0x4e, 0x73])
+    }
+
+    /// Returns a label about the scriptPubKey type
+    /// (pubkey, pubkeyhash, multisig, nulldata, scripthash, witness_v0_keyhash, witness_v0_scripthash, witness_v1_taproot, anchor, nonstandard)
+    pub(super) fn get_script_type_label(script: &Script) -> &'static str {
+        if script.is_p2pk() {
+            return "pubkey";
         }
 
-        let genesis_timestamp = genesis_block(self.network).header.time;
+        if script.is_p2pkh() {
+            return "pubkeyhash";
+        }
 
-        if timestamp == 0 || timestamp == genesis_timestamp {
-            return Ok(0);
-        };
+        if script.is_multisig() {
+            return "multisig";
+        }
 
-        let (tip_height, _) = self
+        if script.is_op_return() {
+            return "nulldata";
+        }
+
+        if script.is_p2sh() {
+            return "scripthash";
+        }
+
+        if script.is_p2wpkh() {
+            return "witness_v0_keyhash";
+        }
+
+        if script.is_p2wsh() {
+            return "witness_v0_scripthash";
+        }
+
+        if script.is_p2tr() {
+            return "witness_v1_taproot";
+        }
+
+        if Self::is_anchor_type(script) {
+            return "anchor";
+        }
+
+        "nonstandard"
+    }
+
+    /// TODO: This function is not compliant with Bitcoin Core.
+    /// See: <https://github.com/getfloresta/Floresta/issues/987>
+    pub(super) fn get_script_type_descriptor(script: &Script, address: &Option<Address>) -> String {
+        // Try script from the address
+        if let Some(addr) = address {
+            if script.is_p2pk() {
+                return format!("pk({addr})");
+            }
+
+            return format!("addr({addr})");
+        }
+
+        if script.is_op_return() {
+            let hex = script.to_hex_string();
+            return format!("raw({hex})");
+        }
+
+        let hex = script.to_hex_string();
+        format!("raw({hex})")
+    }
+
+    /// Time-based estimate of validated-tip progress in `[0.0, 1.0]`.
+    ///
+    /// Ratio of chain-time elapsed between genesis and the validated block,
+    /// over chain-time between genesis and the later of `now` or the tip
+    /// header's time. Returns `0.0` for cold start, clamps to `1.0` at tip.
+    fn verification_progress(
+        &self,
+        validated: u32,
+        latest_header: &Header,
+    ) -> Result<f64, JsonRpcError> {
+        let header_tip_time = latest_header.time;
+
+        let validated_block_time = self
             .chain
-            .get_best_block()
-            .map_err(|_| JsonRpcError::BlockNotFound)?;
+            .get_block_hash(validated)
+            .and_then(|hash| self.chain.get_block_header(&hash))
+            .map_err(|_| JsonRpcError::Chain)?
+            .time;
 
-        let tip_time = get_block_time(self, tip_height)?;
+        let genesis_time = genesis_block(self.network).header.time;
+        let now: u32 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| JsonRpcError::InvalidSystemTime)?
+            .as_secs()
+            .try_into()
+            .map_err(|_| JsonRpcError::InvalidSystemTime)?;
 
-        if timestamp < genesis_timestamp || timestamp > tip_time {
-            return Err(JsonRpcError::InvalidTimestamp);
+        let elapsed_validated = validated_block_time.saturating_sub(genesis_time);
+        let elapsed_total = now.max(header_tip_time).saturating_sub(genesis_time);
+
+        // Cold start: the tip is still genesis and the clock has not reached
+        // genesis time, so there is no span to measure against.
+        if elapsed_total == 0 {
+            return Ok(0.0);
         }
 
-        let adjusted_target = timestamp.saturating_sub(confidence.as_secs());
-
-        let mut high = tip_height;
-        let mut low = 0;
-        let max_iters = tip_height.ilog2() + 1;
-        for _ in 0..max_iters {
-            let cut = (high + low) / 2;
-
-            let block_timestamp = get_block_time(self, cut)?;
-
-            if block_timestamp == adjusted_target {
-                debug!("found a precise block; returning {cut}");
-                return Ok(cut);
-            }
-
-            if high - low <= 2 {
-                debug!("didn't find a precise block; returning {low}");
-                return Ok(low);
-            }
-
-            if block_timestamp > adjusted_target {
-                high = cut;
-            } else {
-                low = cut;
-            }
-        }
-
-        // This is pretty much unreachable.
-        Err(JsonRpcError::BlockNotFound)
+        Ok((f64::from(elapsed_validated) / f64::from(elapsed_total)).clamp(0.0, 1.0))
     }
 }
 
 // blockchain rpcs
-impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
+impl<Blockchain: RpcChain> BlockchainRpc for RpcImpl<Blockchain> {
+    type Error = JsonRpcError;
+
+    // floresta flavored rpcs. These are not part of the bitcoin rpc spec
+    // findtxout
+    async fn find_tx_out(
+        &self,
+        txid: Txid,
+        vout: u32,
+        script: ScriptBuf,
+        height_hint: Option<u32>,
+    ) -> Result<Option<GetTxOut>, JsonRpcError> {
+        let include_mempool = Some(true);
+        if let Ok(Some(txout)) = self.get_tx_out(txid, vout, include_mempool).await {
+            return Ok(Some(txout));
+        }
+
+        // if we are on IBD, we don't have any filters to find this txout.
+        if self.chain.is_in_ibd() {
+            return Err(JsonRpcError::InInitialBlockDownload);
+        }
+
+        self.wallet.cache_address(script.clone())?;
+        let filters = self.filters.clone().ok_or(JsonRpcError::NoBlockFilters)?;
+        Self::rescan_with_block_filters(
+            vec![script],
+            self.chain.clone(),
+            self.wallet.clone(),
+            filters,
+            Some(height_hint.unwrap_or(0)),
+            None,
+            None,
+        )
+        .await?;
+
+        self.get_tx_out(txid, vout, include_mempool).await
+    }
+
     // dumputxoutset
 
     // getbestblockhash
-    pub(super) fn get_best_block_hash(&self) -> Result<BlockHash, JsonRpcError> {
+    async fn get_best_block_hash(&self) -> Result<BlockHash, JsonRpcError> {
         Ok(self
             .chain
             .get_best_block()
@@ -194,12 +288,13 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 
     // getblock
-    pub(super) async fn get_block(
+    async fn get_block(
         &self,
         hash: BlockHash,
-        verbosity: u8,
+        verbosity: Option<u32>,
     ) -> Result<GetBlockRes, JsonRpcError> {
         let block = self.get_block_inner(hash).await?;
+        let verbosity = verbosity.unwrap_or(1);
 
         if verbosity == 0 {
             let hex = serialize_hex(&block);
@@ -255,7 +350,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     //
     // `headers` tracks the best-known header tip; `blocks` tracks the validated
     // tip. They can diverge mid-IBD and coincide once sync completes.
-    pub(super) fn get_blockchain_info(&self) -> Result<GetBlockchainInfoRes, JsonRpcError> {
+    async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoRes, JsonRpcError> {
         let (height, hash) = self
             .chain
             .get_best_block()
@@ -354,7 +449,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 
     // getblockcount
-    pub(super) fn get_block_count(&self) -> Result<u32, JsonRpcError> {
+    async fn get_block_count(&self) -> Result<u32, JsonRpcError> {
         self.chain.get_height().map_err(|_| JsonRpcError::Chain)
     }
 
@@ -362,19 +457,18 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     // getblockfrompeer (just call getblock)
 
     // getblockhash
-    pub(super) fn get_block_hash(&self, height: u32) -> Result<BlockHash, JsonRpcError> {
-        self.chain
-            .get_block_hash(height)
-            .map_err(|_| JsonRpcError::BlockNotFound)
+    async fn get_block_hash(&self, height: u32) -> Result<BlockHash, JsonRpcError> {
+        self.get_block_hash_inner(height)
     }
 
     // getblockheader
-    pub(super) async fn get_block_header(
+    async fn get_block_header(
         &self,
         hash: BlockHash,
-        verbosity: bool,
+        verbosity: Option<bool>,
     ) -> Result<GetBlockHeaderRes, JsonRpcError> {
         let header = self.get_block_header_inner(hash)?;
+        let verbosity = verbosity.unwrap_or(true);
 
         if !verbosity {
             let hex = serialize_hex(&header);
@@ -392,9 +486,8 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     // getchainstates
     // getchaintips
     // getchaintxstats
-
     // getdeploymentinfo
-    pub(super) fn get_deployment_info(
+    async fn get_deployment_info(
         &self,
         hash: Option<BlockHash>,
     ) -> Result<GetDeploymentInfo, JsonRpcError> {
@@ -433,7 +526,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 
     // getdifficulty
-    pub(super) fn get_difficulty(&self) -> Result<f64, JsonRpcError> {
+    async fn get_difficulty(&self) -> Result<f64, JsonRpcError> {
         let (_, hash) = self
             .chain
             .get_best_block()
@@ -444,144 +537,26 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             .map_err(|_| JsonRpcError::BlockNotFound)?;
         Ok(header.difficulty_float())
     }
-
     // getmempoolancestors
     // getmempooldescendants
     // getmempoolentry
     // getmempoolinfo
     // getrawmempool
 
-    /// Same as `get_block_header_inner` but verbose.
-    fn get_block_header_verbose_inner(
-        &self,
-        block: &Block,
-    ) -> Result<GetBlockHeaderVerbose, JsonRpcError> {
-        let header = &block.header;
-        let height = header.get_height(&self.chain)?;
-        let median_time = header.calculate_median_time_past(&self.chain)?;
-        let chain_work = header.calculate_chain_work(&self.chain)?.to_string_hex();
-        let confirmations = header.get_confirmations(&self.chain)?;
-        let version_hex = header.get_version_hex();
-
-        let next_block_hash = header
-            .get_next_block_hash(&self.chain)?
-            .map(|h| h.to_string());
-
-        let bits = header.get_bits_hex();
-        let difficulty = header.get_difficulty();
-        let target = header.get_target_hex();
-        let previous_block_hash = (header.prev_blockhash != BlockHash::all_zeros())
-            .then_some(header.prev_blockhash.to_string());
-
-        Ok(GetBlockHeaderVerbose {
-            bits,
-            chain_work,
-            confirmations: confirmations.into(),
-            difficulty,
-            hash: header.block_hash().to_string(),
-            height: height.into(),
-            median_time: median_time.into(),
-            next_block_hash,
-            version: header.version.to_consensus(),
-            version_hex,
-            previous_block_hash,
-            merkle_root: header.merkle_root.to_string(),
-            time: header.time.into(),
-            target,
-            nonce: header.nonce.into(),
-            n_tx: block.txdata.len().try_into()?,
-        })
-    }
-
-    /// Helper method to get a block header by its hash, used by multiple rpcs.
-    fn get_block_header_inner(&self, hash: BlockHash) -> Result<Header, JsonRpcError> {
-        self.chain
-            .get_block_header(&hash)
-            .map_err(|_| JsonRpcError::BlockNotFound)
-    }
-
-    /// Check if the script is anchor type
-    fn is_anchor_type(script: &Script) -> bool {
-        script.as_bytes().starts_with(&[0x51, 0x02, 0x4e, 0x73])
-    }
-
-    /// Returns a label about the scriptPubKey type
-    /// (pubkey, pubkeyhash, multisig, nulldata, scripthash, witness_v0_keyhash, witness_v0_scripthash, witness_v1_taproot, anchor, nonstandard)
-    pub(super) fn get_script_type_label(script: &Script) -> &'static str {
-        if script.is_p2pk() {
-            return "pubkey";
-        }
-
-        if script.is_p2pkh() {
-            return "pubkeyhash";
-        }
-
-        if script.is_multisig() {
-            return "multisig";
-        }
-
-        if script.is_op_return() {
-            return "nulldata";
-        }
-
-        if script.is_p2sh() {
-            return "scripthash";
-        }
-
-        if script.is_p2wpkh() {
-            return "witness_v0_keyhash";
-        }
-
-        if script.is_p2wsh() {
-            return "witness_v0_scripthash";
-        }
-
-        if script.is_p2tr() {
-            return "witness_v1_taproot";
-        }
-
-        if Self::is_anchor_type(script) {
-            return "anchor";
-        }
-
-        "nonstandard"
-    }
-
-    /// TODO: This function is not compliant with Bitcoin Core.
-    /// See: <https://github.com/getfloresta/Floresta/issues/987>
-    pub(super) fn get_script_type_descriptor(script: &Script, address: &Option<Address>) -> String {
-        // Try script from the address
-        if let Some(addr) = address {
-            if script.is_p2pk() {
-                return format!("pk({addr})");
-            }
-
-            return format!("addr({addr})");
-        }
-
-        if script.is_op_return() {
-            let hex = script.to_hex_string();
-            return format!("raw({hex})");
-        }
-
-        let hex = script.to_hex_string();
-        format!("raw({hex})")
-    }
-
     /// gettxout: returns details about an unspent transaction output.
-    pub(super) fn get_tx_out(
+    async fn get_tx_out(
         &self,
         txid: Txid,
         outpoint: u32,
-        _include_mempool: bool,
+        _include_mempool: Option<bool>,
     ) -> Result<Option<GetTxOut>, JsonRpcError> {
         let res = match (
-            self.wallet.get_transaction(&txid),
-            self.wallet.get_height(&txid),
+            self.wallet.get_transaction(&txid)?,
+            self.wallet.get_height(&txid)?,
             self.wallet.get_utxo(&OutPoint {
                 txid,
                 vout: outpoint,
-            }),
+            })?,
         ) {
             (Some(cached_tx), Some(height), Some(txout)) => {
                 let is_coinbase = cached_tx.tx.is_coinbase();
@@ -636,11 +611,22 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     /// watch-only wallet which may not have the transaction cached.
     ///
     /// Not finding one of the specified transactions will raise [`JsonRpcError::TxNotFound`].
-    pub(super) async fn get_txout_proof(
+    async fn get_txout_proof(
         &self,
         tx_ids: &[Txid],
         blockhash: Option<BlockHash>,
-    ) -> Result<GetTxOutProof, JsonRpcError> {
+    ) -> Result<String, JsonRpcError> {
+        if tx_ids.is_empty() {
+            return Err(JsonRpcError::EmptyTxids);
+        }
+
+        let mut seen = HashSet::with_capacity(tx_ids.len());
+        for txid in tx_ids {
+            if !seen.insert(txid) {
+                return Err(JsonRpcError::DuplicatedTxid(*txid));
+            }
+        }
+
         let block = match blockhash {
             Some(blockhash) => self.get_block_inner(blockhash).await?,
             // Using the first Txid to get the block should be fine since they are expected to all
@@ -676,7 +662,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         merkle_block
             .consensus_encode(&mut bytes)
             .expect("This will raise if a writer error happens");
-        Ok(GetTxOutProof(bytes.to_lower_hex_string()))
+        Ok(bytes.to_lower_hex_string())
     }
 
     // gettxoutsetinfo
@@ -691,91 +677,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     // verifychain
     // verifytxoutproof
 
-    // floresta flavored rpcs. These are not part of the bitcoin rpc spec
-    // findtxout
-    pub(super) async fn find_tx_out(
-        &self,
-        txid: Txid,
-        vout: u32,
-        script: ScriptBuf,
-        height: u32,
-    ) -> Result<Value, JsonRpcError> {
-        if let Some(txout) = self.wallet.get_utxo(&OutPoint { txid, vout }) {
-            return Ok(serde_json::to_value(txout).expect(SERIALIZATION_EXPECT_MSG));
-        }
-        if self.chain.is_in_ibd() {
-            return Err(JsonRpcError::InInitialBlockDownload);
-        }
-
-        self.wallet.cache_address(script.clone());
-        let filters = self.filters.clone().ok_or(JsonRpcError::NoBlockFilters)?;
-        Self::rescan_with_block_filters(
-            vec![script],
-            self.chain.clone(),
-            self.wallet.clone(),
-            filters,
-            Some(height),
-            None,
-            None,
-        )
-        .await?;
-
-        Ok(match self.get_tx_out(txid, vout, false)? {
-            Some(txout) => json!(txout),
-            None => json!({}),
-        })
-    }
-
     // getroots
-    pub(super) fn get_roots(&self) -> Result<Vec<String>, JsonRpcError> {
+    async fn get_roots(&self) -> Result<Vec<String>, JsonRpcError> {
         let hashes = self.chain.get_root_hashes();
         Ok(hashes.iter().map(|h| h.to_string()).collect())
-    }
-
-    pub(super) fn list_descriptors(&self) -> Result<Vec<String>, JsonRpcError> {
-        let descriptors = self
-            .wallet
-            .get_descriptors()
-            .map_err(|e| JsonRpcError::Wallet(e.to_string()))?;
-        Ok(descriptors)
-    }
-
-    /// Time-based estimate of validated-tip progress in `[0.0, 1.0]`.
-    ///
-    /// Ratio of chain-time elapsed between genesis and the validated block,
-    /// over chain-time between genesis and the later of `now` or the tip
-    /// header's time. Returns `0.0` for cold start, clamps to `1.0` at tip.
-    fn verification_progress(
-        &self,
-        validated: u32,
-        latest_header: &Header,
-    ) -> Result<f64, JsonRpcError> {
-        let header_tip_time = latest_header.time;
-
-        let validated_block_time = self
-            .chain
-            .get_block_hash(validated)
-            .and_then(|hash| self.chain.get_block_header(&hash))
-            .map_err(|_| JsonRpcError::Chain)?
-            .time;
-
-        let genesis_time = genesis_block(self.network).header.time;
-        let now: u32 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| JsonRpcError::InvalidSystemTime)?
-            .as_secs()
-            .try_into()
-            .map_err(|_| JsonRpcError::InvalidSystemTime)?;
-
-        let elapsed_validated = validated_block_time.saturating_sub(genesis_time);
-        let elapsed_total = now.max(header_tip_time).saturating_sub(genesis_time);
-
-        // Cold start: the tip is still genesis and the clock has not reached
-        // genesis time, so there is no span to measure against.
-        if elapsed_total == 0 {
-            return Ok(0.0);
-        }
-
-        Ok((f64::from(elapsed_validated) / f64::from(elapsed_total)).clamp(0.0, 1.0))
     }
 }

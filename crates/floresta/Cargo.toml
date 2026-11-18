@@ -3,7 +3,6 @@ name = "floresta"
 version = "0.5.1"
 description = "A modular and extensible framework for building Utreexo-based Bitcoin nodes"
 authors = ["Floresta Developers <contact@getfloresta.org>"]
-homepage = "https://github.com/getfloresta/Floresta"
 documentation = "https://docs.getfloresta.sh/floresta"
 repository = "https://github.com/getfloresta/Floresta"
 categories = ["cryptography::cryptocurrencies"]
@@ -88,6 +87,8 @@ compact-filters = ["dep:floresta-compact-filters"]
 
 # floresta-domain
 domain = ["dep:floresta-domain"]
+domain-mempool = ["domain", "floresta-domain/mempool"]
+domain-wallet = ["domain", "floresta-domain/wallet"]
 
 # floresta-electrum
 electrum = ["dep:floresta-electrum"]
@@ -109,6 +110,7 @@ node-zmq-server = ["node", "floresta-node/zmq-server"]
 rpc = ["dep:floresta-rpc"]
 rpc-clap = ["rpc", "floresta-rpc/clap"]
 rpc-jsonrpc = ["rpc", "floresta-rpc/with-jsonrpc"]
+rpc-async = ["rpc", "floresta-rpc/async"]
 
 # floresta-watch-only
 watch-only = ["dep:floresta-watch-only"]

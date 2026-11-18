@@ -32,6 +32,19 @@ use rustreexo::node_hash::BitcoinNodeHash;
 use crate::AssumeValidArg;
 use crate::prelude::*;
 
+// Bitcoin Core script verification flags used by GetTransactionSigOpCost:
+// https://github.com/bitcoin/bitcoin/blob/v31.0/src/kernel/bitcoinkernel.h#L468-L479
+const VERIFY_NONE: u32 = 0;
+pub(super) const VERIFY_P2SH: u32 = 1 << 0;
+pub(super) const VERIFY_WITNESS: u32 = 1 << 11;
+
+#[cfg(feature = "bitcoinkernel")]
+const _: () = {
+    assert!(VERIFY_NONE == bitcoinkernel::VERIFY_NONE);
+    assert!(VERIFY_P2SH == bitcoinkernel::VERIFY_P2SH);
+    assert!(VERIFY_WITNESS == bitcoinkernel::VERIFY_WITNESS);
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubsidyHalvingInterval {
     /// Bitcoin, testnet, testnet4, and signet: 210,000 blocks.
@@ -215,8 +228,8 @@ impl ChainParams {
     /// - [`AssumeValidArg::Disabled`] — no checkpoint; all scripts are validated.
     /// - [`AssumeValidArg::UserInput`] — use the provided hash.
     /// - [`AssumeValidArg::Hardcoded`] — use a release-time checkpoint per [`Network`]:
-    ///   - **Bitcoin**: block [939,969](https://mempool.space/block/939969)
-    ///   - **Signet**: block [296,870](https://mempool.space/signet/block/296870)
+    ///   - **Bitcoin**: block [971,420](https://mempool.space/block/971420)
+    ///   - **Signet**: block [326,326](https://mempool.space/signet/block/326326)
     ///   - **Testnet**: block [4,887,983](https://mempool.space/testnet/block/4887983)
     ///   - **Testnet4**: block [126,514](https://mempool.space/testnet4/block/126514)
     ///   - **Regtest**: genesis block
@@ -226,10 +239,10 @@ impl ChainParams {
             AssumeValidArg::UserInput(hash) => Some(hash),
             AssumeValidArg::Hardcoded => match network {
                 Network::Bitcoin => Some(bhash!(
-                    "000000000000000000009d36aae180d04aeac872adb14e22f65c8b6647a8bf79" // 939_969
+                    "000000000000000000019d4afaefa42fc5b4211a7edcce7681a1478df661ead6" // 971_420
                 )),
                 Network::Signet => Some(bhash!(
-                    "000000068d38e9cfa53268a08b32dab55118a58e5212729b016ee3c9c66387a6" // 296_870
+                    "00000008f507c8db68879442b1eea8c312fd66b445d4dd9b1b12c4bc8188ef64" // 326_326
                 )),
                 Network::Testnet => Some(bhash!(
                     "000000005cf458fb1f79c8fee78822eead52aee40530a6bbe018cd61f22d6bb1" // 4_887_983
@@ -279,18 +292,22 @@ impl ChainParams {
 
         flags
     }
+
+    #[cfg(not(feature = "bitcoinkernel"))]
+    /// Returns the flags relevant to contextual sigop accounting.
+    pub(crate) fn get_sigop_flags(&self, hash: BlockHash) -> u32 {
+        self.exceptions
+            .get(&hash)
+            .copied()
+            .unwrap_or(VERIFY_P2SH | VERIFY_WITNESS)
+    }
 }
 
-#[cfg(feature = "bitcoinkernel")]
 /// There's almost no transactions in the chain that
 /// "looks like segwit but are not segwit". We pretend segwit
 /// was enabled since genesis, and only skip this for blocks
 /// that have such transactions using hardcoded values.
-fn get_exceptions() -> HashMap<BlockHash, ScriptVerificationFlags> {
-    use bitcoinkernel::VERIFY_NONE;
-    use bitcoinkernel::VERIFY_P2SH;
-    use bitcoinkernel::VERIFY_WITNESS;
-
+fn get_exceptions() -> HashMap<BlockHash, u32> {
     let mut exceptions = HashMap::new();
     exceptions.insert(
         bhash!("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"),
@@ -305,11 +322,6 @@ fn get_exceptions() -> HashMap<BlockHash, ScriptVerificationFlags> {
         VERIFY_NONE,
     ); // BIP16 exception on test net
     exceptions
-}
-
-#[cfg(not(feature = "bitcoinkernel"))]
-fn get_exceptions() -> HashMap<BlockHash, u32> {
-    HashMap::new()
 }
 
 impl AsRef<Params> for ChainParams {

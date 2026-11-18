@@ -46,6 +46,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -80,6 +81,7 @@ use crate::node::InflightRequests;
 use crate::node::NodeNotification;
 use crate::node::NodeRequest;
 use crate::node::UtreexoNode;
+use crate::node::WitnessMode;
 use crate::node::periodic_job;
 use crate::node_context::LoopControl;
 use crate::node_context::NodeContext;
@@ -157,15 +159,13 @@ impl ChainSelector {
 impl NodeContext for ChainSelector {
     const REQUEST_TIMEOUT: u64 = 10; // Detect stalled IBD peers quickly so we re-issue to a fresh fast peer
 
+    // A 2,000-header batch can take over 10 s on a phone's cellular link; dropping every
+    // peer that slow would churn the whole outbound set during header sync.
+    const DISCONNECT_ON_TIMEOUT: bool = false;
+
     // Since we don't have any peers when chain selection starts, we use a more aggressive batch
     // size to make sure we get to our `MAX_OUTGOING_CONNECTIONS` ASAP
     const NEW_CONNECTIONS_BATCH_SIZE: usize = 12;
-
-    fn get_required_services(&self) -> ServiceFlags {
-        ServiceFlags::NETWORK
-            | service_flags::UTREEXO.into()
-            | service_flags::UTREEXO_ARCHIVE.into()
-    }
 }
 
 impl<Chain> UtreexoNode<Chain, ChainSelector>
@@ -485,7 +485,10 @@ where
         peer: PeerId,
         block_hash: BlockHash,
     ) -> Result<InflightBlock, WireError> {
-        self.send_to_peer(peer, NodeRequest::GetBlock(vec![block_hash]))?;
+        self.send_to_peer(
+            peer,
+            NodeRequest::GetBlock(vec![block_hash], WitnessMode::Full),
+        )?;
 
         let timeout = Instant::now() + Duration::from_secs(60);
         let mut block = None;
@@ -494,6 +497,7 @@ where
                 return Err(WireError::PeerTimeout);
             }
 
+            // TODO: Bound this receive by the deadline, even when no messages arrive.
             let Some(NodeNotification::FromPeer(id, message, _)) = self.node_rx.recv().await else {
                 // Keep waiting until peer message is read or timeout
                 continue;
@@ -549,8 +553,9 @@ where
 
                     return Ok(InflightBlock {
                         peer,
-                        block,
+                        block: Arc::new(block),
                         aux_data: Some((uproof.leaf_data, proof, peer)),
+                        processing_since: None,
                     });
                 }
                 _ => {}
@@ -567,9 +572,13 @@ where
         leaf_data: &[CompactLeafData],
         height: u32,
     ) -> Result<Stump, WireError> {
-        let (del_hashes, _) = proof_util::process_proof(leaf_data, &block.txdata, height, |h| {
-            self.chain.get_block_hash(h)
-        })?;
+        let (del_hashes, _) = proof_util::process_proof(
+            leaf_data,
+            &block.txdata,
+            height,
+            |h| self.chain.get_block_hash(h),
+            |h| self.chain.get_mtp_by_height(h),
+        )?;
 
         Ok(self
             .chain
@@ -732,10 +741,13 @@ where
             .aux_data
             .expect("Block proof and leaf data should be present");
 
-        let (del_hashes, inputs) =
-            proof_util::process_proof(&leaf_data, &block.block.txdata, fork_height, |h| {
-                self.chain.get_block_hash(h)
-            })?;
+        let (del_hashes, inputs) = proof_util::process_proof(
+            &leaf_data,
+            &block.block.txdata,
+            fork_height,
+            |h| self.chain.get_block_hash(h),
+            |h| self.chain.get_mtp_by_height(h),
+        )?;
 
         let acc = self.find_accumulator_for_block(fork_height, fork).await?;
         let is_valid = self
@@ -973,7 +985,7 @@ where
         if self.context.state == ChainSelectorState::Done {
             let (height, hash) = self.chain.get_best_block()?;
             info!("ChainSelector done: tip height={height} hash={hash}");
-            self.chain.update_ibd(IBDState::DownloadingBlocks);
+            self.chain.update_ibd(IBDState::ProofSync);
             try_and_log!(self.chain.flush());
             return Ok(LoopControl::Break);
         }
@@ -1027,6 +1039,10 @@ where
                     NodeNotification::FromUser(request, responder) => {
                         self.perform_user_request(request, responder).await;
                     }
+
+                    msg @ NodeNotification::FromWorker { .. } => {
+                        error!("Received a notification from the worker thread {msg:?}");
+                    }
                 }
             }
 
@@ -1073,6 +1089,10 @@ where
 
             NodeNotification::DnsSeedAddresses(addresses) => {
                 self.address_man.push_addresses(&addresses);
+            }
+
+            msg @ NodeNotification::FromWorker { .. } => {
+                error!("Received a notification from the worker thread {msg:?}");
             }
         }
         Ok(())

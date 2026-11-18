@@ -363,9 +363,13 @@ build_floresta() {
     cd "$bdlDir" || exit
     export RUSTFLAGS="-C link-arg=-fuse-ld=mold -C target-cpu=native"
     cargo build --release \
-        --bin florestad \
-        --bin floresta-cli \
+        -p florestad \
         --features json-rpc \
+        --locked
+
+    echo "🦀 Building floresta-cli $defaultTag..."
+    cargo build --release \
+        -p floresta-cli \
         --locked
 
     echo "🌳 Copying binaries to /usr/local/bin (need sudo)..."
@@ -428,7 +432,7 @@ After=network-online.target time-set.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/florestad --daemon --network $network --data-dir $florestaDir --config-file $florestaLib/config.toml --pid-file $florestaRun/florestad.pid --log-to-file$([ -n "$proxy" ] && echo " --proxy $proxy ")$([ -n "$connect" ] && echo " --connect $connect ")$([ -n "$zeromq" ] && echo " --zmq-address $zeromq ")$([ -n "$assume_valid" ] && echo " --assume-valid $assume_valid ")$([ "$assume_utreexo" = true ] && echo " --assume-utreexo ")$([ "$enable_cfilters" = false ] && echo " --no-cfilters ")$([ "$enable_tls" == true ] && echo " --generate-cert --enable-electrum-tls")
+ExecStart=/usr/local/bin/florestad --daemon --network $network --data-dir $florestaDir --config-file $florestaLib/config.toml --pid-file $florestaRun/florestad.pid$([ -n "$proxy" ] && echo " --proxy $proxy ")$([ -n "$connect" ] && echo " --connect $connect ")$([ -n "$zeromq" ] && echo " --zmq-address $zeromq ")$([ -n "$assume_valid" ] && echo " --assume-valid $assume_valid ")$([ "$assume_utreexo" = true ] && echo " --assume-utreexo ")$([ "$enable_cfilters" = false ] && echo " --no-cfilters ")$([ -n "$filters_start_height" ] && echo " --filters-start-height \"$filters_start_height\" ")$([ "$enable_tls" == true ] && echo " --generate-cert --enable-electrum-tls")
 
 # Ensure that the service is ready after the MainPID exists
 Type=forking
@@ -577,7 +581,10 @@ show_done() {
     echo "    sudo systemctl start florestad.service  # this will start the service now"
     echo "    sudo systemctl status florestad.service # this check if service is running well"
     echo "    sudo systemctl enable florestad.service # this enable service on boot"
-    echo "    floresta-cli getblockchaininfo          # this assures all OK"
+    echo "    sudo -u florestad floresta-cli --network $network --data-dir $florestaDir getblockchaininfo"
+    echo ""
+    echo "The RPC cookie is owned by the 'florestad' user and readable only by it,"
+    echo "so run floresta-cli as that user, or set -rpcuser/-rpcpassword instead."
     echo ""
 }
 

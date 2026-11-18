@@ -34,9 +34,12 @@ use crate::node::InflightRequests;
 use crate::node::MAX_ADDRV2_ADDRESSES;
 use crate::node::NodeNotification;
 use crate::node::NodeRequest;
+use crate::node::PeerStatus;
 use crate::node::UtreexoNode;
+use crate::node::WitnessMode;
 use crate::node::chain_selector_ctx::ChainSelector;
 use crate::node::periodic_job;
+use crate::node::swift_sync_ctx::SwiftSync;
 use crate::node::sync_ctx::SyncNode;
 use crate::node_context::LoopControl;
 use crate::node_context::NodeContext;
@@ -66,13 +69,6 @@ pub struct RunningNode {
 
 impl NodeContext for RunningNode {
     const REQUEST_TIMEOUT: u64 = 2 * 60;
-
-    fn get_required_services(&self) -> ServiceFlags {
-        ServiceFlags::NETWORK
-            | service_flags::UTREEXO.into()
-            | ServiceFlags::WITNESS
-            | ServiceFlags::COMPACT_FILTERS
-    }
 }
 
 impl Default for RunningNode {
@@ -104,7 +100,12 @@ where
             .take(MAX_ADDRV2_ADDRESSES)
             .collect();
 
-        self.send_to_random_peer(NodeRequest::SendAddresses(addresses), ServiceFlags::NONE)?;
+        self.send_to_random_peer_with_predicate(
+            NodeRequest::SendAddresses(addresses),
+            ServiceFlags::NONE,
+            |peer| peer.state == PeerStatus::Ready && peer.kind.is_full_relay(),
+        )?;
+
         Ok(())
     }
 
@@ -118,19 +119,47 @@ where
     /// proofs, this means the last 100 blocks, and for assumeutreexo, this means however many
     /// blocks from the hard-coded value in the config file.
     pub async fn catch_up(self) -> Result<Self, WireError> {
-        let sync = UtreexoNode {
+        let swift_sync = UtreexoNode {
             common: self.common,
+            context: SwiftSync::default(),
+        };
+
+        // Propagate chainstate errors instead of falling back to proof sync with uncertain state
+        let swift_sync = swift_sync.run(|_| {}).await?;
+
+        if *swift_sync.kill_signal.read().await {
+            // Return to the caller shutdown path instead of starting proof sync
+            return Ok(Self {
+                common: swift_sync.common,
+                context: self.context,
+            });
+        }
+
+        let swift_sync_failed = swift_sync.was_aborted();
+
+        // Finish IBD with regular utreexo sync
+        let mut sync = UtreexoNode {
+            common: swift_sync.common,
             context: SyncNode::default(),
         };
+
+        // If SwiftSync couldn't complete, we need to validate all blocks from scratch
+        if swift_sync_failed {
+            // Clear the inflight requests and in-memory blocks to start from genesis
+            sync.inflight.clear();
+            sync.blocks.clear();
+            assert_eq!(sync.unprocessed_blocks(), 0);
+        }
 
         let sync = sync.run(|_| {}).await;
 
         // Once we are synced, peer diversity is the priority, as we must be able to discover
-        // newly mined blocks. However, the peer list that we have built during `SyncNode` is
-        // biased towards low-latency peers (often geographically close to our node).
+        // newly mined blocks. However, the peer list that we have built during IBD is biased
+        // towards low-latency peers (often geographically close to our node).
         //
-        // Here we try disconnecting half of our connected peers to open space for new peers.
-        let peers_to_disconnect = sync.connected_peers() / 2;
+        // Keep half the running-mode peer limit to leave room for fresh peers.
+        let peers_to_keep = RunningNode::MAX_OUTGOING_PEERS / 2;
+        let peers_to_disconnect = sync.connected_peers().saturating_sub(peers_to_keep);
         let protected_services = &[service_flags::UTREEXO.into()];
         sync.disconnect_random_peers(peers_to_disconnect, protected_services);
 
@@ -157,7 +186,7 @@ where
             if self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
                 self.peers
                     .values()
-                    .filter(|peer| peer.is_regular_peer())
+                    .filter(|peer| peer.kind.is_regular())
                     .choose(&mut rng())
                     .and_then(|p| p.channel.send(NodeRequest::Shutdown).ok());
             }
@@ -177,7 +206,7 @@ where
             if has_cf_candidate && self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
                 self.peers
                     .values()
-                    .filter(|peer| peer.is_regular_peer())
+                    .filter(|peer| peer.kind.is_regular())
                     .choose(&mut rng())
                     .and_then(|p| p.channel.send(NodeRequest::Shutdown).ok());
             }
@@ -339,11 +368,13 @@ where
         };
 
         // Catch up with the network, downloading blocks from our last validation index to the tip
+        let kill_signal = self.kill_signal.clone();
         info!("Catching up with the network...");
         self = match self.catch_up().await {
             Ok(node) => node,
             Err(e) => {
-                error!("An error happened while trying to catch-up with the network: {e:?}",);
+                error!("An error happened while trying to catch-up with the network: {e:?}");
+                *kill_signal.write().await = true;
                 return;
             }
         };
@@ -660,24 +691,34 @@ where
                             }
 
                             // this peer got us a new block, we should disconnect one of our regular peers
-                            // and keep this one.
+                            // and keep this one as block-relay-only.
                             let peer_to_disconnect = self
                                 .peers
                                 .iter()
                                 // Don't disconnect manual connections
-                                .filter(|(_, info)| info.is_regular_peer())
+                                .filter(|(_, info)| info.kind.is_regular())
                                 .min_by_key(|(k, _)| self.get_peer_score(**k))
                                 .map(|(peer, _)| *peer);
 
                             // disconnect the peer with the lowest score
-                            if let Some(peer) = peer_to_disconnect {
-                                self.send_to_peer(peer, NodeRequest::Shutdown)?;
+                            if let Some(peer_to_disconnect) = peer_to_disconnect {
+                                debug!(
+                                    "Disconnecting peer {peer_to_disconnect} after extra peer promotion"
+                                );
+                                self.send_to_peer(peer_to_disconnect, NodeRequest::Shutdown)?;
                             }
 
                             // update the peer info
+                            debug!(
+                                "Extra peer {peer} returned useful headers; keeping it as block-relay-only"
+                            );
                             self.peers.entry(peer).and_modify(|info| {
-                                info.kind = ConnectionKind::Regular(peer_info.services);
+                                info.kind = ConnectionKind::BlockRelayOnly(peer_info.services);
                             });
+
+                            if !self.peer_ids.contains(&peer) {
+                                self.peer_ids.push(peer);
+                            }
                         }
 
                         for header in headers.iter() {
@@ -717,17 +758,17 @@ where
 
                             self.chain.accept_header(*header)?;
 
-                            // Call it again, since `accept_header` might reorg the chain
+                            // `accept_header` may change the best chain.
                             let (_, best_hash) = self.chain.get_best_block()?;
 
-                            // this is a fork block, don't request the actual block.
-                            if header.prev_blockhash != best_hash {
+                            // Don't request blocks outside the best chain.
+                            if block_hash != best_hash {
                                 continue;
                             }
 
                             self.send_to_peer(
                                 peer,
-                                NodeRequest::GetBlock(vec![header.block_hash()]),
+                                NodeRequest::GetBlock(vec![header.block_hash()], WitnessMode::Full),
                             )?;
 
                             self.inflight.insert(
@@ -754,7 +795,259 @@ where
                     ),
                 }
             }
+
+            msg @ NodeNotification::FromWorker { .. } => {
+                error!("Received a notification from the worker thread {msg:?}");
+            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use bitcoin::Network;
+    use bitcoin::p2p::ServiceFlags;
+    use floresta_chain::AssumeValidArg;
+    use floresta_chain::ChainState;
+    use floresta_chain::FlatChainStore;
+    use floresta_chain::FlatChainStoreConfig;
+    use floresta_chain::pruned_utreexo::UpdatableChainstate;
+    use floresta_common::Ema;
+    use floresta_mempool::Mempool;
+    use tokio::sync::Mutex;
+    use tokio::sync::RwLock;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use crate::TransportProtocol;
+    use crate::UtreexoNodeConfig;
+    use crate::address_man::AddressMan;
+    use crate::address_man::AddressState;
+    use crate::address_man::LocalAddress;
+    use crate::node::ConnectionKind;
+    use crate::node::InflightRequests;
+    use crate::node::LocalPeerView;
+    use crate::node::NodeNotification;
+    use crate::node::NodeRequest;
+    use crate::node::PeerStatus;
+    use crate::node::UtreexoNode;
+    use crate::node::WitnessMode;
+    use crate::node::running_ctx::RunningNode;
+    use crate::p2p_wire::peer::PeerMessages;
+    use crate::p2p_wire::peer::Version;
+    use crate::p2p_wire::tests::signet_headers;
+
+    type TestChain = Arc<ChainState<FlatChainStore>>;
+    type TestNode = UtreexoNode<TestChain, RunningNode>;
+
+    fn peer_services() -> ServiceFlags {
+        ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::NETWORK_LIMITED
+    }
+
+    fn test_node() -> TestNode {
+        let datadir = format!("./tmp-db/{}.running_node", rand::random::<u32>());
+        fs::create_dir_all(&datadir).expect("test datadir should be created");
+
+        let chainstore = FlatChainStore::new(FlatChainStoreConfig::new(&datadir))
+            .expect("chain store should be created");
+        let chain = Arc::new(
+            ChainState::open(chainstore, Network::Signet, AssumeValidArg::Disabled)
+                .expect("chain state should open"),
+        );
+
+        let mut headers = signet_headers();
+        headers.remove(0);
+        chain
+            .accept_header(headers[0])
+            .expect("test chain should accept first signet header");
+
+        let config = UtreexoNodeConfig {
+            network: Network::Signet,
+            datadir: datadir.into(),
+            ..Default::default()
+        };
+
+        UtreexoNode::<TestChain, RunningNode>::new(
+            config,
+            chain,
+            Arc::new(Mutex::new(Mempool::new(1000))),
+            Arc::new(RwLock::new(false)),
+            AddressMan::new(None, &[]),
+        )
+        .expect("test node should be created")
+    }
+
+    fn local_address(peer_id: u32) -> LocalAddress {
+        LocalAddress::new(
+            format!("192.0.2.{}:38333", peer_id + 1)
+                .parse()
+                .expect("test address should parse"),
+            0,
+            AddressState::NeverTried,
+            peer_services(),
+            peer_id as usize,
+        )
+    }
+
+    fn insert_peer(
+        node: &mut TestNode,
+        peer_id: u32,
+        kind: ConnectionKind,
+    ) -> UnboundedReceiver<NodeRequest> {
+        let (sender, receiver) = unbounded_channel();
+
+        node.peers.insert(
+            peer_id,
+            LocalPeerView {
+                message_times: Ema::with_half_life_50(),
+                state: PeerStatus::Ready,
+                channel: sender,
+                services: peer_services(),
+                user_agent: "/test:0.0.0/".to_string(),
+                address: local_address(peer_id),
+                _last_message: Instant::now(),
+                kind,
+                height: 1,
+                time_offset: 0,
+                banscore: 0,
+                transport_protocol: TransportProtocol::V2,
+            },
+        );
+
+        receiver
+    }
+
+    /// Creates a test node with a single ready peer of the given kind.
+    fn test_node_with_peer(
+        peer_id: u32,
+        kind: ConnectionKind,
+    ) -> (TestNode, UnboundedReceiver<NodeRequest>) {
+        let mut node = test_node();
+        let receiver = insert_peer(&mut node, peer_id, kind);
+
+        (node, receiver)
+    }
+
+    fn peer_version(peer_id: u32, kind: ConnectionKind) -> Version {
+        Version {
+            user_agent: "/test:0.0.0/".to_string(),
+            protocol_version: 70016,
+            blocks: 1,
+            id: peer_id,
+            address_id: peer_id as usize,
+            services: peer_services(),
+            time_offset: 0,
+            kind,
+            transport_protocol: TransportProtocol::V2,
+        }
+    }
+
+    #[test]
+    fn feeler_peer_disconnects_after_handshake_without_requesting_addresses() {
+        let peer = 0;
+        let (mut node, mut receiver) = test_node_with_peer(peer, ConnectionKind::Feeler);
+
+        node.handle_peer_ready(peer, peer_version(peer, ConnectionKind::Feeler))
+            .expect("feeler peer should become ready");
+
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("feeler peer should be disconnected"),
+            NodeRequest::Shutdown
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "feeler peer should not receive address requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn addr_fetch_peer_requests_addresses_then_disconnects() {
+        let peer = 0;
+        let (mut node, mut receiver) = test_node_with_peer(peer, ConnectionKind::AddrFetch);
+
+        node.handle_peer_ready(peer, peer_version(peer, ConnectionKind::AddrFetch))
+            .expect("addr-fetch peer should become ready");
+
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("addr-fetch peer should request addresses"),
+            NodeRequest::GetAddresses
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "addr-fetch peer should wait for addresses before disconnecting"
+        );
+
+        node.handle_notification(NodeNotification::FromPeer(
+            peer,
+            PeerMessages::Addr(Vec::new()),
+            Instant::now(),
+        ))
+        .await
+        .expect("addr-fetch address response should be handled");
+
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("addr-fetch peer should disconnect after addresses"),
+            NodeRequest::Shutdown
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_peer_with_useful_headers_replaces_regular_peer_as_block_relay_only() {
+        let mut node = test_node();
+
+        let regular_peer = 0;
+        let extra_peer = 1;
+        let mut regular_peer_receiver = insert_peer(
+            &mut node,
+            regular_peer,
+            ConnectionKind::OutboundFullRelay(ServiceFlags::NONE),
+        );
+        let mut extra_peer_receiver = insert_peer(&mut node, extra_peer, ConnectionKind::Extra);
+
+        node.peer_ids.push(regular_peer);
+        node.inflight
+            .insert(InflightRequests::Headers, (extra_peer, Instant::now()));
+
+        let headers = signet_headers();
+        let useful_header = headers[2];
+        node.handle_notification(NodeNotification::FromPeer(
+            extra_peer,
+            PeerMessages::Headers(vec![useful_header]),
+            Instant::now(),
+        ))
+        .await
+        .expect("extra peer headers should be handled");
+
+        assert_eq!(
+            regular_peer_receiver
+                .try_recv()
+                .expect("regular peer should be disconnected"),
+            NodeRequest::Shutdown
+        );
+        assert!(matches!(
+            node.peers
+                .get(&extra_peer)
+                .expect("extra peer should still exist")
+                .kind,
+            ConnectionKind::BlockRelayOnly(services) if services == peer_services()
+        ));
+        assert!(node.peer_ids.contains(&extra_peer));
+        assert_eq!(
+            extra_peer_receiver
+                .try_recv()
+                .expect("block-relay-only peer should be asked for the new block"),
+            NodeRequest::GetBlock(vec![useful_header.block_hash()], WitnessMode::Full)
+        );
     }
 }

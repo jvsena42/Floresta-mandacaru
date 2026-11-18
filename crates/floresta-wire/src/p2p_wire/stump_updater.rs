@@ -1,6 +1,3 @@
-// TODO: remove once we use this module for SwiftSync
-#![allow(dead_code, unused_imports)]
-
 use std::collections::BTreeMap;
 use std::time::Duration;
 use std::time::Instant;
@@ -68,8 +65,8 @@ impl SparseUtreexoAdds {
 /// Handle for interacting with a running [`StumpUpdater`] task.
 ///
 /// The caller must send exactly one update for each height in `initial_height + 1..=stop_height`.
-/// Sending stale, duplicate, or out-of-range heights, or dropping `tx` before `stop_height` is
-/// reached, is invalid usage and will close `done` without a result.
+/// Sending stale, duplicate, or out-of-range heights is invalid usage and panics in the task.
+/// Dropping `tx` before `stop_height` cancels the task and closes `done` without a result.
 pub struct StumpUpdaterHandle {
     /// Sender side for feeding `(height, update_data)` into the updater task.
     pub tx: mpsc::UnboundedSender<(u32, SparseUtreexoAdds)>,
@@ -129,8 +126,9 @@ impl StumpUpdater {
         };
 
         tokio::task::spawn_blocking(move || {
-            let result = updater.run(rx, stop_height);
-            let _ = done_tx.send(result);
+            if let Some(result) = updater.run(rx, stop_height) {
+                let _ = done_tx.send(result);
+            }
         });
 
         StumpUpdaterHandle { tx, done: done_rx }
@@ -160,15 +158,10 @@ impl StumpUpdater {
         mut self,
         mut rx: mpsc::UnboundedReceiver<(u32, SparseUtreexoAdds)>,
         stop_height: u32,
-    ) -> Stump {
+    ) -> Option<Stump> {
         while self.last_height < stop_height {
-            // Wait until a new state update arrives
-            let Some((height, update)) = rx.blocking_recv() else {
-                panic!(
-                    "updater channel closed at height {} before {stop_height}",
-                    self.last_height,
-                )
-            };
+            // Channel closure cancels the task without returning a partial stump.
+            let (height, update) = rx.blocking_recv()?;
 
             self.queue_update(height, update, stop_height);
             self.try_next();
@@ -181,7 +174,7 @@ impl StumpUpdater {
             self.max_cached_utxos,
         );
 
-        self.last_acc
+        Some(self.last_acc)
     }
 
     /// Loops over all pending updates that we can sequentially apply, consuming the data and
@@ -205,7 +198,7 @@ impl StumpUpdater {
             let adds = adds.into_dense();
 
             let start = Instant::now();
-            let (new_acc, _) = self
+            let new_acc = self
                 .last_acc
                 .modify(&adds, &[], &Proof::default())
                 .expect("addition-only stump modification cannot fail");
@@ -275,6 +268,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(final_acc.leaves, 4);
+        assert_eq!(
+            final_acc.roots,
+            vec![BitcoinNodeHash::parent_hash(&hash(1), &hash(2))],
+            "non-empty leaves move to the parent position, so this 4-leaf tree only needs one hash"
+        );
     }
 
     #[tokio::test]
@@ -284,6 +282,26 @@ mod tests {
         drop(tx);
 
         assert_worker_closed(done).await;
+    }
+
+    #[test]
+    fn run_cancels_without_returning_partial_stump() {
+        let updater = StumpUpdater {
+            last_acc: Stump::new(),
+            last_height: 0,
+            pending_updates: BTreeMap::new(),
+            total_time: Duration::ZERO,
+            cached_utxos: 0,
+            max_cached_utxos: 0,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Provide block 1's additions, then close the channel to simulate cancellation
+        tx.send((1, SparseUtreexoAdds::new(vec![hash(1)]))).unwrap();
+        drop(tx);
+
+        let stop_height = 2;
+        assert!(updater.run(rx, stop_height).is_none());
     }
 
     #[tokio::test]
@@ -324,17 +342,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "initial `StumpUpdater` height must be less than `stop_height`")]
     fn spawn_panics_if_initial_height_is_not_below_stop_height() {
-        for h in 0..5 {
-            let _ = StumpUpdater::spawn(Stump::new(), h, 5);
-        }
-
         let _ = StumpUpdater::spawn(Stump::new(), 5, 5);
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "initial `StumpUpdater` height must be less than `stop_height`")]
     fn spawn_panics_if_initial_height_is_above_stop_height() {
         let _ = StumpUpdater::spawn(Stump::new(), 6, 5);
     }
@@ -388,8 +402,6 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    // TODO: uncomment when rustreexo supports implicit deletion
-    /*
     #[tokio::test]
     async fn mainnet_additions_with_implicit_deletion_out_of_order() {
         // Block 9's sole addition is spent at height 170
@@ -397,10 +409,15 @@ mod tests {
 
         let expected = Stump {
             leaves: 177,
-            roots: acchashes![], // TODO: expected roots at height 175
+            roots: acchashes![
+                "d71afabf3ec469988d02cbcbca6123dc294af01da8e5e60ebe1bb6139b513a05",
+                "53c92fa0792c9af1c19793b1149e7fe209c69b320ea054338f53f8fd8535f2e8",
+                "6dc041b6f10c8ac3bfa74c03c04d99bce498c9f0330b8ec1883d5afd71676af5",
+                "fa140e9d9a85ad8c5a56761661c25d54dfd0d070da6e84781499d5a6b7f6a0cd",
+            ]
+            .to_vec(),
         };
 
         assert_eq!(actual, expected);
     }
-    */
 }

@@ -28,6 +28,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up libbitcoinkernel
+        uses: $/.github/actions/setup-libbitcoinkernel
+
       - name: Install cargo-hack
         uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
         with:
@@ -38,11 +41,6 @@ jobs:
           rustup toolchain install nightly --profile minimal --component rustfmt,clippy --no-self-update
           rustup default nightly
 
-      - name: Install Boost
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libboost-all-dev
-
       - name: Spell check
         uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
         with:
@@ -51,10 +49,16 @@ jobs:
       - name: Run cargo fmt
         run: cargo +nightly fmt --all --check
 
-      - name: Run cargo doc
+      - name: Run cargo doc (each crate)
         run: |
-          RUSTDOCFLAGS="--cfg docsrs -D warnings" \
-          cargo +nightly doc --workspace --no-deps --lib --all-features --document-private-items
+          #!/usr/bin/env bash
+          set -e
+          CRATES=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.source == null and (.targets | map(.kind | contains(["lib"])) | any)) | .name' | tr '\n' ' ')
+          echo "Building docs for crates: $CRATES"
+          for crate in $CRATES; do
+            echo "Running cargo doc for: $crate"
+            RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc -p "$crate" --no-deps --lib --all-features --document-private-items || exit 1
+          done
 
       - name: Run cargo clippy
         run: ./contrib/feature_matrix.sh clippy '-- -D warnings'
@@ -72,6 +76,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up libbitcoinkernel
+        uses: $/.github/actions/setup-libbitcoinkernel
+
       - name: Install 1.85.0 Rust Toolchain
         run: |
           rustup toolchain install 1.85.0 --profile minimal --component rustfmt,clippy --no-self-update
@@ -81,35 +88,6 @@ jobs:
         uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
         with:
           tool: cargo-hack
-
-      - name: Install Boost (Ubuntu)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libboost-all-dev
-
-      - name: Install Boost (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew update
-          brew install boost
-
-      - name: Install Boost library
-        if: runner.os == 'Windows'
-        run: |
-          git clone https://github.com/microsoft/vcpkg.git
-          cd vcpkg
-          .\bootstrap-vcpkg.bat
-          .\vcpkg install boost-multi-index:x64-windows-static boost-headers:x64-windows-static
-          echo "VCPKG_ROOT=$env:GITHUB_WORKSPACE\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "$env:GITHUB_WORKSPACE\vcpkg\installed\x64-windows-static\lib" | Out-File -FilePath $env:GITHUB_PATH -Append
-
-      - name: Set environment variables for static linking
-        if: runner.os == 'windows'
-        run: |
-          echo "BOOST_ROOT=$env:GITHUB_WORKSPACE\vcpkg\installed\x64-windows-static" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "BOOST_INCLUDEDIR=$env:GITHUB_WORKSPACE\vcpkg\installed\x64-windows-static\include" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "BOOST_LIBRARYDIR=$env:GITHUB_WORKSPACE\vcpkg\installed\x64-windows-static\lib" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # Bi-weekly numbers to refresh caches every two weeks, ensuring recent project changes are cached
       - name: Set bi-weekly cache key
@@ -137,9 +115,11 @@ jobs:
             ${{ runner.os }}-cargo-${{ env.CACHE_VERSION }}-
             ${{ runner.os }}-cargo-
 
-      # Build only the binaries
+      # Build only the binaries (florestad and floresta-cli separately to avoid feature conflicts)
       - name: Build binaries
-        run: cargo build --release --bins --verbose
+        run: |
+          cargo build --release -p florestad --verbose
+          cargo build --release -p floresta-cli --verbose
 
       # Run the feature testing script
       - name: Run feature tests

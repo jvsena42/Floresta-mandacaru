@@ -1,20 +1,21 @@
 [package]
 name = "floresta-common"
-version = "0.5.1"
+version = "1.0.0"
 rust-version.workspace = true
 edition.workspace = true
 description = "Common types and functions for Floresta"
 authors = ["Floresta Developers <contact@getfloresta.org>"]
 license.workspace = true
 repository = "https://github.com/getfloresta/Floresta"
-readme.workspace = true # Floresta/README.md
+readme = "README.md"
 
 [dependencies]
 # All dependencies MUST be pinned precisely with `X.Y.z`
 bitcoin = { workspace = true }
+# Required for the `#[cfg(not(feature = "std"))]` prelude re-exports below;
+# the CI builds this crate for no_std targets (thumbv7em-none-eabi).
 hashbrown = { version = "=0.17.1" }
 spin = { workspace = true }
-tracing = { workspace = true }
 
 [features]
 default = ["std"]

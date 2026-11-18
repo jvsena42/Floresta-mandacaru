@@ -156,6 +156,9 @@ pub const fn validate_hash_compile_time(s: &str) -> Result<(), &str> {
 
 #[macro_export]
 /// Run a task and log any errors that might occur.
+///
+/// The error is logged with `tracing::error!`, which is resolved in the calling crate, so that
+/// crate must depend on `tracing`.
 macro_rules! try_and_log {
     ($what:expr) => {
         if let Err(error) = $what {
@@ -168,6 +171,9 @@ macro_rules! try_and_log {
 /// Run a task and warn any errors that might occur.
 ///
 /// `try_and_log!` variant for tasks that can fail safely.
+///
+/// The error is logged with `tracing::warn!`, which is resolved in the calling crate, so that
+/// crate must depend on `tracing`.
 macro_rules! try_and_warn {
     ($what:expr) => {
         if let Err(warning) = $what {

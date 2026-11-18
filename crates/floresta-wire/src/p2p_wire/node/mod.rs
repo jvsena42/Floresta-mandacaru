@@ -9,6 +9,7 @@ pub mod chain_selector_ctx;
 mod conn;
 mod peer_man;
 pub mod running_ctx;
+pub mod swift_sync_ctx;
 pub mod sync_ctx;
 mod user_req;
 
@@ -29,7 +30,9 @@ use bitcoin::bip158::BlockFilter;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::AddrV2Message;
 pub(crate) use blocks::InflightBlock;
+use floresta_chain::BlockchainError;
 use floresta_chain::ChainBackend;
+use floresta_chain::pruned_utreexo::consensus::SwiftSyncDelta;
 use floresta_common::Ema;
 use floresta_common::try_and_log;
 use floresta_common::try_and_warn;
@@ -64,18 +67,34 @@ use crate::node_context::PeerId;
 /// As per BIP 155, limit the number of addresses to 1,000
 pub const MAX_ADDRV2_ADDRESSES: usize = 1_000;
 
+type WorkerResult = Result<SwiftSyncDelta, BlockchainError>;
+
 #[derive(Debug)]
 pub enum NodeNotification {
     DnsSeedAddresses(Vec<LocalAddress>),
     FromPeer(u32, PeerMessages, Instant),
     FromUser(UserRequest, oneshot::Sender<NodeResponse>),
+    /// Returns the validation result with the delta SwiftSync aggregator and the total unspent
+    /// amount sum, together with the block hash and height.
+    FromWorker {
+        result: WorkerResult,
+        block_hash: BlockHash,
+        block_height: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Whether we want to request full or stripped blocks (for witnessless sync).
+pub enum WitnessMode {
+    Full,
+    Witnessless,
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 /// Sent from node to peers, usually to request something
 pub enum NodeRequest {
     /// Request the full block data for one or more blocks
-    GetBlock(Vec<BlockHash>),
+    GetBlock(Vec<BlockHash>, WitnessMode),
 
     /// Asks peer for headers
     GetHeaders(Vec<BlockHash>),
@@ -124,6 +143,13 @@ pub enum NodeRequest {
     GetCFCheckpt(BlockHash),
 }
 
+impl NodeRequest {
+    /// Whether this request broadcasts one of our mempool transactions.
+    pub(crate) const fn is_broadcast_transaction(&self) -> bool {
+        matches!(self, Self::BroadcastTransaction(_))
+    }
+}
+
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub(crate) enum InflightRequests {
     /// Requests the peer to send us the next block headers in their main chain
@@ -145,44 +171,97 @@ pub(crate) enum InflightRequests {
     GetAddresses,
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
 /// The kind of connection we see this peer as.
 ///
 /// Core's counterpart: <https://github.com/bitcoin/bitcoin/blob/bf9ef4f0433551e850a11c2da8baae0ec6439a99/src/node/connection_types.h#L18>.
 pub enum ConnectionKind {
-    /// A feeler connection is a short-lived connection used to check whether this peer is alive.
-    ///
-    /// After handshake, we ask for addresses and when we receive an answer we just disconnect,
-    /// marking this peer as alive in our address manager.
-    Feeler,
-
-    /// A regular peer, used to send requests to and learn about transactions and blocks.
-    Regular(ServiceFlags),
-
-    /// An extra peer specially created if our tip hasn't moved for too long.
-    ///
-    /// If more than [`NodeContext::ASSUME_STALE`] seconds have passed since the
-    /// last processed block, we use this to make sure we are not in a partitioned subnet,
-    /// unable to learn about new blocks.
-    Extra,
+    /// A regular outbound peer, used to relay transactions, addresses, and blocks.
+    OutboundFullRelay(#[serde(skip)] ServiceFlags),
 
     /// A connection that was manually requested by our user. This type of peer won't be banned on
     /// misbehaving, and won't respect the [`ServiceFlags`] requirements when creating a
     /// connection.
     Manual,
+
+    /// A short-lived connection used to check whether a known peer is reachable.
+    ///
+    /// A feeler updates the address state for the peer it connects to, but it
+    /// does not solicit new addresses.
+    Feeler,
+
+    /// A short-lived automatic connection for soliciting addresses.
+    ///
+    /// An addr-fetch peer asks for addresses, stores the response in our
+    /// address manager, and then disconnects.
+    AddrFetch,
+
+    /// A peer that is only used to relay blocks, not transactions or addresses.
+    BlockRelayOnly(#[serde(skip)] ServiceFlags),
+
+    /// A temporary extra peer created if our tip hasn't moved for too long.
+    ///
+    /// If more than [`NodeContext::ASSUME_STALE`] seconds have passed since the
+    /// last processed block, we use this to make sure we are not in a partitioned
+    /// subnet, unable to learn about new blocks. If this peer returns useful
+    /// headers, we keep it as a [`ConnectionKind::BlockRelayOnly`] peer.
+    #[serde(rename = "block-relay-only")]
+    Extra,
 }
 
-impl Serialize for ConnectionKind {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+impl ConnectionKind {
+    /// The name of this connection kind, as reported by `getpeerinfo`.
+    ///
+    /// These match Bitcoin Core's connection type names. [`ConnectionKind::Extra`] is
+    /// reported as `block-relay-only`, since that's how it behaves to the outside.
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::Feeler => serializer.serialize_str("feeler"),
-            Self::Regular(_) => serializer.serialize_str("regular"),
-            Self::Extra => serializer.serialize_str("extra"),
-            Self::Manual => serializer.serialize_str("manual"),
+            Self::OutboundFullRelay(_) => "outbound-full-relay",
+            Self::Manual => "manual",
+            Self::Feeler => "feeler",
+            Self::AddrFetch => "addr-fetch",
+            Self::BlockRelayOnly(_) | Self::Extra => "block-relay-only",
         }
+    }
+
+    /// The service flags required to open this kind of connection.
+    pub(crate) const fn get_required_services(&self) -> ServiceFlags {
+        match self {
+            Self::OutboundFullRelay(services) | Self::BlockRelayOnly(services) => *services,
+            Self::Manual | Self::Feeler | Self::AddrFetch | Self::Extra => ServiceFlags::NONE,
+        }
+    }
+
+    /// Whether this connection kind was manually requested by the user.
+    pub(crate) const fn is_manual(&self) -> bool {
+        matches!(self, Self::Manual)
+    }
+
+    /// Whether this connection kind relays transactions and addresses.
+    pub(crate) const fn is_full_relay(&self) -> bool {
+        matches!(self, Self::OutboundFullRelay(_) | Self::Manual)
+    }
+
+    /// Whether this connection kind is a long-lived outbound kind managed by our connection logic.
+    pub(crate) const fn is_regular(&self) -> bool {
+        matches!(self, Self::OutboundFullRelay(_) | Self::BlockRelayOnly(_))
+    }
+
+    /// Whether this connection kind is expected to remain open if the peer doesn't die.
+    pub(crate) const fn is_long_lived(&self) -> bool {
+        self.is_manual() || self.is_regular()
+    }
+
+    /// Whether this connection kind is short-lived and disconnected after a
+    /// reachability check or address request.
+    pub(crate) const fn is_short_lived(&self) -> bool {
+        matches!(self, Self::Feeler | Self::AddrFetch)
+    }
+
+    /// Whether this connection kind is block-relay-only.
+    pub(crate) const fn is_block_relay_only(&self) -> bool {
+        matches!(self, Self::BlockRelayOnly(_))
     }
 }
 
@@ -215,8 +294,9 @@ pub struct LocalPeerView {
 
     /// The kind of connection we have with this peer
     ///
-    /// We use different connections with different goals, e.g., feeler connections,
-    /// regular connections, extra connections to find about new tips, etc.
+    /// We use different connections with different goals, e.g. full-relay peers,
+    /// block-relay-only peers, feeler connections, addr-fetch connections, and
+    /// extra connections to learn about new tips.
     pub(crate) kind: ConnectionKind,
 
     /// The latest height this peer has announced to us
@@ -240,21 +320,6 @@ impl LocalPeerView {
     /// Whether this peer advertises any service in `services`.
     pub(crate) fn has_any_service(&self, services: &[ServiceFlags]) -> bool {
         services.iter().any(|service| self.services.has(*service))
-    }
-
-    /// Whether this is a manually added peer
-    pub(crate) const fn is_manual_peer(&self) -> bool {
-        matches!(self.kind, ConnectionKind::Manual)
-    }
-
-    /// Whether this is a regular peer
-    pub(crate) const fn is_regular_peer(&self) -> bool {
-        matches!(self.kind, ConnectionKind::Regular(_))
-    }
-
-    // Connections expected to remain open if the peer doesn't die
-    pub(crate) const fn is_long_lived(&self) -> bool {
-        self.is_manual_peer() || self.is_regular_peer()
     }
 }
 
@@ -317,6 +382,7 @@ pub struct NodeCommon<Chain: ChainBackend> {
     pub(crate) datadir: PathBuf,
     pub(crate) network: Network,
     pub(crate) kill_signal: Arc<tokio::sync::RwLock<bool>>,
+    pub(crate) witness_mode: WitnessMode,
 }
 
 /// The main node that operates while florestad is up.
@@ -420,6 +486,7 @@ where
                 config,
                 kill_signal,
                 added_peers: Vec::new(),
+                witness_mode: WitnessMode::Full,
             },
             context: T::default(),
         })
@@ -454,3 +521,36 @@ macro_rules! periodic_job {
 }
 
 pub(crate) use periodic_job;
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::p2p::ServiceFlags;
+
+    use super::ConnectionKind;
+
+    #[test]
+    fn extra_connection_kind_serializes_as_block_relay_only() {
+        // Extra is an internal stale-tip connection kind. It is exposed through
+        // RPC as block-relay-only, matching its externally visible behavior.
+        let serialized =
+            serde_json::to_string(&ConnectionKind::Extra).expect("kind should serialize");
+
+        assert_eq!(serialized, "\"block-relay-only\"");
+    }
+
+    #[test]
+    fn connection_kind_names_match_core() {
+        assert_eq!(
+            ConnectionKind::OutboundFullRelay(ServiceFlags::NETWORK).as_str(),
+            "outbound-full-relay"
+        );
+        assert_eq!(ConnectionKind::Manual.as_str(), "manual");
+        assert_eq!(ConnectionKind::Feeler.as_str(), "feeler");
+        assert_eq!(ConnectionKind::AddrFetch.as_str(), "addr-fetch");
+        assert_eq!(
+            ConnectionKind::BlockRelayOnly(ServiceFlags::NETWORK).as_str(),
+            "block-relay-only"
+        );
+        assert_eq!(ConnectionKind::Extra.as_str(), "block-relay-only");
+    }
+}

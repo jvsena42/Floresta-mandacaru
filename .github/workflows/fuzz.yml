@@ -35,6 +35,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up libbitcoinkernel
+        uses: $/.github/actions/setup-libbitcoinkernel
+
       - name: Install Nightly Rust Toolchain
         run: |
           rustup toolchain install nightly --profile minimal --no-self-update
@@ -85,11 +88,6 @@ jobs:
             ./.apt-cache
             ./.apt-state
           key: ${{ runner.os }}-apt-${{ env.APT_HASH }}
-
-      - name: Install Boost
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libboost-all-dev
 
       # Install system dependencies only if cache miss
       - name: Install libfuzzer dependencies

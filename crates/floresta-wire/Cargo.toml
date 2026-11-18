@@ -20,8 +20,9 @@ categories = ["cryptography::cryptocurrencies", "network-programming"]
 bip324 = { version = "=0.11.0", features = [ "tokio" ] }
 bitcoin = { workspace = true, features = ["serde"] }
 dns-lookup = { workspace = true }
+hintsfile = "0.2.1"
 rand = { workspace = true }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustreexo = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -31,16 +32,15 @@ bitcoin_hashes = { version = "=0.20.0" }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 ureq = { version = "=3.3.0", features = ["socks-proxy", "json", "rustls-no-provider"], default-features = false }
-tonic = { workspace = true }
-tonic-prost = { workspace = true }
 
 # Local dependencies
 floresta-chain = { workspace = true, features = ["flat-chainstore"] }
 floresta-common = { workspace = true }
-floresta-domain = { workspace = true }
+floresta-domain = { workspace = true, features = ["mempool"] }
 floresta-metrics = { workspace = true, optional = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 zstd = { workspace = true }
 derive_more = { version = "=2.1.1", features = ["constructor"] }
 
@@ -50,6 +50,7 @@ floresta-mempool = { workspace = true }
 [features]
 default = []
 metrics = ["dep:floresta-metrics"]
+fuzzing = []
 
 [lints]
 workspace = true

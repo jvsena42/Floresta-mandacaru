@@ -21,55 +21,6 @@
 //! [`RpcError`]: jsonrpc_interface::RpcError
 //! [`JsonRpcError`]: jsonrpc_interface::JsonRpcError
 
-use core::fmt::Debug;
-
-use corepc_types::v30::GetBlockHeaderVerbose;
-use corepc_types::v30::GetBlockVerboseOne;
-use corepc_types::v30::GetBlockchainInfo;
-use corepc_types::v30::GetRawTransactionVerbose;
-use serde::Deserialize;
-use serde::Serialize;
-
-/// `getblockchaininfo` response: Bitcoin Core's fields plus Floresta extensions.
-#[derive(Deserialize, Serialize)]
-pub struct GetBlockchainInfoRes {
-    #[serde(flatten)]
-    pub core: GetBlockchainInfo,
-    /// How many leaves we have in the utreexo accumulator so far
-    pub leaf_count: u64,
-    /// How many roots we have in the utreexo accumulator
-    pub root_count: u32,
-    /// The hex-encoded utreexo accumulator roots
-    pub root_hashes: Vec<String>,
-    /// Height up to which compact block filter headers have been synchronized.
-    /// They are synchronized from genesis, so progress is `filters / headers`.
-    ///
-    /// Absent when the node was started without compact-filter support.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub filters: Option<u32>,
-    /// Whether a wallet rescan is currently running.
-    ///
-    /// Filter headers reaching the tip does not mean the wallet is fully
-    /// scanned; while this is `true` the wallet history may still be
-    /// incomplete, so clients should not report "fully synced" yet.
-    #[serde(default)]
-    pub rescan_in_progress: bool,
-    /// Blocks whose filter the in-progress rescan has already checked. Absent
-    /// when no rescan is running.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub rescan_blocks_processed: Option<u32>,
-    /// Blocks in the height range of the in-progress rescan. Absent when no
-    /// rescan is running.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub rescan_blocks_total: Option<u32>,
-    /// Why the last wallet rescan failed. Cleared when another rescan starts.
-    ///
-    /// `rescan_in_progress` going back to `false` doesn't tell a completed
-    /// rescan from a failed one; clients should offer a retry when this is set.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub rescan_error: Option<String>,
-}
-
 /// Types and methods implementing the [JSON-RPC 2.0 spec](https://www.jsonrpc.org/specification),
 /// tailored for floresta's RPC server. Requests using JSON-RPC 1.0 (or omitting the version
 /// field) are also accepted, but responses always follow the 2.0 format.
@@ -81,11 +32,12 @@ pub mod jsonrpc_interface {
     use std::fmt::Formatter;
 
     use axum::http::StatusCode;
+    use bitcoin::Txid;
     use floresta_chain::BlockchainError;
     use floresta_chain::extensions::HeaderExtError;
     use floresta_common::impl_error_from;
     use floresta_domain::mempool::MempoolError;
-    use floresta_watch_only::WatchOnlyError;
+    use floresta_domain::wallet::error::WatchOnlyError;
     use floresta_wire::bitcoin_socket_addr::InvalidAddressError;
     use serde::Deserialize;
     use serde::Serialize;
@@ -228,6 +180,12 @@ pub mod jsonrpc_interface {
         /// Transaction not found.
         TxNotFound,
 
+        /// `gettxoutproof` was called with an empty `txids` list.
+        EmptyTxids,
+
+        /// `gettxoutproof` was called with the same txid more than once.
+        DuplicatedTxid(Txid),
+
         /// The provided script is invalid.
         InvalidScript,
 
@@ -280,9 +238,6 @@ pub mod jsonrpc_interface {
         /// the u32 timestamp range that block headers use.
         InvalidSystemTime,
 
-        /// Invalid `addnode` command or parameters.
-        InvalidAddnodeCommand,
-
         /// Invalid `disconnectnode` command (both address and node ID were provided).
         InvalidDisconnectNodeCommand,
 
@@ -306,6 +261,17 @@ pub mod jsonrpc_interface {
     impl_error_from!(JsonRpcError, MempoolError, MempoolAccept);
     impl_error_from!(JsonRpcError, InvalidAddressError, InvalidNetAddress);
 
+    impl Display for JsonRpcError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            let rpc_error = self.rpc_error();
+            let msg = match &rpc_error.data {
+                Some(data) => format!("{}: {}", rpc_error.message, data),
+                None => rpc_error.message.clone(),
+            };
+            write!(f, "{}", msg)
+        }
+    }
+
     impl JsonRpcError {
         pub fn http_code(&self) -> StatusCode {
             match self {
@@ -319,7 +285,6 @@ pub mod jsonrpc_interface {
                 | Self::Decode(_)
                 | Self::MempoolAccept(_)
                 | Self::InvalidMemInfoMode
-                | Self::InvalidAddnodeCommand
                 | Self::InvalidDisconnectNodeCommand
                 | Self::InvalidTimestamp
                 | Self::InvalidRescanVal
@@ -328,6 +293,8 @@ pub mod jsonrpc_interface {
                 | Self::InvalidParameterStructure(_)
                 | Self::MissingParameter(_)
                 | Self::InvalidNetAddress(_)
+                | Self::EmptyTxids
+                | Self::DuplicatedTxid(_)
                 | Self::Wallet(_) => StatusCode::BAD_REQUEST,
 
                 // 404 Not Found - resource/method doesn't exist
@@ -405,11 +372,6 @@ pub mod jsonrpc_interface {
                     message: "Invalid meminfo mode".into(),
                     data: None,
                 },
-                Self::InvalidAddnodeCommand => RpcError {
-                    code: INVALID_METHOD_PARAMETERS,
-                    message: "Invalid addnode command".into(),
-                    data: None,
-                },
                 Self::InvalidDisconnectNodeCommand => RpcError {
                     code: INVALID_METHOD_PARAMETERS,
                     message: "Invalid disconnectnode command".into(),
@@ -446,6 +408,16 @@ pub mod jsonrpc_interface {
                     code: INVALID_METHOD_PARAMETERS,
                     message: "Invalid network address provided".into(),
                     data: Some(Value::String(err.to_string())),
+                },
+                Self::EmptyTxids => RpcError {
+                    code: INVALID_METHOD_PARAMETERS,
+                    message: "Parameter 'txids' cannot be empty".into(),
+                    data: None,
+                },
+                Self::DuplicatedTxid(txid) => RpcError {
+                    code: INVALID_METHOD_PARAMETERS,
+                    message: "Invalid parameter, duplicated txid".into(),
+                    data: Some(Value::String(txid.to_string())),
                 },
 
                 // Internal error
@@ -553,8 +525,8 @@ pub mod jsonrpc_interface {
     }
 
     impl_error_from!(JsonRpcError, miniscript::Error, InvalidDescriptor);
-    impl<T: fmt::Debug> From<WatchOnlyError<T>> for JsonRpcError {
-        fn from(e: WatchOnlyError<T>) -> Self {
+    impl From<WatchOnlyError> for JsonRpcError {
+        fn from(e: WatchOnlyError) -> Self {
             Self::Wallet(e.to_string())
         }
     }
@@ -566,133 +538,5 @@ pub mod jsonrpc_interface {
                 _ => Self::Chain,
             }
         }
-    }
-}
-
-/// A confidence enum to auxiliate rescan timestamp values.
-///
-/// Serves to tell how much confidence you need in such a rescan request. That is, the need for a high confidence rescan
-/// will make the rescan to start in a block that have an lower timestamp than the given in order to be more secure
-/// about finding addresses and relevant transactions, a lower confidence will make the rescan to be closer to the given value.
-///
-/// This input is necessary to cover network variancy specially in testnet, for mainnet you can safely use low or medium confidences
-/// depending on how much sure you are about the given timestamp covering the addresses you need.
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(rename_all = "lowercase")]
-pub enum RescanConfidence {
-    /// `high`: 99% confidence interval. Returning 46 minutes in seconds for `val`.
-    High,
-
-    /// `medium` (default): 95% confidence interval. Returning 30 minutes in seconds for `val`.
-    Medium,
-
-    /// `low`: 90% confidence interval. Returning 23 minutes in seconds for `val`.
-    Low,
-
-    /// `exact`: Removes any lookback addition. Returning 0 for `val`
-    Exact,
-}
-
-impl RescanConfidence {
-    /// In cases where `use_timestamp` is set, tells how much confidence the user wants for finding its addresses from this rescan request, a higher confidence will add more lookback seconds to the targeted timestamp and rescanning more blocks.
-    /// Under the hood this uses an [Exponential distribution](https://en.wikipedia.org/wiki/Exponential_distribution) [cumulative distribution function (CDF)](https:///en.wikipedia.org/wiki/Cumulative_distribution_function) where the parameter $\lambda$ (rate) is $\frac{1}{600}$ (1 block every 600 seconds, 10 minutes).
-    ///   The supplied string can be one of:
-    ///
-    ///   - `high`: 99% confidence interval. Returning 46 minutes in seconds for `val`.
-    ///   - `medium` (default): 95% confidence interval. Returning 30 minutes in seconds for `val`.
-    ///   - `low`: 90% confidence interval. Returning 23 minutes in seconds for `val`.
-    ///   - `exact`: Removes any lookback addition. Returning 0 for `val`
-    pub const fn as_secs(&self) -> u32 {
-        match self {
-            Self::Exact => 0,
-            Self::Low => 1_380,
-            Self::Medium => 1_800,
-            Self::High => 2_760,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum GetRawTransactionRes {
-    Zero(String),
-
-    One(Box<GetRawTransactionVerbose>),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum GetBlockRes {
-    Zero(String),
-    One(Box<GetBlockVerboseOne>),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-/// The response for `getblockheader`, which can be either a raw hex-encoded block header or a verbose
-/// one with all the fields parsed and decoded.
-pub enum GetBlockHeaderRes {
-    /// The raw hex-encoded block header, as returned by `getblockheader` with verbosity false
-    Raw(String),
-
-    /// A verbose block header, as returned by `getblockheader` with verbosity true
-    Verbose(Box<GetBlockHeaderVerbose>),
-}
-
-/// Return type for the `gettxoutproof` rpc command, the internal is
-/// the hex-encoded representation of the Merkle Block, as defined
-/// by Bitcoin Core.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct GetTxOutProof(pub String);
-
-#[cfg(test)]
-mod tests {
-    use corepc_types::v30::GetBlockchainInfo;
-
-    use super::GetBlockchainInfoRes;
-
-    fn server_response() -> GetBlockchainInfoRes {
-        GetBlockchainInfoRes {
-            core: GetBlockchainInfo {
-                chain: "main".to_string(),
-                blocks: 960_321,
-                headers: 967_710,
-                best_block_hash: "00".repeat(32),
-                bits: "1702349e".to_string(),
-                target: "00".repeat(32),
-                difficulty: 1.0,
-                time: 1,
-                median_time: 1,
-                verification_progress: 0.99,
-                initial_block_download: true,
-                chain_work: "00".repeat(32),
-                size_on_disk: 1,
-                pruned: true,
-                prune_height: Some(960_322),
-                automatic_pruning: Some(true),
-                prune_target_size: Some(0),
-                signet_challenge: None,
-                warnings: vec![],
-            },
-            leaf_count: 3_165_422_362,
-            root_count: 2,
-            root_hashes: vec!["11".repeat(32), "22".repeat(32)],
-            filters: Some(960_000),
-            rescan_in_progress: true,
-            rescan_blocks_processed: Some(3),
-            rescan_blocks_total: Some(7),
-            rescan_error: None,
-        }
-    }
-
-    /// The client-side mirror in floresta-rpc must decode every field the handler serves.
-    #[test]
-    fn client_type_round_trips_server_response() {
-        let served = serde_json::to_value(server_response()).unwrap();
-
-        let decoded: floresta_rpc::rpc_types::GetBlockchainInfoRes =
-            serde_json::from_value(served.clone()).unwrap();
-
-        assert_eq!(serde_json::to_value(decoded).unwrap(), served);
     }
 }

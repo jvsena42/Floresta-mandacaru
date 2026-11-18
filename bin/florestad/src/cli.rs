@@ -33,11 +33,19 @@ pub struct Cli {
     /// Turn debugging information on
     pub debug: bool,
 
-    #[arg(long)]
-    /// Option for saving log into data_Dir
+    #[arg(long, alias = "debuglogfile", value_name = "FILE")]
+    /// Specify location of the log file (default: debug.log)
     ///
-    /// if set, log will be saved into $DATA_DIR/debug.log.
-    pub log_to_file: bool,
+    /// Relative paths will be prefixed by a net-specific datadir location.
+    /// Pass `--no-log-file` to disable writing the log to a file.
+    /// Core's `--debuglogfile` spelling also works.
+    pub log_file: Option<PathBuf>,
+
+    #[arg(long, alias = "nodebuglogfile")]
+    /// Disable writing the log to a file
+    ///
+    /// Core's `--nodebuglogfile` spelling also works.
+    pub no_log_file: bool,
 
     #[arg(long, value_name = "PATH")]
     /// Where should we store data. This is the directory where we'll store the chainstate,
@@ -107,6 +115,31 @@ pub struct Cli {
     #[arg(long, value_name = "address[:<port>]")]
     /// The address where our json-rpc server should listen to, in the format `<address>[:<port>]`
     pub rpc_address: Option<String>,
+
+    #[arg(long, value_name = "USER")]
+    /// Username for `-rpcuser`/`-rpcpassword` auth.
+    pub rpc_user: Option<String>,
+
+    #[arg(long, value_name = "PASS")]
+    /// Password for `-rpcuser`/`-rpcpassword` auth; setting it disables cookie auth.
+    pub rpc_password: Option<String>,
+
+    #[arg(long, value_name = "LINE", action = clap::ArgAction::Append)]
+    /// Pre-hashed credential entry in `<user>:<salt_hex>$<hash_hex>` format.
+    /// Generate with Bitcoin Core's `share/rpcauth/rpcauth.py`. Repeat for
+    /// multiple users.
+    pub rpc_auth: Vec<String>,
+
+    #[arg(long, value_name = "PATH")]
+    /// Override the path where florestad writes the RPC cookie file.
+    /// Absolute paths are used as-is; relative paths are joined against the
+    /// net-specific data directory.
+    pub rpc_cookie_file: Option<PathBuf>,
+
+    #[arg(long)]
+    /// Disable cookie auth entirely. Configured `-rpcuser`/`-rpcpassword` or
+    /// `-rpcauth` entries still work; no cookie file is written.
+    pub no_rpc_cookie_file: bool,
 
     #[arg(long, value_name = "HEIGHT")]
     /// Wallet birthday: compact-filter rescans start at this height unless told otherwise. Negative numbers are relative to the current tip.
@@ -190,6 +223,24 @@ pub struct Cli {
     /// This will run in the background and wont't affect node's operation. However,
     /// to disable backfilling, run floresta using this flag.
     pub no_backfill: bool,
+
+    #[cfg(feature = "json-rpc")]
+    #[arg(long, default_value_t = false)]
+    /// Whether the JSON-RPC server should be disabled
+    pub disable_rpc: bool,
+
+    #[arg(long, default_value_t = false)]
+    /// Whether the Electrum server should be disabled
+    ///
+    /// The Electrum server is what feeds newly validated blocks into the watch-only wallet, so
+    /// while this flag is set the wallet will not update for new blocks. You can still catch the
+    /// wallet up afterwards with the `rescan` RPC.
+    pub disable_electrum: bool,
+
+    #[cfg(feature = "zmq-server")]
+    #[arg(long, default_value_t = false)]
+    /// Whether the ZMQ server should be disabled
+    pub disable_zmq: bool,
 }
 
 impl Cli {

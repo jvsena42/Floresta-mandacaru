@@ -28,13 +28,18 @@
 
 use std::time::Duration;
 
-use bitcoin::p2p::ServiceFlags;
-
 /// This trait mainly defines a bunch of constants that we need for the node, but we may tweak
 /// those values for each one. It's also an organized way of defining those constants anyway.
 pub trait NodeContext {
     /// How long we wait for a peer to respond to our request
     const REQUEST_TIMEOUT: u64;
+
+    /// Whether a non-manual peer that lets a request time out is disconnected.
+    ///
+    /// Contexts with a deliberately short [`Self::REQUEST_TIMEOUT`] turn this off: they only
+    /// want the request re-issued to another peer, and a peer that is merely slow on a poor
+    /// link is penalized instead of dropped.
+    const DISCONNECT_ON_TIMEOUT: bool = true;
 
     /// Max number of simultaneous connections we initiates we are willing to hold
     const MAX_OUTGOING_PEERS: usize = 10;
@@ -87,10 +92,6 @@ pub trait NodeContext {
 
     /// How many connections we try at once
     const NEW_CONNECTIONS_BATCH_SIZE: usize = 4;
-
-    fn get_required_services(&self) -> ServiceFlags {
-        ServiceFlags::NETWORK
-    }
 }
 
 pub(crate) type PeerId = u32;
