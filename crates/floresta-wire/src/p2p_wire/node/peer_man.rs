@@ -88,10 +88,15 @@ impl AddedPeerInfo {
 
     /// Records a dial. A peer that drops us right after the handshake would otherwise be
     /// redialed on every maintenance tick, all day, which on a phone is battery and data.
+    /// The first redial after a session ends is not delayed, so a single drop (e.g. a peer
+    /// we disconnected for flooding us) is recovered as quickly as before.
     pub(crate) fn note_attempt(&mut self, now: Instant) {
-        let wait = Self::FIRST_RETRY
-            .saturating_mul(1 << self.failed_attempts.min(6))
-            .min(Self::MAX_RETRY);
+        let wait = match self.failed_attempts {
+            0 => Duration::ZERO,
+            failed => Self::FIRST_RETRY
+                .saturating_mul(1 << (failed - 1).min(6))
+                .min(Self::MAX_RETRY),
+        };
         self.retry_after = Some(now + wait);
         self.dialed_at = Some(now);
         self.failed_attempts = self.failed_attempts.saturating_add(1);
@@ -100,9 +105,9 @@ impl AddedPeerInfo {
     /// Records the end of a session. One that lasted means the peer is reachable, so the next
     /// drop is dialed right away again.
     pub(crate) fn note_session_end(&mut self, now: Instant) {
-        let lasted = self
-            .dialed_at
-            .is_some_and(|dialed_at| now.saturating_duration_since(dialed_at) >= Self::STABLE_SESSION);
+        let lasted = self.dialed_at.is_some_and(|dialed_at| {
+            now.saturating_duration_since(dialed_at) >= Self::STABLE_SESSION
+        });
         if lasted {
             self.failed_attempts = 0;
             self.retry_after = None;
@@ -1509,14 +1514,14 @@ mod added_peer_tests {
         assert!(added.due(start));
 
         let mut waits = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..9 {
             added.note_attempt(start);
             let retry_after = added.retry_after.unwrap();
-            assert!(!added.due(start));
             assert!(added.due(retry_after));
             waits.push((retry_after - start).as_secs());
         }
-        assert_eq!(waits, [10, 20, 40, 80, 160, 320, 600, 600]);
+        // The first redial is immediate, so a single drop costs nothing
+        assert_eq!(waits, [0, 10, 20, 40, 80, 160, 320, 600, 600]);
 
         // A session that ended quickly keeps the backoff
         added.note_session_end(start + Duration::from_secs(5));
@@ -1524,6 +1529,8 @@ mod added_peer_tests {
 
         // A session that lasted makes it a fresh start
         added.note_session_end(start + AddedPeerInfo::STABLE_SESSION);
+        assert!(added.due(start));
+        added.note_attempt(start);
         assert!(added.due(start));
         added.note_attempt(start);
         assert_eq!(added.retry_after.unwrap() - start, Duration::from_secs(10));
