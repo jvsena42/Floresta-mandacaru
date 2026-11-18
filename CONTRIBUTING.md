@@ -14,13 +14,62 @@ The primary communication channel is the [GitHub repository](https://github.com/
 Contribution Workflow
 ---------------------
 
-The contribution workflow is designed to facilitate cooperation and ensure a high level of quality in the project. The process is as follows:
+The contribution workflow is designed to facilitate cooperation and ensure a high level of quality in the project.
+
+### Before opening a pull request
+
+**Discuss the problem and your proposed approach with project members in a
+GitHub issue before opening a pull request.** This gives contributors and
+maintainers an opportunity to agree on the need for the change and its direction
+before reviewing a patch. It also reduces the burden on reviewers by helping
+avoid pull requests for changes that are not planned or are already being worked
+on.
+
+The project prioritizes work according to its quarterly [roadmap](https://github.com/getfloresta/Floresta#roadmap).
+Issues outside the current roadmap scope tend to receive lower priority for
+discussion and review.
+
+**You must understand and be able to explain your changes**, including the
+problem, the proposed solution and its trade-offs. This also applies when using
+LLMs or other tools. Do not submit generated changes that you cannot explain
+and maintain.
 
 To contribute a patch, the workflow is as follows:
 
-  1. Fork Repository
-  2. Create topic branch
-  3. Commit patches
+  1. Discuss the problem and proposed approach with project members
+  2. Fork Repository
+  3. Create topic branch
+  4. Commit patches
+  5. Open a pull request
+
+### Working on crates published to crates.io
+
+Some Floresta crates are consumed as published releases from crates.io. Their
+local sources can remain workspace members and be included in workspace-wide
+tests, but local changes do not automatically affect crates that depend on the
+published releases.
+
+To test changes to one of these crates with the rest of Floresta, temporarily add
+a `[patch.crates-io]` entry to the root `Cargo.toml`. For example:
+
+```toml
+[patch.crates-io]
+floresta-common = { path = "crates/floresta-common" }
+```
+
+Use the name and local path of the crate you are modifying. Its version must
+satisfy the consumers' dependency requirements; for an exact pin, it must match
+that version. Check both the shared dependencies in the root `Cargo.toml` and
+any direct declarations in individual crate manifests.
+
+Remove the temporary override after testing and run `cargo check --workspace`
+to restore crates.io resolution in `Cargo.lock`. Do not commit the temporary
+override or its lockfile changes.
+See the [Cargo dependency override documentation](https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html)
+for more details.
+
+When adopting a newly published release, update all relevant dependency pins
+and commit the resulting `Cargo.lock` changes.
 
 ### Commits
 
@@ -103,7 +152,7 @@ Where a patch set proposes to change the Bitcoin consensus, it must have been di
 Coding Conventions
 ------------------
 
-There's a few rules to make sure the code is readable and maintainable. Most of them are checked by `cargo-fmt` and `clippy`, and are enforced by CI. You can run locally `cargo +nightly fmt && cargo +nightly clippy --all` or, if you have the [Just Command Runner](https://github.com/casey/just) you might use `just lint`.
+There's a few rules to make sure the code is readable and maintainable. Most of them are checked by `cargo-fmt` and `clippy`, and are enforced by CI. You can run locally `cargo +nightly fmt && cargo +nightly clippy --all` or, if you have the [Just Command Runner](https://github.com/casey/just) you might use `just lint`. Note that many `just` recipes (e.g., `just build`, `just test` and `just lint`) also require [`jq`](https://jqlang.github.io/jq/download/) to list the crates of the workspace, so make sure it is installed.
 
 For the sake of clarity, **please use an empty line between items**, in both the Python and Rust code. Some examples:
 

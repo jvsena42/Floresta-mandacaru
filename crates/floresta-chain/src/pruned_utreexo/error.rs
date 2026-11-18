@@ -23,6 +23,7 @@ use floresta_common::impl_error_from;
 use floresta_common::prelude::*;
 use rustreexo::stump::StumpError;
 
+use crate::extensions::BlockExtError;
 use crate::extensions::ChainWorkOverflow;
 use crate::proof_util::UtreexoLeafError;
 use crate::pruned_utreexo::chain_state_builder::BlockchainBuilderError;
@@ -131,8 +132,11 @@ pub enum BlockValidationErrors {
     EmptyOutputs,
     ScriptError,
     BlockTooBig,
+    TooManySigops,
     TooManyCoins,
     NotEnoughPow,
+    BadDiffBits,
+    BadVersion,
     BadMerkleRoot,
     BadWitnessCommitment,
     NotEnoughMoney,
@@ -147,6 +151,7 @@ pub enum BlockValidationErrors {
     UnspendableUTXO,
     BIP94TimeWarp,
     DuplicateInput,
+    BadRelativeLockTime,
 }
 
 // Helpful macro for generating a TransactionError
@@ -196,6 +201,7 @@ impl Display for BlockValidationErrors {
                 write!(f, "This transaction has no outputs")
             }
             Self::BlockTooBig => write!(f, "Block too big"),
+            Self::TooManySigops => write!(f, "Block has too many signature operations"),
             Self::InvalidCoinbase(e) => {
                 write!(f, "Invalid coinbase: {e:?}")
             }
@@ -208,6 +214,12 @@ impl Display for BlockValidationErrors {
             }
             Self::NotEnoughPow => {
                 write!(f, "This block doesn't have enough proof-of-work")
+            }
+            Self::BadDiffBits => {
+                write!(f, "The header's nBits differ from the required difficulty")
+            }
+            Self::BadVersion => {
+                write!(f, "The header's version is too old for its height")
             }
             Self::BadMerkleRoot => write!(f, "Wrong merkle root"),
             Self::BadWitnessCommitment => write!(f, "Wrong witness commitment"),
@@ -246,6 +258,9 @@ impl Display for BlockValidationErrors {
             Self::DuplicateInput => {
                 write!(f, "This transaction has duplicate inputs")
             }
+            Self::BadRelativeLockTime => {
+                write!(f, "Input's relative lock-time (BIP68) has not matured yet")
+            }
         }
     }
 }
@@ -259,3 +274,20 @@ impl<T: DatabaseError> From<T> for BlockchainBuilderError {
 impl_error_from!(BlockchainError, TransactionError, TransactionError);
 impl_error_from!(BlockchainError, BlockValidationErrors, BlockValidation);
 impl_error_from!(BlockchainError, StumpError, AccumulatorError);
+
+impl From<BlockExtError> for BlockValidationErrors {
+    fn from(value: BlockExtError) -> Self {
+        match value {
+            BlockExtError::BadMerkleRoot => Self::BadMerkleRoot,
+            BlockExtError::BadWitnessCommitment => Self::BadWitnessCommitment,
+            BlockExtError::BlockTooBig => Self::BlockTooBig,
+            BlockExtError::TooManySigops => Self::TooManySigops,
+        }
+    }
+}
+
+impl From<BlockExtError> for BlockchainError {
+    fn from(value: BlockExtError) -> Self {
+        Self::BlockValidation(value.into())
+    }
+}

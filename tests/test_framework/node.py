@@ -21,7 +21,7 @@ from test_framework.rpc.floresta import FlorestaRPC
 from test_framework.rpc.utreexo import UtreexoRPC
 from test_framework.electrum import ConfigElectrum, ConfigTls
 from test_framework.electrum.client import ElectrumClient
-from test_framework.util import Utility
+from test_framework.util import Utility, wait_until
 
 
 class NodeType(Enum):
@@ -129,7 +129,7 @@ class Node:
         During initialization, the `static_values` attribute is set to False,
         allowing the node's arguments to be modified after creation.
         """
-        config_rpc = cls.create_config_rpc_default(variant=variant)
+        config_rpc = cls.create_config_rpc_default()
         config_p2p = cls.create_config_p2p_default(log_path=log_path)
         config_electrum = cls.create_config_electrum_default(tls=tls)
 
@@ -208,24 +208,17 @@ class Node:
         self.daemon.set_extra_args(value)
 
     @staticmethod
-    def create_config_rpc_default(variant: NodeType) -> ConfigRPC:
+    def create_config_rpc_default() -> ConfigRPC:
         """
         Create a default RPC configuration for a node.
 
-        Generates a random port and sets default credentials based on the node variant.
+        Generates a random port and sets default credentials.
         """
-        if variant == NodeType.FLORESTAD:
-            user = None
-            password = None
-        else:
-            user = "test"
-            password = "test"
-
         return ConfigRPC(
             host="127.0.0.1",
             port=Utility.get_random_port(),
-            user=user,
-            password=password,
+            user="test",
+            password="test",
         )
 
     @staticmethod
@@ -267,7 +260,7 @@ class Node:
         This function sets new configurations for the node by using the default
         configuration creation methods
         """
-        new_rpc_config = self.create_config_rpc_default(self.variant)
+        new_rpc_config = self.create_config_rpc_default()
         new_p2p_config = self.create_config_p2p_default(self._log_path)
         new_electrum_config = self.create_config_electrum_default(self._tls)
 
@@ -286,8 +279,15 @@ class Node:
         self.daemon.start()
         self.rpc.wait_on_socket(opened=True)
 
-        # Test if the node is already responding to RPC calls.
-        self.rpc.get_blockchain_info()
+        # An open port is not readiness: the daemon only answers RPC calls once
+        # it is done loading, so poll it until it does.
+        wait_until(
+            self.rpc.is_responsive,
+            timeout=self.rpc.TIMEOUT,
+            interval=self.rpc.POLL_INTERVAL,
+            error_msg=f"Node '{self.variant}' did not answer RPC calls",
+        )
+
         # When starting Floresta for the first time, it is ideal to check
         # if the Electrum server is ready to receive requests.
         if self.variant == NodeType.FLORESTAD and self.static_values is not True:

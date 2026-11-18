@@ -26,8 +26,9 @@ jobs:
         with:
             persist-credentials: false
 
-      # see more at
-      # https://docs.astral.sh/uv/guides/integration/github/
+      - name: Set up libbitcoinkernel
+        uses: $/.github/actions/setup-libbitcoinkernel
+
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
@@ -43,12 +44,6 @@ jobs:
 
       - name: Run pylint linter
         run: uv run pylint --verbose $(find ./tests -name "*.py")
-
-      # Required for compiling the project, as it depends on the bitcoinkernel
-      - name: Install Boost
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libboost-all-dev
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1

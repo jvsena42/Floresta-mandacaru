@@ -21,6 +21,7 @@ pub mod consensus;
 pub mod flat_chain_store;
 pub mod merkle;
 pub mod partial_chain;
+pub(crate) mod sigops;
 pub mod snapshot;
 pub mod udata;
 
@@ -44,6 +45,7 @@ use crate::BlockchainError;
 use crate::prelude::*;
 use crate::pruned_utreexo::utxo_data::UtxoData;
 
+#[non_exhaustive]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 /// Our current IBD state, meaning which startup phase are we, if any.
 ///
@@ -58,11 +60,20 @@ pub enum IBDState {
     /// this is the most work chain available.
     HeadersSync,
 
-    /// Downloading and checking blocks.
+    /// Downloading and validating blocks with SwiftSync and Utreexo implicit deletion.
     ///
-    /// After we find the most work chain, we start downloading blocks and connecting them to our
-    /// chain. This step usually takes the longest time.
-    DownloadingBlocks,
+    /// `processed_blocks` is a successful-block count rather than a height because SwiftSync
+    /// validates blocks in parallel and out of order.
+    SwiftSync {
+        /// Number of distinct blocks processed successfully.
+        processed_blocks: u32,
+
+        /// Number of blocks to process up to the SwiftSync stop height.
+        total_blocks: u32,
+    },
+
+    /// Downloading and validating blocks using conventional Utreexo deletion proofs.
+    ProofSync,
 
     /// We've finished IBD and are now listening for new blocks as they are found.
     Done,
@@ -118,6 +129,13 @@ pub trait BlockchainInterface {
     /// Returns the last block we validated
     fn get_validation_index(&self) -> Result<u32, Self::Error>;
 
+    /// Returns the configured AssumeValid block's height on the current best chain.
+    /// Returns `None` if AssumeValid is disabled or the block is not on that chain.
+    /// Backends without AssumeValid support default to `None`.
+    fn get_assume_valid_height(&self) -> Result<Option<u32>, Self::Error> {
+        Ok(None)
+    }
+
     /// Returns the height of a block, given it's hash
     fn get_block_height(&self, hash: &BlockHash) -> Result<Option<u32>, Self::Error>;
 
@@ -169,6 +187,10 @@ pub trait BlockchainInterface {
     fn get_warnings(&self) -> Vec<ChainStoreWarning> {
         vec![]
     }
+
+    /// Calculates the Median Time Past (MTP) for the block at `height`: the median of that
+    /// block's timestamp and up to the 10 timestamps before it.
+    fn get_mtp_by_height(&self, height: u32) -> Result<u32, Self::Error>;
 }
 
 /// [UpdatableChainstate] is a contract that a is expected from a chainstate
@@ -345,6 +367,10 @@ impl<T: BlockchainInterface> BlockchainInterface for Arc<T> {
         T::get_block_hash(self, height)
     }
 
+    fn get_mtp_by_height(&self, height: u32) -> Result<u32, Self::Error> {
+        T::get_mtp_by_height(self, height)
+    }
+
     fn get_best_block(&self) -> Result<(u32, BlockHash), Self::Error> {
         T::get_best_block(self)
     }
@@ -367,6 +393,10 @@ impl<T: BlockchainInterface> BlockchainInterface for Arc<T> {
 
     fn get_validation_index(&self) -> Result<u32, Self::Error> {
         T::get_validation_index(self)
+    }
+
+    fn get_assume_valid_height(&self) -> Result<Option<u32>, Self::Error> {
+        T::get_assume_valid_height(self)
     }
 
     fn get_block_locator_for_tip(&self, tip: BlockHash) -> Result<Vec<BlockHash>, BlockchainError> {

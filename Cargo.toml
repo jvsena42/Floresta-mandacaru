@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     # Libraries
+    "crates/floresta-proc-macro",
     "crates/floresta",
     "crates/floresta-node",
     "crates/floresta-chain",
@@ -24,6 +25,7 @@ members = [
 ]
 
 default-members = [
+    "crates/floresta-proc-macro",
     "crates/floresta",
     "crates/floresta-node",
     "crates/floresta-chain",
@@ -49,35 +51,35 @@ readme = "README.md"
 [workspace.dependencies]
 # All dependencies MUST be pinned precisely with `X.Y.z`
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tracing", "tokio"] }
+base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 bitcoin = { version = "=0.32.8", default-features = false }
 bitcoin_hashes = { version = "=1.1.0", default-features = false }
 clap = { version = "=4.6.1", default-features = false, features = ["derive", "std", "error-context"] }
 corepc-types = { version = "=0.15.0" }
 console-subscriber = { version = "=0.5.0", default-features = false }
 dns-lookup = { version = "=2.1.1" }
+floresta-common = { version = "=1.0.0", path = "crates/floresta-common" } # fork: local copy carries ChainMethods
 hex = { version = "=0.4.3" }
 kv = { version = "=0.24.0" }
 miniscript = { version = "=13.1.0", default-features = false }
 rand = { version = "=0.10.2" }
 rcgen = { version = "=0.14.7", default-features = false, features = ["ring", "pem"] } # note: >0.14.7 requires Rust 1.86.0
-rustreexo = { version = "=0.6.0" }
+rustreexo = { version = "=0.7.0" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150" }
 spin = { version = "=0.10.1", default-features = false, features = ["spin_mutex", "rwlock"] }
 tempfile = { version = "=3.27.0" }
-tokio = { version = "=1.52.3", features = ["net", "time", "rt-multi-thread", "signal", "macros"] }
+tokio = { version = "=1.53.3", features = ["net", "time", "rt-multi-thread", "signal", "macros"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 toml = { version = "=1.1.2", default-features = false, features = ["std", "parse", "serde"] }
 tracing = { version = "=0.1.44", default-features = false }
-zstd = { version = "=0.13.3" }
+zstd = { version = "=0.14.3" }
 # Pins for MSRV compatibility:
 time = { version = "=0.3.45" } # note: >0.3.45 requires Rust 1.88.0
-tonic = { version = "=0.14.5" } # note: >0.14.5 requires Rust 1.88.0
-tonic-prost = { version = "=0.14.5" } # note: >0.14.5 requires Rust 1.88.0
 
 # Local dependencies
+floresta-proc-macro = { path = "crates/floresta-proc-macro" }
 floresta-chain = { path = "crates/floresta-chain" }
-floresta-common = { path = "crates/floresta-common" }
 floresta-compact-filters = { path = "crates/floresta-compact-filters" }
 floresta-electrum = { path = "crates/floresta-electrum" }
 floresta-node = { path = "crates/floresta-node", default-features = false }

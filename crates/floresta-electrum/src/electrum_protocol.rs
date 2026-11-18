@@ -67,6 +67,13 @@ const RESCAN_BLOCK_BUFFER: usize = 16;
 /// Delay before retrying a failed rescan, doubled by each consecutive failure.
 const RESCAN_RETRY_BASE_DELAY: Duration = Duration::from_secs(60);
 const RESCAN_RETRY_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
+/// The Electrum protocol version this server implements.
+///
+/// `server.version` answers it and `server.features` reports it as both
+/// `protocol_min` and `protocol_max`, so the two always agree. Version 1.5
+/// was skipped by the protocol, and 1.6 needs changes this server does not
+/// have yet.
+const PROTOCOL_VERSION: &str = "1.4";
 
 /// Type alias for u32 representing a ClientId
 type ClientId = u32;
@@ -359,7 +366,7 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             "blockchain.relayfee" => json_rpc_res!(request, 0.00001),
             "blockchain.scripthash.get_balance" => {
                 let script_hash = get_arg!(request, sha256::Hash, 0);
-                let balance = self.address_cache.get_address_balance(&script_hash);
+                let balance = self.address_cache.get_address_balance(&script_hash)?;
                 let result = json!({
                     "confirmed": balance,
                     "unconfirmed": 0
@@ -369,7 +376,7 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             "blockchain.scripthash.get_history" => {
                 let script_hash = get_arg!(request, sha256::Hash, 0);
                 self.address_cache
-                    .get_address_history(&script_hash)
+                    .get_address_history(&script_hash)?
                     .map(|transactions| {
                         let res = Self::process_history(&transactions);
                         json_rpc_res!(request, res)
@@ -385,13 +392,12 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             "blockchain.scripthash.get_mempool" => json_rpc_res!(request, []),
             "blockchain.scripthash.listunspent" => {
                 let hash = get_arg!(request, sha256::Hash, 0);
-                let utxos = self.address_cache.get_address_utxos(&hash);
-                if utxos.is_none() {
+                let Some(utxos) = self.address_cache.get_address_utxos(&hash)? else {
                     return json_rpc_res!(request, []);
-                }
+                };
                 let mut final_utxos = Vec::new();
-                for (utxo, prevout) in utxos.unwrap().into_iter() {
-                    let height = self.address_cache.get_height(&prevout.txid).unwrap();
+                for (utxo, prevout) in utxos.into_iter() {
+                    let height = self.address_cache.get_height(&prevout.txid)?.unwrap_or(0);
 
                     final_utxos.push(json!({
                         "height": height,
@@ -407,7 +413,7 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
                 let hash = get_arg!(request, sha256::Hash, 0);
                 self.client_addresses.insert(hash, client);
 
-                let history = self.address_cache.get_address_history(&hash);
+                let history = self.address_cache.get_address_history(&hash)?;
                 match history {
                     Some(transactions) if !transactions.is_empty() => {
                         let res = get_status(transactions);
@@ -429,8 +435,8 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
                 let script = get_arg!(request, ScriptBuf, 0);
                 let hash = get_spk_hash(&script);
 
-                if !self.address_cache.is_address_cached(&hash) {
-                    self.address_cache.cache_address(script.clone());
+                if !self.address_cache.is_address_cached(&hash)? {
+                    self.address_cache.cache_address(script.clone())?;
                     self.addresses_to_scan.push(script);
                     let res = json!({
                         "confirmed": 0,
@@ -439,7 +445,7 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
                     return json_rpc_res!(request, res);
                 }
 
-                let balance = self.address_cache.get_address_balance(&hash);
+                let balance = self.address_cache.get_address_balance(&hash)?;
                 let result = json!({
                     "confirmed": balance,
                     "unconfirmed": 0
@@ -450,14 +456,14 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
                 let script = get_arg!(request, ScriptBuf, 0);
                 let hash = get_spk_hash(&script);
 
-                if !self.address_cache.is_address_cached(&hash) {
-                    self.address_cache.cache_address(script.clone());
+                if !self.address_cache.is_address_cached(&hash)? {
+                    self.address_cache.cache_address(script.clone())?;
                     self.addresses_to_scan.push(script);
                     return json_rpc_res!(request, null);
                 }
 
                 self.address_cache
-                    .get_address_history(&hash)
+                    .get_address_history(&hash)?
                     .map(|transactions| {
                         let res = Self::process_history(&transactions);
                         json_rpc_res!(request, res)
@@ -475,7 +481,7 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
                 let hash = get_spk_hash(&script);
                 self.client_addresses.insert(hash, client);
 
-                let history = self.address_cache.get_address_history(&hash);
+                let history = self.address_cache.get_address_history(&hash)?;
                 match history {
                     Some(transactions) if !transactions.is_empty() => {
                         let res = get_status(transactions);
@@ -517,12 +523,12 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
 
                 let updated = self
                     .address_cache
-                    .cache_mempool_transaction(&tx)
+                    .cache_mempool_transaction(&tx)?
                     .into_iter()
                     .map(|spend| (tx.clone(), spend))
                     .collect::<Vec<_>>();
 
-                self.wallet_notify(&updated);
+                self.wallet_notify(&updated)?;
                 json_rpc_res!(request, txid)
             }
             "blockchain.transaction.get" => {
@@ -536,7 +542,7 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
                     .unwrap_or(false);
 
                 if !verbose {
-                    let tx = self.address_cache.get_cached_transaction(&tx_id);
+                    let tx = self.address_cache.get_cached_transaction(&tx_id)?;
                     if let Some(tx) = tx {
                         return json_rpc_res!(request, tx);
                     }
@@ -545,7 +551,7 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
 
                 let cached = self
                     .address_cache
-                    .get_transaction(&tx_id)
+                    .get_transaction(&tx_id)?
                     .ok_or(super::error::Error::InvalidParams)?;
                 let network = self.chain.get_params().network;
                 let tip = self
@@ -582,8 +588,8 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             }
             "blockchain.transaction.get_merkle" => {
                 let tx_id = get_arg!(request, Txid, 0);
-                let proof = self.address_cache.get_merkle_proof(&tx_id);
-                let height = self.address_cache.get_height(&tx_id);
+                let proof = self.address_cache.get_merkle_proof(&tx_id)?;
+                let height = self.address_cache.get_height(&tx_id)?;
                 if let Some(proof) = proof {
                     let result = json!({
                         "merkle": proof.hashes,
@@ -612,8 +618,8 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
                     {
                         "genesis_hash": genesis_hash,
                         "hosts": {"127.0.0.1": {"tcp_port": 50001}},
-                        "protocol_max": "1.5",
-                        "protocol_min": "1.4",
+                        "protocol_max": PROTOCOL_VERSION,
+                        "protocol_min": PROTOCOL_VERSION,
                         "pruning": null,
                         "server_version": format!("Floresta {}", env!("CARGO_PKG_VERSION")),
                         "hash_function": "sha256"
@@ -625,7 +631,10 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             "server.ping" => json_rpc_res!(request, null),
             "server.version" => json_rpc_res!(
                 request,
-                [format!("Floresta {}", env!("CARGO_PKG_VERSION")), "1.4"]
+                [
+                    format!("Floresta {}", env!("CARGO_PKG_VERSION")),
+                    PROTOCOL_VERSION
+                ]
             ),
 
             _ => Err(super::error::Error::InvalidParams),
@@ -644,16 +653,22 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
         }
     }
 
-    pub async fn main_loop(mut self) -> Result<(), crate::error::Error> {
+    pub async fn main_loop(self) -> Result<(), crate::error::Error> {
         let blocks = Channel::new();
         let blocks = Arc::new(blocks);
 
         self.chain.subscribe(blocks.clone());
 
+        self.run(&blocks).await
+    }
+
+    /// Serves client requests and new blocks from `blocks`.
+    async fn run(
+        mut self,
+        blocks: &Channel<(bitcoin::Block, u32)>,
+    ) -> Result<(), crate::error::Error> {
         loop {
-            for (block, height) in blocks.recv() {
-                self.handle_block(block, height);
-            }
+            self.handle_blocks(blocks);
 
             // handles client requests
             while let Ok(request) = tokio::time::timeout(
@@ -662,6 +677,10 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             )
             .await
             {
+                // Take in new blocks before each request. Otherwise, clients
+                // that send a request at least once a second hold them back.
+                self.handle_blocks(blocks);
+
                 if let Some(message) = request {
                     self.handle_message(message).await?;
                 }
@@ -745,7 +764,11 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             // A matched block should always have a height; a miss means it was reorged out
             // while we scanned. Skip it rather than giving up on the rest of the rescan.
             match self.chain.get_block_height(&block.block_hash()) {
-                Ok(Some(height)) => self.handle_block(block, height),
+                Ok(Some(height)) => {
+                    if let Err(error) = self.handle_block(block, height) {
+                        error!(%error, "Failed to process a rescan block");
+                    }
+                }
                 _ => warn!(
                     "Rescan matched block {} but it has no height; skipping",
                     block.block_hash()
@@ -766,7 +789,9 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             // the scriptpubkey endpoints rely on this function to cache what they queue.
             error!("Can't rescan for new Electrum scripts: compact filters are disabled");
             for address in std::mem::take(&mut self.addresses_to_scan) {
-                self.address_cache.cache_address(address);
+                if let Err(e) = self.address_cache.cache_address(address) {
+                    error!("Error in cache address: {e}");
+                }
             }
             return;
         };
@@ -776,7 +801,9 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
 
         let addresses = std::mem::take(&mut self.addresses_to_scan);
         for address in &addresses {
-            self.address_cache.cache_address(address.clone());
+            if let Err(e) = self.address_cache.cache_address(address.clone()) {
+                error!("Error in cache address: {e}");
+            }
         }
         info!("Catching up with addresses {addresses:?}");
 
@@ -844,7 +871,16 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
         res
     }
 
-    fn handle_block(&self, block: bitcoin::Block, height: u32) {
+    /// Handles the blocks waiting in `blocks`, in the order they arrived.
+    fn handle_blocks(&self, blocks: &Channel<(bitcoin::Block, u32)>) {
+        for (block, height) in blocks.recv() {
+            if let Err(e) = self.handle_block(block, height) {
+                error!("Error processing block at height {height}: {e}")
+            }
+        }
+    }
+
+    fn handle_block(&self, block: bitcoin::Block, height: u32) -> Result<(), super::error::Error> {
         let result = json!({
             "jsonrpc": "2.0",
             "method": "blockchain.headers.subscribe",
@@ -854,10 +890,10 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             }]
         });
 
-        let current_height = self.address_cache.get_cache_height();
+        let current_height = self.address_cache.get_cache_height()?;
 
         if (!self.chain.is_in_ibd() || height % 1000 == 0) && (height > current_height) {
-            self.address_cache.bump_height(height);
+            self.address_cache.bump_height(height)?;
         }
 
         if self.chain.get_height().unwrap() == height {
@@ -866,9 +902,9 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             }
         }
 
-        let transactions = self.address_cache.block_process(&block, height);
+        let transactions = self.address_cache.block_process(&block, height)?;
 
-        self.wallet_notify(&transactions);
+        self.wallet_notify(&transactions)
     }
 
     /// Handles each kind of Message
@@ -958,13 +994,19 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
         Ok(())
     }
 
-    fn wallet_notify(&self, transactions: &[(Transaction, TxOut)]) {
+    fn wallet_notify(
+        &self,
+        transactions: &[(Transaction, TxOut)],
+    ) -> Result<(), crate::error::Error> {
         for (_, out) in transactions {
             let hash = get_spk_hash(&out.script_pubkey);
             if let Some(client) = self.client_addresses.get(&hash) {
-                let history = self.address_cache.get_address_history(&hash);
+                let history = self
+                    .address_cache
+                    .get_address_history(&hash)?
+                    .ok_or(crate::error::Error::InvalidParams)?;
 
-                let status_hash = get_status(history.unwrap());
+                let status_hash = get_status(history);
                 let notify = json!({
                     "jsonrpc": "2.0",
                     "method": "blockchain.scripthash.subscribe",
@@ -974,6 +1016,8 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
                 try_and_log!(client.write(serde_json::to_string(&notify).unwrap().as_bytes()));
             }
         }
+
+        Ok(())
     }
 }
 
@@ -1131,6 +1175,9 @@ mod test {
     use core::str::FromStr;
     use std::io;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use bitcoin::Address;
@@ -1140,15 +1187,18 @@ mod test {
     use bitcoin::block::Header as BlockHeader;
     use bitcoin::consensus::Decodable;
     use bitcoin::consensus::deserialize;
+    use bitcoin::constants::genesis_block;
     use bitcoin::hashes::hex::FromHex;
     use bitcoin::hashes::sha256;
     use floresta_chain::AssumeValidArg;
+    use floresta_chain::BlockchainInterface;
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
     use floresta_chain::FlatChainStoreConfig;
     use floresta_chain::pruned_utreexo::merkle::ConsensusMerkle;
     use floresta_common::assert_ok;
     use floresta_common::get_spk_hash;
+    use floresta_common::spsc::Channel;
     use floresta_mempool::Mempool;
     use floresta_watch_only::AddressCache;
     use floresta_watch_only::kv_database::KvDatabase;
@@ -1221,16 +1271,18 @@ mod test {
 
         // Inserting test transactions in the wallet
         let (transaction, proof) = get_test_transaction();
-        cache.cache_transaction(
-            &transaction,
-            118511,
-            transaction.output[0].value.to_sat(),
-            proof,
-            1,
-            0,
-            false,
-            get_spk_hash(&transaction.output[0].script_pubkey),
-        );
+        cache
+            .cache_transaction(
+                &transaction,
+                118511,
+                transaction.output[0].value.to_sat(),
+                proof,
+                1,
+                0,
+                false,
+                get_spk_hash(&transaction.output[0].script_pubkey),
+            )
+            .unwrap();
 
         Arc::new(cache)
     }
@@ -1268,6 +1320,14 @@ mod test {
 
     // Returns the port assigned by the OS
     async fn start_electrum() -> u16 {
+        let (electrum_server, port) = setup_electrum().await;
+        task::spawn(electrum_server.main_loop());
+        port
+    }
+
+    // Returns a server whose main loop is not started yet, and the port
+    // assigned by the OS
+    async fn setup_electrum() -> (ElectrumServer<ChainState<FlatChainStore>>, u16) {
         let e_addr = "0.0.0.0:0";
         let ssl_e_addr = "0.0.0.0:0";
         let wallet = get_test_cache();
@@ -1335,9 +1395,7 @@ mod test {
             ));
         }
 
-        // Electrum main loop
-        task::spawn(electrum_server.main_loop());
-        assigned_port
+        (electrum_server, assigned_port)
     }
 
     /// Create a tls config thats valid for localhost with a random
@@ -1488,6 +1546,86 @@ mod test {
         let re = send_request(batch_req, port).await.unwrap();
         let answers = re.as_array().unwrap();
         assert_eq!(answers.len(), 3);
+    }
+
+    /// A new block must be taken in while a client sends requests faster than
+    /// the 1 s request timeout of the main loop. The cache takes its height,
+    /// and the polling client gets the `blockchain.headers.subscribe`
+    /// notification for it.
+    #[tokio::test]
+    async fn test_block_while_polling() {
+        let (electrum_server, port) = setup_electrum().await;
+        let cache = electrum_server.address_cache.clone();
+        let tip = electrum_server.chain.get_height().unwrap();
+        let blocks = Arc::new(Channel::new());
+        let channel = blocks.clone();
+        task::spawn(async move { electrum_server.run(&channel).await });
+
+        // Ping every 100 ms on one connection. Count the answers, and keep
+        // the height of the last header notification (u32::MAX for none)
+        let pings = Arc::new(AtomicUsize::new(0));
+        let answered = pings.clone();
+        let notified = Arc::new(AtomicU32::new(u32::MAX));
+        let notification = notified.clone();
+        let poller = task::spawn(async move {
+            let stream = TcpStream::connect(format!("localhost:{port}"))
+                .await
+                .unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut answers = BufReader::new(reader).lines();
+            loop {
+                let method = Value::String("server.ping".to_string());
+                let mut request = generate_request(&mut vec![method]).to_string();
+                request.push('\n');
+                writer.write_all(request.as_bytes()).await.unwrap();
+                // A notification may come before the answer
+                loop {
+                    let line = answers.next_line().await.unwrap().unwrap();
+                    let line: Value = serde_json::from_str(&line).unwrap();
+                    if line["method"] == "blockchain.headers.subscribe" {
+                        let height = line["params"][0]["height"].as_u64().unwrap();
+                        notification.store(height as u32, Ordering::SeqCst);
+                    } else {
+                        break;
+                    }
+                }
+                answered.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let polling = timeout(Duration::from_secs(10), async {
+            while pings.load(Ordering::SeqCst) < 5 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(polling.is_ok(), "the client did not get 5 answers in 10 s");
+
+        // The test chain is in IBD, where `handle_block` bumps the cache height
+        // only at multiples of 1000
+        let height = (cache.get_cache_height().unwrap() / 1000 + 1) * 1000;
+        blocks.send((genesis_block(Network::Signet), height));
+
+        // The server notifies clients of a block at the height of the chain
+        let block = genesis_block(Network::Signet);
+        blocks.send((block, tip));
+
+        let taken_in = timeout(Duration::from_secs(3), async {
+            while cache.get_cache_height().unwrap() != height
+                || notified.load(Ordering::SeqCst) != tip
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(!poller.is_finished(), "the client stopped polling");
+        poller.abort();
+        assert!(
+            taken_in.is_ok(),
+            "the block waited while the client polled: cache height {}, notified {}, expected {height} and {tip}",
+            cache.get_cache_height().unwrap(),
+            notified.load(Ordering::SeqCst),
+        );
     }
 
     #[tokio::test]
@@ -1711,5 +1849,12 @@ mod test {
             batch_response[6]["result"][0],
             format!("Floresta {}", env!("CARGO_PKG_VERSION"))
         );
+
+        // `server.version` negotiates the only version `server.features`
+        // reports.
+        let version = &batch_response[6]["result"][1];
+        assert_eq!(version, "1.4");
+        assert_eq!(&batch_response[3]["result"]["protocol_min"], version);
+        assert_eq!(&batch_response[3]["result"]["protocol_max"], version);
     }
 }

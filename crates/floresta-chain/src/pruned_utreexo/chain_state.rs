@@ -37,6 +37,7 @@ use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::Work;
 use bitcoin::block::Header as BlockHeader;
+use bitcoin::blockdata::constants::DIFFCHANGE_INTERVAL;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256;
@@ -222,25 +223,34 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
     }
 
     fn validate_header(&self, block_header: &BlockHeader) -> Result<BlockHash, BlockchainError> {
+        // As in Core, the header's own proof of work comes first: it is the cheap check, and the
+        // ones below read the chain.
+        let block_hash = block_header
+            .validate_pow(block_header.target())
+            .map_err(|_| BlockValidationErrors::NotEnoughPow)?;
+
         let prev_block = self.get_disk_block_header(&block_header.prev_blockhash)?;
         let height = prev_block
             .height()
             .ok_or(BlockValidationErrors::BlockExtendsAnOrphanChain)?
             + 1;
 
-        // Check pow
+        // Like Core's `bad-diffbits`, the compact bits must match exactly: a harder target
+        // than the required one is invalid too.
         let expected_target = self.get_next_required_work(&prev_block, height, block_header)?;
-
-        let actual_target = block_header.target();
-        if actual_target > expected_target {
-            Err(BlockValidationErrors::NotEnoughPow)?;
+        if block_header.bits != expected_target.to_compact_lossy() {
+            Err(BlockValidationErrors::BadDiffBits)?;
         }
 
         self.check_bip94_block(block_header, height)?;
 
-        let block_hash = block_header
-            .validate_pow(actual_target)
-            .map_err(|_| BlockValidationErrors::NotEnoughPow)?;
+        // Like Core's `bad-version`: old versions are rejected once their BIP activates
+        let min_version =
+            Consensus::min_header_version(&read_lock!(self).consensus.parameters.params, height);
+        if block_header.version.to_consensus() < min_version {
+            Err(BlockValidationErrors::BadVersion)?;
+        }
+
         Ok(block_hash)
     }
 
@@ -976,22 +986,46 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         next_header: &BlockHeader,
     ) -> Result<Target, BlockchainError> {
         let params: ChainParams = self.chain_params();
-        // Special testnet rule, if a block takes more than 20 minutes to mine, we can
-        // mine a block with diff 1
-        if params.params.allow_min_difficulty_blocks
-            && last_block.time + params.params.pow_target_spacing as u32 * 2 < next_header.time
-        {
-            return Ok(params.params.max_attainable_target);
+
+        // Outside a retarget height, testnets may allow min-difficulty blocks
+        if next_height % 2016 != 0 {
+            if !params.params.allow_min_difficulty_blocks {
+                return Ok(last_block.target());
+            }
+
+            // Special testnet rule, if a block takes more than 20 minutes to mine, we can
+            // mine a block with diff 1
+            if u64::from(last_block.time) + params.params.pow_target_spacing * 2
+                < u64::from(next_header.time)
+            {
+                return Ok(params.params.max_attainable_target);
+            }
+
+            // Otherwise, require the target of the last block that wasn't mined under that rule,
+            // stopping at the last retarget block
+            let min_difficulty_bits = params.params.max_attainable_target.to_compact_lossy();
+            let mut header = *last_block;
+            let mut height = next_height - 1;
+            while height % 2016 != 0 && header.bits == min_difficulty_bits {
+                header = *self.get_disk_block_header(&header.prev_blockhash)?;
+                height -= 1;
+            }
+
+            return Ok(header.target());
         }
 
         // Regtest don't have retarget
-        if !params.params.no_pow_retargeting && (next_height) % 2016 == 0 {
-            // First block in this epoch
-            let first_block = self.get_header_by_height(next_height - 2016)?;
-            let last_block = self.get_header_by_height(next_height - 1)?;
+        if !params.params.no_pow_retargeting {
+            // Core reads both ends of the epoch from the new header's own ancestors
+            // (`pindexLast->GetAncestor`), and the parent may be on a fork.
+            let first_block = self.get_ancestor_at_height(
+                last_block,
+                next_height - 1,
+                next_height - DIFFCHANGE_INTERVAL,
+            )?;
 
             let target =
-                Consensus::calc_next_work_required(&last_block, &first_block, self.chain_params());
+                Consensus::calc_next_work_required(last_block, &first_block, self.chain_params());
 
             if target < params.params.max_attainable_target {
                 return Ok(target);
@@ -1001,6 +1035,28 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         }
 
         Ok(last_block.target())
+    }
+
+    /// Returns the ancestor of `header` at `target_height`, where `header` is at `header_height`.
+    ///
+    /// The height index only knows the best chain, so it is used when `header` is on it. Otherwise
+    /// this follows `prev_blockhash`, which is also right for a header on a fork.
+    fn get_ancestor_at_height(
+        &self,
+        header: &BlockHeader,
+        header_height: u32,
+        target_height: u32,
+    ) -> Result<BlockHeader, BlockchainError> {
+        if self.get_block_hash(header_height).ok() == Some(header.block_hash()) {
+            return Ok(*self.get_header_by_height(target_height)?);
+        }
+
+        let mut ancestor = *header;
+        for _ in target_height..header_height {
+            ancestor = *self.get_disk_block_header(&ancestor.prev_blockhash)?;
+        }
+
+        Ok(ancestor)
     }
 
     /// Check timestamp against prev for difficulty-adjustment blocks to prevent timewarp attacks.
@@ -1014,7 +1070,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             return Ok(());
         }
 
-        let prev_header = self.get_header_by_height(height - 1)?;
+        let prev_header = self.get_disk_block_header(&block.prev_blockhash)?;
         Ok(Consensus::check_bip94_time(block, &prev_header)?)
     }
 
@@ -1042,7 +1098,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             .parameters
             .get_validation_flags(height, block.block_hash());
         #[cfg(not(feature = "bitcoinkernel"))]
-        let flags = 0;
+        let flags = consensus.parameters.get_sigop_flags(block.block_hash());
         let verify_script = self.verify_script(height)?;
 
         Consensus::verify_block_transactions(
@@ -1076,6 +1132,11 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
 
     fn size_on_disk(&self) -> Result<u64, Self::Error> {
         Ok(read_lock!(self).chainstore.size_on_disk()?)
+    }
+
+    fn get_mtp_by_height(&self, height: u32) -> Result<u32, Self::Error> {
+        let header = *self.get_header_by_height(height)?;
+        self.median_time_past(header)
     }
 
     fn get_fork_point(&self, block: BlockHash) -> Result<BlockHash, Self::Error> {
@@ -1169,6 +1230,30 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
     fn get_block_height(&self, hash: &BlockHash) -> Result<Option<u32>, Self::Error> {
         self.get_disk_block_header(hash)
             .map(|header| header.height())
+    }
+
+    fn get_assume_valid_height(&self) -> Result<Option<u32>, Self::Error> {
+        let inner = read_lock!(self);
+        let Some(hash) = inner.assume_valid else {
+            return Ok(None);
+        };
+        let height = match inner.chainstore.get_header(&hash)? {
+            Some(DiskBlockHeader::HeadersOnly(_, height))
+            | Some(DiskBlockHeader::FullyValid(_, height))
+            | Some(DiskBlockHeader::AssumedValid(_, height)) => height,
+            // `InFork`, `Orphan` or `InvalidChain`
+            _ => return Ok(None),
+        };
+
+        // Cross-check that the AssumeValid block is on the current best chain.
+        if height > inner.best_block.depth {
+            return Ok(None);
+        }
+        if inner.chainstore.get_block_hash(height)? != Some(hash) {
+            return Ok(None);
+        }
+
+        Ok(Some(height))
     }
 
     fn get_block_hash(&self, height: u32) -> Result<BlockHash, Self::Error> {
@@ -1298,18 +1383,27 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         assumed_hash: BlockHash,
     ) -> Result<bool, BlockchainError> {
         let assumed_header = self.get_disk_block_header(&assumed_hash)?;
-        let mut curr_header = assumed_header;
 
-        while let Ok(header) = self.get_disk_block_header(&curr_header.block_hash()) {
+        let mut header = assumed_header;
+        let mut hash = assumed_hash;
+        loop {
             if self.is_genesis(&header) {
                 break;
             }
 
             let height = header.try_height()?;
-            self.update_header(&DiskBlockHeader::FullyValid(*header, height))?;
-            curr_header = self.get_ancestor(&header)?;
+            self.update_header_and_index(
+                &DiskBlockHeader::FullyValid(*header, height),
+                hash,
+                height,
+            )?;
+
+            // Move to the previous block
+            header = self.get_ancestor(&header)?;
+            hash = header.block_hash();
         }
 
+        // Update the tip and accumulator data with our assumed tip
         self.update_view(assumed_header.try_height()?, &assumed_header, acc)?;
         self.flush()?;
 
@@ -1403,8 +1497,8 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
             .any(|subscriber| subscriber.wants_spent_utxos())
             .then(|| inputs.clone());
 
-        self.validate_block_no_acc(block, height, inputs)?;
         let acc = Consensus::update_acc(&self.acc(), block, height, proof, del_hashes)?;
+        self.validate_block_no_acc(block, height, inputs)?;
 
         self.update_view(height, &block.header, acc)?;
 
@@ -1583,9 +1677,11 @@ mod test {
     use bitcoin::consensus::Decodable;
     use bitcoin::consensus::deserialize;
     use bitcoin::consensus::encode::deserialize_hex;
+    use bitcoin::constants::DIFFCHANGE_INTERVAL;
     use bitcoin::constants::genesis_block;
     use bitcoin::hashes::Hash;
     use bitcoin::opcodes::OP_TRUE;
+    use bitcoin::params::Params;
     use bitcoin::script::Builder;
     use bitcoin::transaction::Version as TransactionVersion;
     use floresta_common::assert_ok;
@@ -1603,10 +1699,13 @@ mod test {
     use crate::AssumeValidArg;
     use crate::BlockchainError;
     use crate::ChainStore;
+    use crate::CompactLeafData;
     use crate::FlatChainStore;
     use crate::FlatChainStoreConfig;
+    use crate::ScriptPubKeyKind;
     use crate::extensions::WorkExt;
     use crate::prelude::HashMap;
+    use crate::proof_util::process_proof;
     use crate::pruned_utreexo::consensus::Consensus;
     use crate::pruned_utreexo::error::BlockValidationErrors;
     use crate::pruned_utreexo::utxo_data::UtxoData;
@@ -1634,6 +1733,80 @@ mod test {
 
         let chainstore = FlatChainStore::new(config).unwrap();
         ChainState::open(chainstore, network, assume_valid_arg).unwrap()
+    }
+
+    #[test]
+    fn test_assume_valid_height_uses_configured_block() {
+        let genesis = genesis_block(Network::Regtest).block_hash();
+        for (setting, expected) in [
+            (AssumeValidArg::Disabled, None),
+            (AssumeValidArg::Hardcoded, Some(0)),
+            (AssumeValidArg::UserInput(genesis), Some(0)),
+            (AssumeValidArg::UserInput(BlockHash::all_zeros()), None),
+        ] {
+            // Arc must forward the setting too, as the wire node shares its chainstate
+            let chain = std::sync::Arc::new(setup_test_chain(Network::Regtest, setting, None));
+            assert_eq!(chain.get_assume_valid_height().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_assume_valid_height_requires_current_best_chain() {
+        let genesis = genesis_block(Network::Regtest);
+        let header = BlockHeader {
+            prev_blockhash: genesis.block_hash(),
+            time: genesis.header.time + 1,
+            ..genesis.header
+        };
+        let hash = header.block_hash();
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::UserInput(hash), None);
+        {
+            let mut inner = write_lock!(chain);
+            inner.best_block.best_block = hash;
+            inner.best_block.depth = 1;
+            inner.chainstore.update_block_index(1, hash).unwrap();
+        }
+
+        let active = DiskBlockHeader::HeadersOnly(header, 1);
+        // Only active-chain header states are eligible
+        for (stored, expected) in [
+            (DiskBlockHeader::FullyValid(header, 1), Some(1)),
+            (active, Some(1)),
+            (DiskBlockHeader::AssumedValid(header, 1), Some(1)),
+            (DiskBlockHeader::InFork(header, 1), None),
+            (DiskBlockHeader::Orphan(header), None),
+            (DiskBlockHeader::InvalidChain(header), None),
+        ] {
+            write_lock!(chain).chainstore.save_header(&stored).unwrap();
+            assert_eq!(chain.get_assume_valid_height().unwrap(), expected);
+        }
+
+        let other_header = BlockHeader {
+            time: header.time + 1,
+            ..header
+        };
+
+        #[rustfmt::skip]
+        let cases = [
+            // Different block at the same height
+            (DiskBlockHeader::HeadersOnly(other_header, 1), other_header.block_hash(), 1),
+            // Simulate a rollback to genesis, retaining the AssumeValid header at height 1
+            (active, genesis.block_hash(), 0),
+        ];
+        for (selected, tip_hash, depth) in cases {
+            {
+                let mut inner = write_lock!(chain);
+                inner.chainstore.save_header(&active).unwrap();
+                inner.chainstore.save_header(&selected).unwrap();
+                inner
+                    .chainstore
+                    .update_block_index(1, selected.block_hash())
+                    .unwrap();
+                inner.best_block.best_block = tip_hash;
+                inner.best_block.depth = depth;
+            }
+            assert_eq!(chain.get_assume_valid_height().unwrap(), None);
+        }
     }
 
     fn anyone_can_spend_script() -> ScriptBuf {
@@ -1776,6 +1949,129 @@ mod test {
         prev_hash
     }
 
+    fn assert_malleated_leaf_rejects_proof(malleate_script: bool) {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let mut parent = genesis_block(Network::Regtest).block_hash();
+        let mut funding_outpoint = OutPoint::null();
+
+        // Only height 1 adds a spendable output, so its proof has target 0 and no siblings.
+        for height in 1..=100 {
+            let mut coinbase = test_coinbase(height, Sequence::MAX, LockTime::ZERO);
+            if height == 1 {
+                coinbase.output = vec![txout!(1, anyone_can_spend_script())];
+                funding_outpoint = OutPoint::new(coinbase.compute_txid(), 0);
+            }
+            let mut block = block_with_coinbase(height, coinbase);
+            block.header.prev_blockhash = parent;
+            while block.header.validate_pow(block.header.target()).is_err() {
+                block.header.nonce += 1;
+            }
+            chain.accept_header(block.header).unwrap();
+            chain
+                .connect_block(&block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+            parent = block.block_hash();
+        }
+
+        let spend = Transaction {
+            version: TransactionVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![txin!(funding_outpoint, ScriptBuf::new(), Sequence::MAX)],
+            output: vec![txout!(1, ScriptBuf::new_op_return([0]))],
+        };
+        let mut block = block_with_transactions(
+            101,
+            vec![test_coinbase(101, Sequence::MAX, LockTime::ZERO), spend],
+        );
+        block.header.prev_blockhash = parent;
+        while block.header.validate_pow(block.header.target()).is_err() {
+            block.header.nonce += 1;
+        }
+        chain.accept_header(block.header).unwrap();
+
+        let honest_leaf = CompactLeafData {
+            header_code: (1 << 1) | 1,
+            amount: 1,
+            spk_ty: ScriptPubKeyKind::Other(anyone_can_spend_script().into_bytes().into()),
+        };
+        let mut malicious_leaf = honest_leaf.clone();
+        if malleate_script {
+            malicious_leaf.spk_ty =
+                ScriptPubKeyKind::Other(ScriptBuf::new_op_return([42]).into_bytes().into());
+        } else {
+            // Claim the otherwise mature coinbase was created in the previous block.
+            malicious_leaf.header_code = (100 << 1) | 1;
+        }
+        let proof = Proof {
+            targets: vec![0],
+            hashes: Vec::new(),
+        };
+        let (bad_hashes, bad_inputs) = process_proof(
+            &[malicious_leaf],
+            &block.txdata,
+            101,
+            |height| chain.get_block_hash(height),
+            |height| chain.get_mtp_by_height(height),
+        )
+        .unwrap();
+
+        // These unauthenticated inputs would fail consensus checks if checked first.
+        let validation_error = chain
+            .validate_block_no_acc(&block, 101, bad_inputs.clone())
+            .unwrap_err();
+        assert!(
+            matches!(validation_error, BlockchainError::TransactionError(_)),
+            "expected a transaction failure from malleated leaf data: {validation_error:?}"
+        );
+
+        let acc = chain.acc();
+        let error = chain
+            .connect_block(&block, proof.clone(), bad_inputs, bad_hashes)
+            .unwrap_err();
+        // The wire layer retries and bans the proof peer for AccumulatorError, whereas
+        // TransactionError would invalidate this perfectly valid block.
+        assert!(
+            matches!(error, BlockchainError::AccumulatorError(_)),
+            "must reject the proof, not the block: {error:?}"
+        );
+        assert_eq!(chain.acc(), acc);
+        assert_eq!(chain.get_validation_index().unwrap(), 100);
+        assert!(matches!(
+            chain.get_disk_block_header(&block.block_hash()).unwrap(),
+            DiskBlockHeader::HeadersOnly(_, 101)
+        ));
+
+        // An honest peer can supply the original leaf and connect the exact same block.
+        let (hashes, inputs) = process_proof(
+            &[honest_leaf],
+            &block.txdata,
+            101,
+            |height| chain.get_block_hash(height),
+            |height| chain.get_mtp_by_height(height),
+        )
+        .unwrap();
+        assert_eq!(
+            chain.connect_block(&block, proof, inputs, hashes).unwrap(),
+            101
+        );
+        assert_eq!(chain.get_validation_index().unwrap(), 101);
+        assert!(matches!(
+            chain.get_disk_block_header(&block.block_hash()).unwrap(),
+            DiskBlockHeader::FullyValid(_, 101)
+        ));
+    }
+
+    #[test]
+    fn malleated_creation_height_rejects_proof_not_block() {
+        assert_malleated_leaf_rejects_proof(false);
+    }
+
+    #[test]
+    #[cfg(feature = "bitcoinkernel")]
+    fn malleated_other_script_rejects_proof_not_block() {
+        assert_malleated_leaf_rejects_proof(true);
+    }
+
     #[test]
     fn reject_non_final_block_transaction() {
         let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
@@ -1849,6 +2145,34 @@ mod test {
         chain
             .validate_block_no_acc(&block, HEIGHT, inputs)
             .expect("Block must be valid");
+    }
+
+    #[test]
+    fn test_reject_block_with_too_many_sigops() {
+        const HEIGHT: u32 = 783_426;
+        const BLOCKS: usize = (HEIGHT + 1) as usize;
+
+        let block_file = File::open("./testdata/invalid_block_783426/raw.zst").unwrap();
+        let stxos_file = File::open("./testdata/invalid_block_783426/spent_utxos.zst").unwrap();
+        let (mut block, inputs) = decode_block_and_inputs(block_file, stxos_file);
+
+        assert_eq!(
+            block.block_hash(),
+            bhash!("00000000000000000002ec935e245f8ae70fc68cc828f05bf4cfa002668599e4"),
+        );
+
+        let chain = setup_test_chain(Network::Bitcoin, AssumeValidArg::Disabled, Some(BLOCKS));
+        read_lock!(chain)
+            .consensus
+            .check_block(&block, HEIGHT)
+            .expect("context-free checks must pass");
+
+        let prev_hash = store_mtp_headers(&chain, Network::Bitcoin, HEIGHT - 1, block.header.time);
+        block.header.prev_blockhash = prev_hash;
+        match chain.validate_block_no_acc(&block, HEIGHT, inputs) {
+            Err(BlockchainError::BlockValidation(BlockValidationErrors::TooManySigops)) => {}
+            other => panic!("expected TooManySigops, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1964,6 +2288,358 @@ mod test {
         assert_eq!(
             chain.previous_median_time_past(&candidate).unwrap(),
             median_time(times.to_vec())
+        );
+    }
+
+    const TESTNET_POW_LIMIT_BITS: u32 = 0x1d00_ffff;
+    const TESTNET_HARD_BITS: u32 = 0x1c00_ffff;
+
+    /// Stores headers at heights `1..=bits.len()` on `network`, spaced 10 minutes from genesis.
+    /// Returns them indexed by height, genesis included.
+    fn store_headers_with_bits(
+        chain: &ChainState<FlatChainStore>,
+        network: Network,
+        bits: &[u32],
+    ) -> Vec<BlockHeader> {
+        let genesis = genesis_block(network).header;
+        let mut headers = vec![genesis];
+
+        for (height, &bits) in (1u32..).zip(bits) {
+            let header = BlockHeader {
+                version: HeaderVersion::TWO,
+                prev_blockhash: headers[height as usize - 1].block_hash(),
+                merkle_root: genesis.merkle_root,
+                time: genesis.time + 600 * height,
+                bits: CompactTarget::from_consensus(bits),
+                nonce: height,
+            };
+            write_lock!(chain)
+                .chainstore
+                .save_header(&DiskBlockHeader::FullyValid(header, height))
+                .unwrap();
+            write_lock!(chain)
+                .chainstore
+                .update_block_index(height, header.block_hash())
+                .unwrap();
+            headers.push(header);
+        }
+
+        headers
+    }
+
+    fn required_bits(
+        chain: &ChainState<FlatChainStore>,
+        last: &BlockHeader,
+        next_height: u32,
+        next_time: u32,
+    ) -> u32 {
+        let next = BlockHeader {
+            time: next_time,
+            ..*last
+        };
+        chain
+            .get_next_required_work(last, next_height, &next)
+            .unwrap()
+            .to_compact_lossy()
+            .to_consensus()
+    }
+
+    #[test]
+    fn min_difficulty_exception_does_not_apply_at_retarget_height() {
+        let chain = setup_test_chain(Network::Testnet, AssumeValidArg::Disabled, None);
+        let headers = store_headers_with_bits(
+            &chain,
+            Network::Testnet,
+            &[TESTNET_HARD_BITS; DIFFCHANGE_INTERVAL as usize - 1],
+        );
+        let last = headers[DIFFCHANGE_INTERVAL as usize - 1];
+
+        // The retarget Core computes for a period of 2015 * 600 seconds
+        // (checked against btclib's `next_bits_required`)
+        let retargeted = 0x1c00_ffde;
+        assert_eq!(
+            required_bits(&chain, &last, DIFFCHANGE_INTERVAL, last.time + 20 * 60 + 1),
+            retargeted
+        );
+        assert_eq!(
+            required_bits(&chain, &last, DIFFCHANGE_INTERVAL, last.time + 10 * 60),
+            retargeted
+        );
+    }
+
+    #[test]
+    fn min_difficulty_walks_back_to_last_regular_block() {
+        let chain = setup_test_chain(Network::Testnet, AssumeValidArg::Disabled, None);
+        let mut bits = [TESTNET_HARD_BITS; 12];
+        bits[9..].fill(TESTNET_POW_LIMIT_BITS); // heights 10, 11 and 12
+        let headers = store_headers_with_bits(&chain, Network::Testnet, &bits);
+
+        // Within 20 minutes: the target of height 9, not of the min-difficulty tip
+        let last = headers[12];
+        assert_eq!(
+            required_bits(&chain, &last, 13, last.time + 10 * 60),
+            TESTNET_HARD_BITS
+        );
+        // Later than 20 minutes: the exception applies
+        assert_eq!(
+            required_bits(&chain, &last, 13, last.time + 20 * 60 + 1),
+            TESTNET_POW_LIMIT_BITS
+        );
+        // A regular tip is its own answer
+        assert_eq!(
+            required_bits(&chain, &headers[9], 10, headers[9].time + 10 * 60),
+            TESTNET_HARD_BITS
+        );
+    }
+
+    #[test]
+    fn min_difficulty_walk_stops_at_retarget_block() {
+        let chain = setup_test_chain(Network::Testnet, AssumeValidArg::Disabled, None);
+        let bits = [TESTNET_POW_LIMIT_BITS; 3];
+        let headers = store_headers_with_bits(&chain, Network::Testnet, &bits);
+
+        let last = headers[3];
+        assert_eq!(
+            required_bits(&chain, &last, 4, last.time + 10 * 60),
+            TESTNET_POW_LIMIT_BITS
+        );
+    }
+
+    /// A chain of `network` with `2015` headers at the pow limit, and a header at height 2015
+    /// that is a sibling of the best tip, stored as a fork and mined an hour earlier.
+    fn chain_with_fork_at_height_2015(
+        network: Network,
+    ) -> (ChainState<FlatChainStore>, Vec<BlockHeader>, BlockHeader) {
+        let chain = setup_test_chain(network, AssumeValidArg::Disabled, None);
+        let headers = store_headers_with_bits(&chain, network, &[TESTNET_POW_LIMIT_BITS; 2015]);
+
+        let fork = BlockHeader {
+            time: headers[2015].time - 3600,
+            nonce: 1,
+            ..headers[2015]
+        };
+        write_lock!(chain)
+            .chainstore
+            .save_header(&DiskBlockHeader::InFork(fork, 2015))
+            .unwrap();
+
+        (chain, headers, fork)
+    }
+
+    #[test]
+    fn retarget_is_computed_from_the_parents_own_ancestors() {
+        let (chain, headers, fork) = chain_with_fork_at_height_2015(Network::Testnet);
+        let child = BlockHeader {
+            prev_blockhash: fork.block_hash(),
+            time: fork.time + 600,
+            ..fork
+        };
+
+        // Core: `pindexLast->GetAncestor`, so the epoch ends at the fork, not at the best tip
+        let on_fork = Consensus::calc_next_work_required(&fork, &headers[0], chain.chain_params());
+        let on_best =
+            Consensus::calc_next_work_required(&headers[2015], &headers[0], chain.chain_params());
+        assert_ne!(on_fork, on_best);
+
+        assert_eq!(
+            chain
+                .get_next_required_work(&fork, DIFFCHANGE_INTERVAL, &child)
+                .unwrap()
+                .to_compact_lossy(),
+            on_fork.to_compact_lossy()
+        );
+    }
+
+    #[test]
+    fn bip94_time_is_checked_against_the_parent_on_a_fork() {
+        let (chain, _, fork) = chain_with_fork_at_height_2015(Network::Testnet4);
+        let child = BlockHeader {
+            prev_blockhash: fork.block_hash(),
+            time: fork.time + 10,
+            ..fork
+        };
+
+        // The best tip is an hour later than the fork, which would make this child too early
+        assert!(chain.check_bip94_block(&child, DIFFCHANGE_INTERVAL).is_ok());
+    }
+
+    /// A regtest child of genesis with the given bits and a valid proof of work.
+    fn mined_regtest_child(bits: u32) -> BlockHeader {
+        let genesis = genesis_block(Network::Regtest).header;
+        let mut header = BlockHeader {
+            version: HeaderVersion::TWO,
+            prev_blockhash: genesis.block_hash(),
+            merkle_root: genesis.merkle_root,
+            time: genesis.time + 600,
+            bits: CompactTarget::from_consensus(bits),
+            nonce: 0,
+        };
+        while header.validate_pow(header.target()).is_err() {
+            header.nonce += 1;
+        }
+        header
+    }
+
+    #[test]
+    fn accept_header_rejects_harder_bits_than_required() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let genesis = genesis_block(Network::Regtest);
+
+        // Regtest requires 0x207fffff. This target is 128 times smaller (about 256 hashes to
+        // mine, against 2) and the proof of work is valid for it, but Core rejects it with
+        // `bad-diffbits`.
+        let header = mined_regtest_child(0x2000_ffff);
+
+        assert!(matches!(
+            chain.accept_header(header),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadDiffBits
+            ))
+        ));
+        assert_eq!(chain.get_best_block().unwrap(), (0, genesis.block_hash()));
+        assert!(chain.get_disk_block_header(&header.block_hash()).is_err());
+    }
+
+    #[test]
+    fn accept_header_accepts_exactly_the_required_bits() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+
+        let header = mined_regtest_child(EASIEST_REGTEST_TARGET_BITS);
+
+        chain.accept_header(header).unwrap();
+        assert_eq!(chain.get_best_block().unwrap(), (1, header.block_hash()));
+    }
+
+    #[test]
+    fn header_pow_is_checked_before_the_required_bits() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let genesis = genesis_block(Network::Regtest).header;
+
+        // Wrong bits, and a proof of work that does not meet them: Core reports `high-hash`
+        // from `CheckBlockHeader` before it looks at the bits.
+        let mut header = BlockHeader {
+            version: HeaderVersion::TWO,
+            prev_blockhash: genesis.block_hash(),
+            merkle_root: genesis.merkle_root,
+            time: genesis.time + 600,
+            bits: CompactTarget::from_consensus(0x2000_ffff),
+            nonce: 0,
+        };
+        while header.validate_pow(header.target()).is_ok() {
+            header.nonce += 1;
+        }
+
+        assert!(matches!(
+            chain.accept_header(header),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::NotEnoughPow
+            ))
+        ));
+    }
+
+    /// A regtest child of `parent` with the given version and a valid proof of work.
+    fn mined_regtest_child_of(parent: &BlockHeader, version: i32) -> BlockHeader {
+        let mut header = BlockHeader {
+            version: HeaderVersion::from_consensus(version),
+            prev_blockhash: parent.block_hash(),
+            merkle_root: parent.merkle_root,
+            time: parent.time + 600,
+            bits: CompactTarget::from_consensus(EASIEST_REGTEST_TARGET_BITS),
+            nonce: 0,
+        };
+        while header.validate_pow(header.target()).is_err() {
+            header.nonce += 1;
+        }
+        header
+    }
+
+    /// Checks that `accept_header` rejects version `min_version - 1` with `BadVersion` at
+    /// `height` on regtest, and accepts `min_version`.
+    fn assert_min_version_at(height: u32, min_version: i32) {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let headers = store_headers_with_bits(
+            &chain,
+            Network::Regtest,
+            &vec![EASIEST_REGTEST_TARGET_BITS; height as usize - 1],
+        );
+        let parent = headers.last().unwrap();
+        chain.update_tip(parent.block_hash(), height - 1);
+
+        let too_old = mined_regtest_child_of(parent, min_version - 1);
+        assert!(matches!(
+            chain.accept_header(too_old),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadVersion
+            ))
+        ));
+        assert!(chain.get_disk_block_header(&too_old.block_hash()).is_err());
+
+        let header = mined_regtest_child_of(parent, min_version);
+        chain.accept_header(header).unwrap();
+        assert_eq!(
+            chain.get_best_block().unwrap(),
+            (height, header.block_hash())
+        );
+    }
+
+    #[test]
+    fn accept_header_enforces_the_bip66_minimum_version() {
+        assert_min_version_at(Params::new(Network::Regtest).bip66_height, 3);
+    }
+
+    #[test]
+    fn accept_header_enforces_the_bip65_minimum_version() {
+        // On regtest BIP34 activates after both, so BIP66 and BIP65 are checked on their own
+        let params = Params::new(Network::Regtest);
+        assert!(params.bip66_height < params.bip65_height);
+        assert!(params.bip65_height < params.bip34_height);
+        assert_min_version_at(params.bip65_height, 4);
+    }
+
+    #[test]
+    fn accept_header_takes_any_version_before_the_activations() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let genesis = genesis_block(Network::Regtest).header;
+
+        let v0 = mined_regtest_child_of(&genesis, 0);
+        chain.accept_header(v0).unwrap();
+        let negative = mined_regtest_child_of(&v0, -1);
+        chain.accept_header(negative).unwrap();
+        assert_eq!(chain.get_best_block().unwrap(), (2, negative.block_hash()));
+    }
+
+    #[test]
+    fn ancestor_at_height_follows_a_fork() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Disabled, None);
+        let headers = store_headers_with_bits(&chain, Network::Regtest, &[0x207f_ffff; 5]);
+
+        // A fork from height 2, with different headers at heights 3, 4 and 5
+        let mut forks = vec![headers[2]];
+        for height in 3..=5_u32 {
+            let parent = forks.last().unwrap();
+            let fork = BlockHeader {
+                prev_blockhash: parent.block_hash(),
+                nonce: 100 + height,
+                ..headers[height as usize]
+            };
+            write_lock!(chain)
+                .chainstore
+                .save_header(&DiskBlockHeader::InFork(fork, height))
+                .unwrap();
+            forks.push(fork);
+        }
+        let (fork3, fork5) = (forks[1], forks[3]);
+        assert_ne!(fork3, headers[3]);
+
+        assert_eq!(chain.get_ancestor_at_height(&fork5, 5, 3).unwrap(), fork3);
+        assert_eq!(
+            chain.get_ancestor_at_height(&fork5, 5, 2).unwrap(),
+            headers[2]
+        );
+        // On the best chain it reads the height index
+        assert_eq!(
+            chain.get_ancestor_at_height(&headers[5], 5, 3).unwrap(),
+            headers[3]
         );
     }
 
@@ -2613,7 +3289,7 @@ mod test {
 
         let acc = Stump {
             leaves: 42,
-            roots: vec![BitcoinNodeHash::Some([1; 32])],
+            roots: vec![BitcoinNodeHash::Some([1; 32]); 3],
         };
 
         let chain = ChainState::open(

@@ -28,8 +28,6 @@
 
 use std::time::Duration;
 
-use bitcoin::p2p::ServiceFlags;
-
 /// This trait mainly defines a bunch of constants that we need for the node, but we may tweak
 /// those values for each one. It's also an organized way of defining those constants anyway.
 pub trait NodeContext {
@@ -87,10 +85,6 @@ pub trait NodeContext {
 
     /// How many connections we try at once
     const NEW_CONNECTIONS_BATCH_SIZE: usize = 4;
-
-    fn get_required_services(&self) -> ServiceFlags {
-        ServiceFlags::NETWORK
-    }
 }
 
 pub(crate) type PeerId = u32;

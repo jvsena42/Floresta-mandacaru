@@ -24,5 +24,7 @@ pub use florestad::DumpError;
 pub use florestad::Florestad;
 pub use florestad::SnapshotError;
 pub use florestad::UtreexoSnapshot;
+#[cfg(feature = "json-rpc")]
+pub use json_rpc::auth::basic;
 pub use logging::init_logging;
 pub use tracing_appender::non_blocking::WorkerGuard;

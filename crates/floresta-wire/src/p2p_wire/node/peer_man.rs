@@ -29,6 +29,7 @@ use super::LocalPeerView;
 use super::NodeRequest;
 use super::PeerStatus;
 use super::UtreexoNode;
+use crate::address_man::AddressMan;
 use crate::address_man::AddressState;
 use crate::address_man::LocalAddress;
 use crate::bitcoin_socket_addr::BitcoinSocketAddr;
@@ -116,7 +117,7 @@ where
     pub(crate) fn connected_peers(&self) -> usize {
         self.peers
             .values()
-            .filter(|p| p.state == PeerStatus::Ready && p.is_long_lived())
+            .filter(|p| p.state == PeerStatus::Ready && p.kind.is_long_lived())
             .count()
     }
 
@@ -174,6 +175,37 @@ where
         Ok(*peer)
     }
 
+    #[inline]
+    pub(crate) fn send_to_random_peer_with_predicate(
+        &mut self,
+        req: NodeRequest,
+        required_service: ServiceFlags,
+        predicate: impl Fn(&LocalPeerView) -> bool,
+    ) -> Result<u32, WireError> {
+        if self.peers.is_empty() {
+            return Err(WireError::NoPeersAvailable);
+        }
+
+        let peers = match required_service {
+            ServiceFlags::NONE => &self.peer_ids,
+            _ => self
+                .peer_by_service
+                .get(&required_service)
+                .ok_or(WireError::NoPeersAvailable)?,
+        };
+
+        let (peer_id, peer) = peers
+            .iter()
+            .filter_map(|peer_id| self.peers.get(peer_id).map(|peer| (peer_id, peer)))
+            .filter(|(_, peer)| predicate(peer))
+            .choose(&mut rand::rng())
+            .ok_or(WireError::NoPeersAvailable)?;
+
+        peer.channel.send(req).map_err(WireError::ChannelSend)?;
+
+        Ok(*peer_id)
+    }
+
     pub(crate) fn send_to_peer(&self, peer_id: u32, req: NodeRequest) -> Result<(), WireError> {
         if let Some(peer) = &self.peers.get(&peer_id) {
             if peer.state == PeerStatus::Awaiting {
@@ -197,6 +229,10 @@ where
                 continue;
             }
 
+            if request.is_broadcast_transaction() && !peer.kind.is_full_relay() {
+                continue;
+            }
+
             if let Err(err) = peer.channel.send(request.clone()) {
                 warn!("Failed to send request to peer {}: {err}", peer.address);
             }
@@ -204,7 +240,12 @@ where
     }
 
     pub(crate) fn ask_for_addresses(&mut self) -> Result<(), WireError> {
-        let _ = self.send_to_random_peer(NodeRequest::GetAddresses, ServiceFlags::NONE)?;
+        self.send_to_random_peer_with_predicate(
+            NodeRequest::GetAddresses,
+            ServiceFlags::NONE,
+            |peer| peer.state == PeerStatus::Ready && peer.kind.is_full_relay(),
+        )?;
+
         Ok(())
     }
 
@@ -230,32 +271,27 @@ where
             p.state = PeerStatus::Ready;
         });
 
-        // Ask for new addresses to populate our address manager
-        self.send_to_peer(peer, NodeRequest::GetAddresses)?;
-        self.inflight
-            .insert(InflightRequests::GetAddresses, (peer, Instant::now()));
-
         let good_peers_count = self.connected_peers();
         if good_peers_count > T::MAX_OUTGOING_PEERS {
             // We allow utreexo, extra and manual peers to bypass our connection limits
-            let is_utreexo_peer = matches!(version.kind, ConnectionKind::Regular(services) if services.has(service_flags::UTREEXO.into()));
-            let is_manual_peer = version.kind == ConnectionKind::Manual;
+            let is_utreexo_peer = matches!(version.kind, ConnectionKind::OutboundFullRelay(services) if services.has(service_flags::UTREEXO.into()));
+            let is_manual_peer = version.kind.is_manual();
             let is_extra = version.kind == ConnectionKind::Extra;
 
             if !(is_utreexo_peer || is_manual_peer || is_extra) {
                 debug!(
-                    "Already have {} peers, disconnecting peer to avoid blowing up our max of {}",
+                    "Already have {} peers, treating peer {peer} as addr-fetch before disconnecting to avoid blowing up our max of {}",
                     good_peers_count,
                     T::MAX_OUTGOING_PEERS
                 );
 
-                // If a peer exceeds our max, just turn them into a feeler so we can receive their
-                // AddrV2 message and then disconnect.
+                // If a peer exceeds our max, just turn them into an addr-fetch
+                // so we can receive their AddrV2 message and then disconnect.
                 self.peers.entry(peer).and_modify(|p| {
-                    p.kind = ConnectionKind::Feeler;
+                    p.kind = ConnectionKind::AddrFetch;
                 });
 
-                version.kind = ConnectionKind::Feeler;
+                version.kind = ConnectionKind::AddrFetch;
             }
         }
 
@@ -269,17 +305,57 @@ where
                 .update_set_service_flag(version.address_id, version.services)
                 .update_set_state(version.address_id, AddressState::Tried(now));
 
+            debug!(
+                "Feeler peer {peer} completed handshake; marking address tried and disconnecting"
+            );
+            self.send_to_peer(peer, NodeRequest::Shutdown)?;
+            return Ok(());
+        }
+
+        if version.kind == ConnectionKind::AddrFetch {
+            debug!("Addr-fetch peer {peer} completed handshake; requesting addresses");
+            self.send_to_peer(peer, NodeRequest::GetAddresses)?;
+            self.inflight
+                .insert(InflightRequests::GetAddresses, (peer, Instant::now()));
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            self.address_man
+                .update_set_service_flag(version.address_id, version.services)
+                .update_set_state(version.address_id, AddressState::Tried(now));
+
             return Ok(());
         }
 
         if version.kind == ConnectionKind::Extra {
+            if let Some(peer_data) = self.common.peers.get_mut(&peer) {
+                peer_data.services = version.services;
+                peer_data.user_agent.clone_from(&version.user_agent);
+                peer_data.height = version.blocks;
+                peer_data.transport_protocol = version.transport_protocol;
+            }
+
             let locator = self.chain.get_block_locator()?;
+            debug!("Extra peer {peer} completed handshake; requesting headers");
             self.send_to_peer(peer, NodeRequest::GetHeaders(locator))?;
 
             self.inflight
                 .insert(InflightRequests::Headers, (peer, Instant::now()));
 
             return Ok(());
+        }
+
+        if !version.kind.is_block_relay_only() {
+            debug!(
+                "Requesting addresses from peer {peer} kind={:?}",
+                version.kind
+            );
+            self.send_to_peer(peer, NodeRequest::GetAddresses)?;
+            self.inflight
+                .insert(InflightRequests::GetAddresses, (peer, Instant::now()));
         }
 
         info!(
@@ -289,13 +365,16 @@ where
 
         if let Some(peer_data) = self.common.peers.get_mut(&peer) {
             peer_data.services = version.services;
+            peer_data.address.set_services(version.services);
             peer_data.user_agent.clone_from(&version.user_agent);
             peer_data.height = version.blocks;
             peer_data.time_offset = version.time_offset;
             peer_data.transport_protocol = version.transport_protocol;
 
             // If this peer doesn't have basic services, we disconnect it
-            if let ConnectionKind::Regular(needs) = version.kind {
+            if let ConnectionKind::OutboundFullRelay(needs)
+            | ConnectionKind::BlockRelayOnly(needs) = version.kind
+            {
                 if !Self::is_peer_good(peer_data, needs) {
                     info!(
                         "Disconnecting peer {peer} for not having the required services. has={} needs={}",
@@ -360,6 +439,14 @@ where
                 .update_set_service_flag(version.address_id, version.services);
 
             self.peer_ids.push(peer);
+
+            if version.kind.is_block_relay_only() {
+                let locator = self.chain.get_block_locator()?;
+                self.send_to_peer(peer, NodeRequest::GetHeaders(locator))?;
+
+                self.inflight
+                    .insert(InflightRequests::Headers, (peer, Instant::now()));
+            }
         }
 
         #[cfg(feature = "metrics")]
@@ -428,6 +515,13 @@ where
         msg: PeerMessages,
         peer: PeerId,
     ) -> Result<Option<PeerMessages>, WireError> {
+        // Ignore queued replies from removed peers, even if retrying their requests failed.
+        // They must not complete requests now assigned to another peer.
+        // Still handle `Disconnected` so each node context can finish its cleanup.
+        if !self.peers.contains_key(&peer) && !matches!(msg, PeerMessages::Disconnected(_)) {
+            return Ok(None);
+        }
+
         match msg {
             PeerMessages::Addr(addresses) => {
                 self.handle_addresses_from_peer(peer, addresses)?;
@@ -633,7 +727,7 @@ where
         self.fail_user_requests_of(peer);
 
         if let Some(p) = self.peers.remove(&peer) {
-            if p.is_long_lived() && p.state == PeerStatus::Ready {
+            if p.kind.is_long_lived() && p.state == PeerStatus::Ready {
                 info!("Peer disconnected: {peer}");
             }
 
@@ -665,6 +759,11 @@ where
             v.retain(|&id| id != peer);
         }
 
+        // User requests have no automatic retry. Dropping their response senders
+        // gives callers an error instead of leaving them waiting for this peer.
+        self.inflight_user_requests
+            .retain(|_, (requested_peer, _, _)| *requested_peer != peer);
+
         let inflight = self
             .inflight
             .clone()
@@ -672,20 +771,22 @@ where
             .filter(|(_k, v)| v.0 == peer)
             .collect::<Vec<_>>();
 
+        let mut retry_error = None;
         for req in inflight {
             self.inflight.remove(&req.0);
 
             if let Err(e) = self.redo_inflight_request(&req.0) {
                 // CRITICAL: never drop the request, so we retry it later
                 self.inflight.insert(req.0, req.1);
-                return Err(e);
+                // Retry the remaining requests before returning an error.
+                retry_error = Some(e);
             }
         }
 
         #[cfg(feature = "metrics")]
         self.update_peer_metrics();
 
-        Ok(())
+        retry_error.map_or(Ok(()), Err)
     }
 
     /// Increases the "banscore" of a peer.
@@ -700,7 +801,7 @@ where
         };
 
         // Manual connections are exempt from being punished
-        if peer.is_manual_peer() {
+        if peer.kind.is_manual() {
             return Ok(());
         }
 
@@ -726,7 +827,7 @@ where
     pub(crate) fn disconnect_and_ban(&mut self, peer: PeerId) -> Result<(), WireError> {
         if let Some(peer) = self.peers.get_mut(&peer) {
             // Manual connections are exempt from being punished
-            if peer.is_manual_peer() {
+            if peer.kind.is_manual() {
                 return Ok(());
             }
 
@@ -745,7 +846,7 @@ where
         let peers = self
             .peers
             .values()
-            .filter(|peer| peer.is_regular_peer() && !peer.has_any_service(protected_services))
+            .filter(|peer| peer.kind.is_regular() && !peer.has_any_service(protected_services))
             .sample(&mut rng, n);
 
         for peer in peers {
@@ -755,9 +856,9 @@ where
 
     /// Checks whether some of our inflight requests have timed out.
     ///
-    /// This function will check if any of our inflight requests have timed out, and if so,
-    /// it will remove them from the inflight list and increase the banscore of the peer that
-    /// sent the request. It will also resend the request to another peer.
+    /// Disconnects unresponsive peers without banning them and retries their requests.
+    /// Manual peers keep their connection when requests time out.
+    /// Address timeouts only disconnect feeler peers.
     pub(crate) fn check_for_timeout(&mut self) -> Result<(), WireError> {
         let now = Instant::now();
 
@@ -773,33 +874,26 @@ where
             _ => None,
         };
 
-        let timed_out = self
+        let timed_out: Vec<_> = self
             .inflight
             .iter()
             .filter_map(|(req, (_, time))| timed_out_fn(req, time))
-            .collect::<Vec<_>>();
+            .collect();
 
+        let mut retry_error = None;
         for req in timed_out {
-            let Some((peer, time)) = self.inflight.remove(&req) else {
+            let Some(&(peer, time)) = self.inflight.get(&req) else {
                 continue;
             };
 
-            // If a feeler connection times out, we ban them at the first message
-            if let Some(peer_data) = self.peers.get(&peer) {
-                if peer_data.kind == ConnectionKind::Feeler {
-                    debug!("Feeler peer {peer} timed out request");
-                    self.send_to_peer(peer, NodeRequest::Shutdown)?;
-                    self.peers.remove(&peer);
-                    continue;
-                }
-            }
-
-            if let InflightRequests::Connect(_) = req {
-                // ignore the output as it might fail due to the task being cancelled
-                let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
-                self.peers.remove(&peer);
+            // This request was timed out when collected, but an earlier iteration
+            // disconnecting the same peer may have retried it. So re-check timeouts.
+            if timed_out_fn(&req, &time).is_none() {
                 continue;
             }
+
+            // Remove it now to avoid retrying it both during disconnection and below.
+            self.inflight.remove(&req);
 
             debug!("Request timed out: {req:?}");
             if matches!(req, InflightRequests::Headers) {
@@ -808,13 +902,33 @@ where
                     "Header request to peer={peer} timed out after {stalled_for}s; re-issuing to a fresh peer"
                 );
             }
-            // Increase the banscore and try banning the peer if needed, then re-request
-            try_and_log!(self.increase_banscore(peer, 1));
+            if let Some(peer_data) = self.peers.get(&peer) {
+                // Do not disconnect peers on missing address replies, except for
+                // short-lived connections.
+                if matches!(req, InflightRequests::GetAddresses) && !peer_data.kind.is_short_lived()
+                {
+                    continue;
+                }
+
+                // Disconnect peers on timeout unless they are manual (and completed handshake).
+                if !peer_data.kind.is_manual() || matches!(req, InflightRequests::Connect(_)) {
+                    let idx = peer_data.address.id;
+                    let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
+
+                    // Remove the peer before retrying, without waiting for its task to stop.
+                    // It cannot be selected again, and the common handler discards late replies.
+                    if let Err(e) = self.handle_disconnection(peer, idx) {
+                        retry_error = Some(e);
+                    }
+                }
+            }
 
             if let Err(e) = self.redo_inflight_request(&req) {
-                // CRITICAL: never drop the request, so we retry it later
+                // CRITICAL: never drop the request, so we retry it later, on the next tick.
+                // Keep the old timestamp so it stays expired.
                 self.inflight.insert(req, (peer, time));
-                return Err(e);
+                // Retry the remaining requests before returning an error.
+                retry_error = Some(e);
             }
         }
 
@@ -850,7 +964,7 @@ where
             drop(responder);
         }
 
-        Ok(())
+        retry_error.map_or(Ok(()), Err)
     }
 
     pub(crate) fn handle_addresses_from_peer(
@@ -878,13 +992,14 @@ where
 
         self.address_man.push_addresses(&good_addresses);
 
-        // For feeler peers, we ask for addresses to populate our address manager,
-        // then disconnect them
+        // Addr-fetch peers are short-lived: after we receive their addresses,
+        // we disconnect them.
         let Some(peer_data) = self.peers.get(&peer) else {
             return Ok(());
         };
 
-        if matches!(peer_data.kind, ConnectionKind::Feeler) {
+        if matches!(peer_data.kind, ConnectionKind::AddrFetch) {
+            debug!("Addr-fetch peer {peer} returned addresses; disconnecting");
             self.send_to_peer(peer, NodeRequest::Shutdown)?;
         }
 
@@ -960,24 +1075,25 @@ where
 
     /// Saves the utreexo peers to disk so we can reconnect with them later
     pub(crate) fn save_utreexo_peers(&self) -> Result<(), WireError> {
-        let peers: &Vec<u32> = self
-            .peer_by_service
-            .get(&service_flags::UTREEXO.into())
-            .ok_or(WireError::NoUtreexoPeersAvailable)?;
-        let peers_usize: Vec<usize> = peers.iter().map(|&peer| peer as usize).collect();
-        if peers_usize.is_empty() {
+        let utreexo_peers: Vec<LocalAddress> = self
+            .peers
+            .values()
+            .filter(|peer| {
+                peer.state == PeerStatus::Ready && peer.services.has(service_flags::UTREEXO.into())
+            })
+            .map(|peer| peer.address.clone())
+            .collect();
+        if utreexo_peers.is_empty() {
             warn!("No connected Utreexo peers to save to disk");
             return Ok(());
         }
         info!("Saving utreexo peers to disk...");
-        self.address_man
-            .dump_utreexo_peers(&self.datadir, &peers_usize)
-            .map_err(WireError::Io)
+        AddressMan::dump_utreexo_peers(&self.datadir, &utreexo_peers).map_err(WireError::Io)
     }
 
     // === METRICS AND HELPERS ===
 
-    /// Register a message on `self.inflights` and record the time taken to respond to it.
+    /// Records response latency for the peer currently assigned to the request.
     ///
     /// We need this information for two purposes:
     /// 1. To calculate the average time taken to respond to messages from peers, which we use
@@ -990,24 +1106,18 @@ where
         peer: PeerId,
         read_at: Instant,
     ) -> Option<()> {
+        let inflight_sent_at = |request: InflightRequests| {
+            let (request_peer, sent_at) = self.inflight.get(&request)?;
+            // A late reply must not use another peer's retry timestamp.
+            (*request_peer == peer).then_some(*sent_at)
+        };
+
         let sent_at = match notification {
             PeerMessages::Block(block) => {
-                let inflight = self
-                    .inflight
-                    .get(&InflightRequests::Blocks(block.block_hash()))?;
-
-                inflight.1
+                inflight_sent_at(InflightRequests::Blocks(block.block_hash()))?
             }
-
-            PeerMessages::Ready(_) => {
-                let inflight = self.inflight.get(&InflightRequests::Connect(peer))?;
-                inflight.1
-            }
-
-            PeerMessages::Headers(_) => {
-                let inflight = self.inflight.get(&InflightRequests::Headers)?;
-                inflight.1
-            }
+            PeerMessages::Ready(_) => inflight_sent_at(InflightRequests::Connect(peer))?,
+            PeerMessages::Headers(_) => inflight_sent_at(InflightRequests::Headers)?,
 
             // One sample per batch, taken on its first filter: the rest of the batch streams in
             // over seconds, and a batch queued behind others on the same peer only starts when
@@ -1048,14 +1158,16 @@ where
             )?,
 
             PeerMessages::UtreexoState(_) => {
-                let inflight = self.inflight.get(&InflightRequests::UtreexoState(peer))?;
-                inflight.1
+                inflight_sent_at(InflightRequests::UtreexoState(peer))?
             }
 
             _ => return None,
         };
 
-        let elapsed = read_at.duration_since(sent_at).as_secs_f64();
+        // A reply may be read just before a retry to the same peer, so `sent_at`
+        // will be overridden with the retry instant, which makes `read_at < sent_at`.
+        // Skip that stale sample instead of recording zero latency.
+        let elapsed = read_at.checked_duration_since(sent_at)?.as_secs_f64();
         if let Some(peer) = self.peers.get_mut(&peer) {
             peer.message_times.add(elapsed * 1_000.0); // milliseconds
         }

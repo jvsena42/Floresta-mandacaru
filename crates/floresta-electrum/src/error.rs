@@ -4,6 +4,7 @@ use core::error;
 use core::fmt;
 
 use floresta_common::impl_error_from;
+use floresta_domain::wallet::error::WatchOnlyError;
 use tokio::sync::oneshot;
 
 #[derive(Debug)]
@@ -25,6 +26,8 @@ pub enum Error {
 
     /// Historical rescans are unavailable because compact filters are disabled.
     CompactFiltersDisabled,
+    /// Wallet error
+    WalletError(WatchOnlyError),
 }
 
 impl fmt::Display for Error {
@@ -38,6 +41,7 @@ impl fmt::Display for Error {
             Self::NodeHandle(e) => write!(f, "The node is unresponsive: {e}"),
             Self::CompactFilters(error) => write!(f, "Compact-filter error: {error}"),
             Self::CompactFiltersDisabled => write!(f, "Compact filters are disabled"),
+            Self::WalletError(e) => write!(f, "Wallet error: {e}"),
         }
     }
 }
@@ -52,6 +56,7 @@ impl error::Error for Error {
             Self::Mempool(e) => Some(e.as_ref()),
             Self::NodeHandle(e) => Some(e),
             Self::CompactFilters(_) | Self::CompactFiltersDisabled => None,
+            Self::WalletError(e) => Some(e),
         }
     }
 }
@@ -59,3 +64,4 @@ impl error::Error for Error {
 impl_error_from!(Error, serde_json::Error, Parsing);
 impl_error_from!(Error, std::io::Error, Io);
 impl_error_from!(Error, oneshot::error::RecvError, NodeHandle);
+impl_error_from!(Error, WatchOnlyError, WalletError);

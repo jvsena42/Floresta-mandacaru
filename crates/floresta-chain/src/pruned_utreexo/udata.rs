@@ -214,6 +214,8 @@ pub mod proof_util {
     use crate::BlockchainError;
     use crate::CompactLeafData;
     use crate::ScriptPubKeyKind;
+    use crate::extensions::Bip30UnspendableExt;
+    use crate::extensions::TransactionExt;
     use crate::prelude::*;
     use crate::pruned_utreexo::consensus::Consensus;
     use crate::pruned_utreexo::consensus::UTREEXO_TAG_V1;
@@ -362,6 +364,20 @@ pub mod proof_util {
         sha256::Hash::from_byte_array(leaf_hash.to_byte_array())
     }
 
+    fn get_input_outpoints(txdata: &[Transaction]) -> HashSet<OutPoint> {
+        let input_count = txdata.iter().map(|tx| tx.input.len()).sum();
+        let mut outpoints = HashSet::with_capacity(input_count);
+
+        outpoints.extend(
+            txdata
+                .iter()
+                .flat_map(|tx| &tx.input)
+                .map(|input| input.previous_output),
+        );
+
+        outpoints
+    }
+
     /// From a block, gets the roots that will be included on the acc, certifying
     /// that any utxo will not be spent in the same block.
     pub fn get_block_adds(
@@ -371,30 +387,101 @@ pub mod proof_util {
     ) -> Vec<BitcoinNodeHash> {
         // Get inputs from the block, we'll need this HashSet to check if an output is spent
         // in the same block. If it is, we don't need to add it to the accumulator.
-        let mut spent = HashSet::new();
-        for tx in &block.txdata {
-            for input in &tx.input {
-                spent.insert((input.previous_output.txid, input.previous_output.vout));
-            }
-        }
+        let spent = get_input_outpoints(&block.txdata);
+
+        // The worst-case length of the leaves to add is simply the output count
+        let output_count = block.txdata.iter().map(|tx| tx.output.len()).sum();
+        let mut adds = Vec::with_capacity(output_count);
 
         // Get all leaf hashes that will be added to the accumulator
-        let mut adds = Vec::new();
         for tx in &block.txdata {
             let txid = tx.compute_txid();
             let is_cb = tx.is_coinbase();
 
             for (vout, output) in tx.output.iter().enumerate() {
-                let utxo_id = (txid, vout as u32);
+                let vout = u32::try_from(vout).expect("block size bounds vout to u32");
+                let utxo_id = OutPoint::new(txid, vout);
 
                 if Consensus::is_unspendable(&output.script_pubkey) || spent.contains(&utxo_id) {
                     // Do not add unspendable nor already spent utxos
                     continue;
                 }
 
-                let leaf_hash =
-                    get_leaf_hashes(txid, is_cb, vout as u32, output, height, block_hash);
+                let leaf_hash = get_leaf_hashes(txid, is_cb, vout, output, height, block_hash);
                 adds.push(BitcoinNodeHash::Some(leaf_hash.to_byte_array()));
+            }
+        }
+
+        adds
+    }
+
+    /// Builds this block Utreexo additions from SwiftSync hints.
+    ///
+    /// Script-unspendable outputs and intra-block spends are omitted. Remaining outputs
+    /// use `BitcoinNodeHash::Empty` when hinted as spent, avoiding leaf hashing, or their
+    /// leaf hash when hinted as unspent.
+    ///
+    /// Historical BIP30-unspendable coinbase leaves are retained regardless of hints,
+    /// but cannot be spent later.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `txids` and `block.txdata` lengths differ.
+    pub fn get_block_adds_from_hints(
+        block: &Block,
+        txids: &[Txid],
+        height: u32,
+        block_hash: BlockHash,
+        unspent_indexes: &HashSet<u32>,
+    ) -> Vec<BitcoinNodeHash> {
+        let transactions = &block.txdata;
+        assert_eq!(transactions.len(), txids.len());
+
+        let mut output_index = 0;
+
+        // Get inputs from the block, we'll need this HashSet to check if an output is spent
+        // in the same block. If it is, we don't need to add it to the accumulator.
+        let spent = get_input_outpoints(transactions);
+
+        // The worst-case length of the leaves to add is simply the output count
+        let output_count = transactions.iter().map(|tx| tx.output.len()).sum();
+        let mut adds = Vec::with_capacity(output_count);
+
+        // Get all leaf hashes that will be added to the accumulator
+        for (tx, txid) in transactions.iter().zip(txids) {
+            let is_cb = tx.is_coinbase();
+
+            for (vout, output) in tx.output.iter().enumerate() {
+                // Special case: unspendable outputs do not count for the block `output_index`
+                if Consensus::is_unspendable(&output.script_pubkey) {
+                    continue;
+                }
+
+                let vout = u32::try_from(vout).expect("block size bounds vout to u32");
+                let utxo_id = OutPoint::new(*txid, vout);
+                if spent.contains(&utxo_id) {
+                    output_index += 1;
+                    // Do not add UTXOs spent in the same block
+                    continue;
+                }
+
+                let is_bip30_unspendable = is_cb && block.is_bip30_unspendable(height);
+
+                if is_bip30_unspendable || unspent_indexes.contains(&output_index) {
+                    // Add unspent outputs to the accumulator, according to the hints
+                    let leaf_hash = get_leaf_hashes(*txid, is_cb, vout, output, height, block_hash);
+                    adds.push(BitcoinNodeHash::Some(leaf_hash.to_byte_array()));
+                } else {
+                    // Hinted as spent: add empty leaf hash
+                    adds.push(BitcoinNodeHash::Empty);
+                }
+
+                // BIP-30 unspendable outputs do not count for the block `output_index`
+                if is_bip30_unspendable {
+                    continue;
+                }
+
+                output_index += 1;
             }
         }
 
@@ -410,48 +497,50 @@ pub mod proof_util {
     /// This will be used to process this block
     type ProcessedProof = (Vec<sha256::Hash>, UtxoMap);
 
-    /// This function processes a proof of inclusion for a given block.
-    /// It takes in the [`CompactLeafData`] for this block, this block's transactions, the height
-    /// and a function to get the block hash for a given height. Then returns a [`Result`] containing
-    /// a vector with hashes for deleted leaves, and a `UtxoMap`, which is defined
-    /// as [`HashMap<OutPoint, UtxoData>`].
-    pub fn process_proof<F, E>(
+    /// Processes the proof of inclusion for a block.
+    ///
+    /// The returned UTXO map contains only outputs reconstructed from `leaves`. Outputs created
+    /// within this block are excluded; block validation makes them available in transaction order.
+    /// Inputs spending any same-block output are therefore not paired with a proof leaf, including
+    /// invalid inputs that spend an output before its creating transaction.
+    ///
+    /// Returns the deleted leaf hashes and the proof-provided UTXOs needed to validate `txdata`.
+    /// The lookup functions supply block hashes and Median Time Past at the requested heights.
+    pub fn process_proof<F, G, E>(
         leaves: &[CompactLeafData],
         txdata: &[Transaction],
-        height: u32,
+        _height: u32,
         get_block_hash: F,
+        get_mtp: G,
     ) -> Result<ProcessedProof, E>
     where
         F: Fn(u32) -> Result<BlockHash, E>,
+        G: Fn(u32) -> Result<u32, E>,
         E: From<UtreexoLeafError>,
     {
+        // Compute transaction IDs once, then use output counts to distinguish same-block spends
+        // from inputs that require proof data. This intentionally ignores transaction order:
+        // validation is responsible for rejecting spends that precede output creation.
+        let txids: Vec<_> = txdata.iter().map(Transaction::compute_txid).collect();
+        let same_block_transactions: HashMap<_, _> = txids
+            .iter()
+            .copied()
+            .zip(txdata.iter().map(|tx| tx.output.len()))
+            .collect();
+
         // Initialize return values
         let mut del_hashes = Vec::new();
         let mut utxos = HashMap::new();
-
         let mut leaves_iter = leaves.iter().cloned();
 
         // Skip coinbase transaction
-        for tx in txdata.iter().skip(1) {
-            let txid = tx.compute_txid();
-
-            // Collect new UTXOs, which may be spent by later transactions in the block
-            for (vout, out) in tx.output.iter().enumerate() {
-                utxos.insert(
-                    OutPoint::new(txid, vout as u32),
-                    UtxoData {
-                        txout: out.clone(),
-                        is_coinbase: tx.is_coinbase(),
-                        creation_height: height,
-                        creation_time: 0, // TODO add MTP(`height` - 1)
-                    },
-                );
-            }
-
+        for (tx, txid) in txdata.iter().zip(txids).skip(1) {
             for (vin, input) in tx.input.iter().enumerate() {
-                // Only reconstruct UTXOs missing from the map, from prior blocks. Transactions
-                // spending uncreated UTXOs yield an invalid deletion hash, failing utreexo verification.
-                if utxos.contains_key(&input.previous_output) {
+                let previous_output = input.previous_output;
+                let is_same_block_output = same_block_transactions
+                    .get(&previous_output.txid)
+                    .is_some_and(|output_count| (previous_output.vout as usize) < *output_count);
+                if is_same_block_output {
                     continue;
                 }
                 let Some(leaf) = leaves_iter.next() else {
@@ -483,6 +572,17 @@ pub mod proof_util {
                         kind: e,
                     })?;
 
+                // creation_time is only read by the BIP68 relative lock-time check, and only
+                // when the spending input's sequence actually encodes a time-based lock, so
+                // avoid the get_mtp call otherwise.
+                let is_time_locked = input.sequence.is_time_locked();
+
+                let creation_time = if tx.is_bip68_enabled() && is_time_locked {
+                    get_mtp(creation_height - 1)?
+                } else {
+                    0
+                };
+
                 // Push the UTXO to remove from the set and its leaf hash (deletion hash)
                 del_hashes.push(leaf._get_leaf_hashes());
                 utxos.insert(
@@ -491,7 +591,7 @@ pub mod proof_util {
                         txout: leaf.utxo,
                         is_coinbase,
                         creation_height,
-                        creation_time: 0, // TODO add MTP(`creation_height` - 1)
+                        creation_time,
                     },
                 );
             }
@@ -608,6 +708,7 @@ mod test {
     use super::proof_util::reconstruct_leaf_data;
     use crate::proof_util::LeafErrorKind;
     use crate::proof_util::reconstruct_script_pubkey;
+    use crate::pruned_utreexo::consensus::LockTimeCutoff;
 
     macro_rules! assert_recover_spk {
         (
@@ -798,7 +899,7 @@ mod test {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint {
-                    txid: coinbase.compute_txid(),
+                    txid: bitcoin::Txid::all_zeros(),
                     vout: 0,
                 },
                 script_sig: ScriptBuf::new(),
@@ -818,13 +919,15 @@ mod test {
             spk_ty: ScriptPubKeyKind::Other(Box::new([0x51])),
         }];
 
-        // The leaf must be rejected before any block-hash lookup happens.
+        // The leaf must be rejected before any block-hash lookup happens (get_mtp is called
+        // unconditionally up front, for the block's own outputs, so it isn't part of this check).
         let get_block_hash = |_height| -> Result<BlockHash, TestErr> {
             panic!("get_block_hash must not be called for a rejected genesis leaf")
         };
+        let get_mtp = |_height| -> Result<u32, TestErr> { Ok(0) };
 
-        let TestErr::Leaf(err) =
-            process_proof(&leaves, &txdata, 100, get_block_hash).expect_err("must be rejected");
+        let TestErr::Leaf(err) = process_proof(&leaves, &txdata, 100, get_block_hash, get_mtp)
+            .expect_err("must be rejected");
 
         assert!(
             matches!(err.kind, LeafErrorKind::GenesisCreationHeight),
@@ -833,6 +936,138 @@ mod test {
         );
     }
 
+    #[test]
+    fn rejects_same_block_spend_before_output_creation() {
+        fn tx(previous_output: OutPoint, value: u64) -> Transaction {
+            Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output,
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(value),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            }
+        }
+
+        let proof_outpoint = OutPoint::new(bitcoin::Txid::all_zeros(), 0);
+        let coinbase = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0, 0]),
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let funding = tx(proof_outpoint, 90);
+        let creator = tx(OutPoint::new(funding.compute_txid(), 0), 70);
+        let uncreated_outpoint = OutPoint::new(creator.compute_txid(), 0);
+        let spender = tx(uncreated_outpoint, 60);
+        let spending_txid = spender.compute_txid();
+        let transactions = [coinbase, funding, spender, creator];
+        let leaf = CompactLeafData {
+            header_code: 1 << 1,
+            amount: 100,
+            spk_ty: ScriptPubKeyKind::Other(Box::new([])),
+        };
+
+        let (_, utxos) = process_proof(
+            &[leaf],
+            &transactions,
+            2,
+            |_| Ok::<_, crate::BlockchainError>(BlockHash::all_zeros()),
+            |_| Ok(0),
+        )
+        .expect("proof reconstruction must succeed");
+
+        match crate::pruned_utreexo::consensus::Consensus::verify_block_transactions(
+            2,
+            LockTimeCutoff::Mtp(0),
+            utxos,
+            &transactions,
+            Amount::from_sat(50),
+            false,
+            0,
+        ) {
+            Err(crate::BlockchainError::TransactionError(error)) => {
+                assert_eq!(error.txid, spending_txid);
+                assert_eq!(
+                    error.error,
+                    crate::BlockValidationErrors::UtxoNotFound(uncreated_outpoint)
+                );
+            }
+            other => panic!("expected UtxoNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_proof_returns_only_proof_provided_utxos() {
+        let proof_outpoint = OutPoint::new(bitcoin::Txid::all_zeros(), 0);
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let parent = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: proof_outpoint,
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(40),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let parent_outpoint = OutPoint::new(parent.compute_txid(), 0);
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: parent_outpoint,
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(30),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let child_outpoint = OutPoint::new(child.compute_txid(), 0);
+        let leaf = CompactLeafData {
+            header_code: 42 << 1,
+            amount: 50,
+            spk_ty: ScriptPubKeyKind::Other(Box::new([])),
+        };
+        let get_block_hash = |_| Ok::<_, UtreexoLeafError>(BlockHash::all_zeros());
+
+        let (del_hashes, utxos) = process_proof(
+            &[leaf],
+            &[coinbase, parent, child],
+            100,
+            get_block_hash,
+            |_| panic!("inputs without time locks must not require MTP"),
+        )
+        .expect("proof data should be reconstructed");
+
+        assert_eq!(del_hashes.len(), 1);
+        assert_eq!(utxos.len(), 1);
+        assert!(utxos.contains_key(&proof_outpoint));
+        assert!(!utxos.contains_key(&parent_outpoint));
+        assert!(!utxos.contains_key(&child_outpoint));
+    }
     #[test]
     fn test_leaf_hash_known_vector() {
         // Precomputed reference hash generated from the original sha2::Sha512_256 implementation
