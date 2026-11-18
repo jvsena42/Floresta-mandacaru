@@ -779,16 +779,13 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
     }
 
     fn maybe_start_rescan(&mut self) {
-        if self.chain.is_in_ibd() {
+        if self.addresses_to_scan.is_empty() || self.chain.is_in_ibd() {
             return;
         }
         if self.rescan_retry_at.is_some_and(|at| Instant::now() < at) {
             return;
         }
         let Some(filters) = self.filter_handle.clone() else {
-            if self.addresses_to_scan.is_empty() {
-                return;
-            }
             // No history without filters, but the scripts are still watched from now on:
             // the scriptpubkey endpoints rely on this function to cache what they queue.
             error!("Can't rescan for new Electrum scripts: compact filters are disabled");
@@ -800,17 +797,6 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
             return;
         };
         if !self.filters_ready(&filters) {
-            return;
-        }
-
-        // Addresses the wallet derived after a payment near its horizon: watched already,
-        // their past is not. Taken only now that a rescan can start, so until then they stay
-        // in the wallet's persisted queue.
-        match self.address_cache.take_addresses_pending_rescan() {
-            Ok(derived) => self.addresses_to_scan.extend(derived),
-            Err(error) => error!(%error, "Could not read the addresses pending a rescan"),
-        }
-        if self.addresses_to_scan.is_empty() {
             return;
         }
 

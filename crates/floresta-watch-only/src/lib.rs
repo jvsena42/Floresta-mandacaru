@@ -184,9 +184,9 @@ struct AddressCacheInner<D: AddressCacheDatabase> {
     /// rebuilt in [`AddressCacheInner::new`].
     derived_index: HashMap<Hash, u32>,
     /// Addresses derived past the horizon after a payment near it. They are followed from
-    /// then on, but their history in blocks already processed is only found by a rescan:
-    /// whoever runs the next one takes them. Mirrored in the database, so an app killed
-    /// before that rescan does not lose them.
+    /// then on, but their history in blocks already processed is only found by a rescan.
+    /// They leave the queue once a rescan that covered them succeeds. Mirrored in the
+    /// database, so an app killed before then does not lose them.
     pending_rescan: Vec<ScriptBuf>,
 }
 
@@ -906,34 +906,35 @@ where
         inner.derive_addresses()
     }
 
-    /// Takes the addresses derived past the horizon since the last call. They are followed
-    /// already; their history in blocks already processed is only found by rescanning them.
-    /// Hand them back with [`Self::requeue_addresses_pending_rescan`] if that rescan fails.
-    pub fn take_addresses_pending_rescan(&self) -> Result<Vec<ScriptBuf>, WatchOnlyError> {
-        let mut inner = self.get_inner_write()?;
-        let addresses = core::mem::take(&mut inner.pending_rescan);
-        if !addresses.is_empty() {
-            inner.database.save_pending_rescan(&[])?;
-        }
-        Ok(addresses)
+    /// The addresses derived past the horizon whose history in blocks already processed has
+    /// not been rescanned yet. They are followed already. They stay queued, also across a
+    /// restart, until [`Self::ack_addresses_rescanned`] is called after a rescan that covered
+    /// them succeeds.
+    pub fn get_addresses_pending_rescan(&self) -> Result<Vec<ScriptBuf>, WatchOnlyError> {
+        let inner = self.get_inner()?;
+        Ok(inner.pending_rescan.clone())
     }
 
-    /// Hands back addresses taken with [`Self::take_addresses_pending_rescan`] that could not
-    /// be rescanned after all.
-    pub fn requeue_addresses_pending_rescan(
-        &self,
-        addresses: Vec<ScriptBuf>,
-    ) -> Result<(), WatchOnlyError> {
+    /// Removes from the rescan queue the addresses a successful rescan covered. Addresses
+    /// queued since they were read stay queued.
+    pub fn ack_addresses_rescanned(&self, addresses: &[ScriptBuf]) -> Result<(), WatchOnlyError> {
         if addresses.is_empty() {
             return Ok(());
         }
         let mut inner = self.get_inner_write()?;
-        for address in addresses {
-            if !inner.pending_rescan.contains(&address) {
-                inner.pending_rescan.push(address);
-            }
+        let rescanned: HashSet<&ScriptBuf> = addresses.iter().collect();
+        let remaining: Vec<ScriptBuf> = inner
+            .pending_rescan
+            .iter()
+            .filter(|address| !rescanned.contains(address))
+            .cloned()
+            .collect();
+        if remaining.len() == inner.pending_rescan.len() {
+            return Ok(());
         }
-        inner.database.save_pending_rescan(&inner.pending_rescan)?;
+        // Saved first: if that fails, the queue in memory still matches the database
+        inner.database.save_pending_rescan(&remaining)?;
+        inner.pending_rescan = remaining;
         Ok(())
     }
 
@@ -1541,28 +1542,28 @@ mod test {
         cache.push_descriptor(DESC_A).unwrap();
         cache.push_descriptor(single).unwrap();
         // Loading a descriptor rescans all of its addresses anyway
-        assert!(cache.take_addresses_pending_rescan().unwrap().is_empty());
+        assert!(cache.get_addresses_pending_rescan().unwrap().is_empty());
 
         pay(&cache, &script_at(DESC_A, 10));
-        assert!(cache.take_addresses_pending_rescan().unwrap().is_empty());
+        assert!(cache.get_addresses_pending_rescan().unwrap().is_empty());
 
         pay(&cache, &script_at(DESC_A, 85));
-        let pending = cache.take_addresses_pending_rescan().unwrap();
+        let pending = cache.get_addresses_pending_rescan().unwrap();
         // Only the new batch: not the script of the descriptor without a wildcard, which
         // every batch derives again
         assert_eq!(pending.len(), DERIVATION_COUNT as usize);
         assert!(pending.contains(&script_at(DESC_A, 100)));
         assert!(pending.contains(&script_at(DESC_A, 199)));
-        assert!(cache.take_addresses_pending_rescan().unwrap().is_empty());
+        // Reading does not dequeue: only a rescan that covered them does
+        assert_eq!(cache.get_addresses_pending_rescan().unwrap(), pending);
 
-        // A failed rescan hands them back, once
-        cache
-            .requeue_addresses_pending_rescan(pending.clone())
-            .unwrap();
-        cache
-            .requeue_addresses_pending_rescan(pending.clone())
-            .unwrap();
-        assert_eq!(cache.take_addresses_pending_rescan().unwrap(), pending);
+        // Derived while that rescan ran: not covered by it, so still queued after the ack
+        pay(&cache, &script_at(DESC_A, 185));
+        cache.ack_addresses_rescanned(&pending).unwrap();
+        let rest = cache.get_addresses_pending_rescan().unwrap();
+        assert_eq!(rest.len(), DERIVATION_COUNT as usize);
+        assert!(rest.contains(&script_at(DESC_A, 200)));
+        assert!(!rest.contains(&script_at(DESC_A, 150)));
     }
 
     #[test]
@@ -1576,14 +1577,20 @@ mod test {
         }
 
         let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
-        let pending = cache.take_addresses_pending_rescan().unwrap();
+        let pending = cache.get_addresses_pending_rescan().unwrap();
         assert_eq!(pending.len(), DERIVATION_COUNT as usize);
         assert!(pending.contains(&script_at(DESC_A, 150)));
         drop(cache);
 
-        // Taken is taken, also across a restart
+        // Read but never acknowledged (the app was killed during the rescan): still there
         let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
-        assert!(cache.take_addresses_pending_rescan().unwrap().is_empty());
+        assert_eq!(cache.get_addresses_pending_rescan().unwrap(), pending);
+        cache.ack_addresses_rescanned(&pending).unwrap();
+        drop(cache);
+
+        // Acknowledged is gone, also across a restart
+        let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
+        assert!(cache.get_addresses_pending_rescan().unwrap().is_empty());
         drop(cache);
         std::fs::remove_dir_all(&datadir).unwrap();
     }
@@ -1607,7 +1614,7 @@ mod test {
 
         let cache = AddressCache::new(KvDatabase::new(&datadir).unwrap(), ConsensusMerkle);
         assert_eq!(derivation_index(&cache), 2 * DERIVATION_COUNT);
-        let pending = cache.take_addresses_pending_rescan().unwrap();
+        let pending = cache.get_addresses_pending_rescan().unwrap();
         assert_eq!(pending.len(), DERIVATION_COUNT as usize);
         assert!(pending.contains(&script_at(DESC_A, 100)));
         drop(cache);
@@ -1631,7 +1638,7 @@ mod test {
         assert_eq!(cache.get_address_history(&hash).unwrap(), Some(Vec::new()));
 
         // The follow-up rescan over the queued addresses matches the early block again
-        let pending = cache.take_addresses_pending_rescan().unwrap();
+        let pending = cache.get_addresses_pending_rescan().unwrap();
         assert!(pending.contains(&script_at(DESC_A, 150)));
         assert_eq!(cache.block_process(&early, 1).unwrap().len(), 1);
 
@@ -1639,6 +1646,58 @@ mod test {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].hash, early.txdata[0].compute_txid());
         assert_eq!(cache.get_address_balance(&hash).unwrap(), Some(5_000));
+    }
+
+    #[test]
+    fn test_rescan_pass_reprocessing_in_order_keeps_spent_coins_spent() {
+        let cache = get_test_cache();
+        cache.push_descriptor(DESC_A).unwrap();
+        let old = script_at(DESC_A, 5);
+        let old_hash = get_spk_hash(&old);
+        let new = script_at(DESC_A, 150);
+        let new_hash = get_spk_hash(&new);
+
+        // b1 pays an old address and one past the horizon, b2 spends the old coin
+        let mut b1 = block_paying(&old, 7_000, None);
+        b1.txdata[0].output.push(TxOut {
+            value: Amount::from_sat(3_000),
+            script_pubkey: new.clone(),
+        });
+        let b1_txid = b1.txdata[0].compute_txid();
+        let b2 = block_paying(
+            &script_at(DESC_B, 0),
+            6_000,
+            Some(OutPoint {
+                txid: b1_txid,
+                vout: 0,
+            }),
+        );
+        cache.block_process(&b1, 1).unwrap();
+        cache.block_process(&b2, 2).unwrap();
+        assert_eq!(cache.get_address_balance(&old_hash).unwrap(), Some(0));
+
+        // A payment near the horizon derives the batch holding index 150
+        pay(&cache, &script_at(DESC_A, 85));
+        assert!(cache.get_addresses_pending_rescan().unwrap().contains(&new));
+
+        // The extra pass scans every wallet address, so it matches b2 as well as b1 and
+        // replays them in order: the old coin is credited and spent again, not resurrected
+        cache.block_process(&b1, 1).unwrap();
+        cache.block_process(&b2, 2).unwrap();
+
+        assert_eq!(cache.get_address_balance(&old_hash).unwrap(), Some(0));
+        assert!(
+            cache
+                .get_address_utxos(&old_hash)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(cache.get_address_balance(&new_hash).unwrap(), Some(3_000));
+        assert_eq!(
+            cache.get_address_history(&old_hash).unwrap().unwrap().len(),
+            2
+        );
     }
 
     #[test]
