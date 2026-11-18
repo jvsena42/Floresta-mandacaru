@@ -76,12 +76,30 @@ pub fn init_logging(
             .with_filter(log_filter.clone())
     });
 
-    // Build the registry and attach layers to it.
+    // Build the registry and attach layers to it. An embedder (the FFI) can start
+    // the node more than once in a process; the first subscriber stays in place,
+    // and a second one is an error to report, not a reason to abort the process.
     tracing_subscriber::registry()
         .with(base_filter)
         .with(fmt_layer_stdout)
         .with(fmt_layer_logfile)
-        .init();
+        .try_init()
+        .map_err(io::Error::other)?;
 
     Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::init_logging;
+
+    #[test]
+    fn a_second_init_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+
+        // The first call may already fail if another test in this binary set a subscriber.
+        let _first = init_logging(data_dir, false, false, false);
+        assert!(init_logging(data_dir, false, false, false).is_err());
+    }
 }
