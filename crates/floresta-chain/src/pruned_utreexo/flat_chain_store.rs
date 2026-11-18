@@ -101,8 +101,12 @@ use floresta_common::impl_error_from;
 use floresta_common::prelude::*;
 use index_impl::Index;
 use lru::LruCache;
+#[cfg(unix)]
+use memmap2::Advice;
 use memmap2::MmapMut;
 use memmap2::MmapOptions;
+#[cfg(unix)]
+use memmap2::UncheckedAdvice;
 use tracing::debug;
 use tracing::info;
 use twox_hash::XxHash3_64;
@@ -120,7 +124,17 @@ use crate::DiskBlockHeader;
 const FLAT_CHAINSTORE_MAGIC: u32 = 0x74_73_6C_66; // "flst" backwards
 
 /// The version of our flat chain store
-const FLAT_CHAINSTORE_VERSION: u32 = 1;
+///
+/// Version 2 checksums only the part of the headers file that holds headers (everything up to
+/// the best block). Version 1 hashed the whole mapping, all 2 GiB of it with the default size,
+/// on every flush: that walked every page of a sparse file into memory, which on Android grew
+/// the process to the low-memory killer's threshold, and took seconds per block on a phone.
+/// The layout of the files is the same, so a version 1 store is checked once its old way and
+/// then written as version 2 by its next flush.
+const FLAT_CHAINSTORE_VERSION: u32 = 2;
+
+/// The last version whose checksum covered whole mappings
+const FLAT_CHAINSTORE_VERSION_FULL_CHECKSUM: u32 = 1;
 
 /// We use a LRU cache to keep the last n blocks we've touched, so we don't need to do a map search
 /// again. This is the type of our cache
@@ -835,8 +849,8 @@ impl FlatChainStore {
     ///
     /// [xxHash]: https://github.com/Cyan4973/xxHash
     fn check_integrity(&self) -> Result<(), FlatChainstoreError> {
-        let computed_checksum = self.compute_checksum();
         let metadata = unsafe { self.get_metadata()? };
+        let computed_checksum = self.compute_checksum_for(metadata.version)?;
 
         if metadata.checksum != computed_checksum {
             return Err(FlatChainstoreError::CorruptedDatabase);
@@ -845,25 +859,60 @@ impl FlatChainStore {
         Ok(())
     }
 
-    /// Computes the XXH3-64 checksum for our database
-    pub fn compute_checksum(&self) -> DbCheckSum {
-        // a function that computes the xxHash of a memory map
-        let checksum_fn = |mmap: &MmapMut| {
-            let mmap_as_slice = mmap.iter().as_slice();
-            let hash = XxHash3_64::oneshot(mmap_as_slice);
+    /// How many bytes at the start of the headers file hold headers: the main chain runs from
+    /// genesis to the best block, one slot per height, and nothing past the best block is
+    /// consulted again.
+    fn headers_bytes_in_use(&self) -> Result<usize, FlatChainstoreError> {
+        let metadata = unsafe { self.get_metadata()? };
+        let headers = (metadata.depth as usize)
+            .saturating_add(1)
+            .min(metadata.headers_file_size);
 
-            FileChecksum(hash)
+        Ok(headers * size_of::<HashedDiskHeader>())
+    }
+
+    /// Computes the XXH3-64 checksum for our database
+    pub fn compute_checksum(&self) -> Result<DbCheckSum, FlatChainstoreError> {
+        self.compute_checksum_for(FLAT_CHAINSTORE_VERSION)
+    }
+
+    /// Computes the XXH3-64 checksum for our database, as a store of `version` records it
+    fn compute_checksum_for(&self, version: u32) -> Result<DbCheckSum, FlatChainstoreError> {
+        // a function that computes the xxHash of a memory map
+        let checksum_fn = |bytes: &[u8]| FileChecksum(XxHash3_64::oneshot(bytes));
+
+        // Only the headers file is large enough for its unused part to matter: the index is
+        // hashed whole because it is addressed by block hash, the forks file is small.
+        let whole_file = version <= FLAT_CHAINSTORE_VERSION_FULL_CHECKSUM;
+        let headers_in_use = if whole_file {
+            self.headers.len()
+        } else {
+            self.headers_bytes_in_use()?.min(self.headers.len())
         };
 
-        let headers_checksum = checksum_fn(&self.headers);
+        // The one walk over the whole (mostly empty) mapping an old store still gets: tell the
+        // kernel it is a sweep, and give its pages back right after. Best effort, and only
+        // hints: the data stays in the file and its page cache.
+        #[cfg(unix)]
+        if whole_file {
+            let _ = self.headers.advise(Advice::Sequential);
+        }
+        let headers_checksum = checksum_fn(&self.headers[..headers_in_use]);
+        #[cfg(unix)]
+        if whole_file {
+            // SAFETY: a shared file mapping keeps its contents in the file and the page
+            // cache; dropping the pages from this process only makes the next access fault
+            // them back in. No reference into the mapping outlives the checksum above.
+            let _ = unsafe { self.headers.unchecked_advise(UncheckedAdvice::DontNeed) };
+        }
         let index_checksum = checksum_fn(&self.block_index.index_map);
         let fork_headers_checksum = checksum_fn(&self.fork_headers);
 
-        DbCheckSum {
+        Ok(DbCheckSum {
             headers_checksum,
             index_checksum,
             fork_headers_checksum,
-        }
+        })
     }
 
     /// Truncates a number to the nearest power of 2
@@ -1150,6 +1199,10 @@ impl FlatChainStore {
         Ok(())
     }
 
+    /// Writes everything out and records the checksum. The checksum covers the headers up to
+    /// the best block recorded in the metadata, so [`Self::do_save_height`] (through
+    /// `save_height`) has to have run first for headers accepted since the last flush to be
+    /// covered.
     unsafe fn do_flush(&mut self) -> Result<(), FlatChainstoreError> {
         self.headers.flush()?;
         self.block_index.flush()?;
@@ -1160,9 +1213,12 @@ impl FlatChainStore {
         // acc_pos entries point past the durable end of accumulators.bin.
         self.accumulator_file.sync_data()?;
 
-        let checksum = self.compute_checksum();
+        // A store written by an older version is brought to the current one here: the files
+        // are laid out the same, only what the checksum covers changed.
+        let checksum = self.compute_checksum()?;
         let metadata = unsafe { self.get_metadata_mut() }?;
 
+        metadata.version = FLAT_CHAINSTORE_VERSION;
         metadata.checksum = checksum;
         self.metadata.flush()?;
 
@@ -1409,7 +1465,9 @@ pub mod migrate_v0_to_v1 {
         fn from(value: MetadataV0) -> Self {
             Self {
                 magic: value.magic,
-                version: FLAT_CHAINSTORE_VERSION, // bump version
+                // The v0 checksum covered whole files; the next flush brings it to the current
+                // version along with the new checksum
+                version: FLAT_CHAINSTORE_VERSION_FULL_CHECKSUM,
                 best_block: value.best_block,
                 depth: value.depth,
                 validation_index: value.validation_index,
@@ -1497,6 +1555,7 @@ mod tests {
 
     use super::FLAT_CHAINSTORE_MAGIC;
     use super::FLAT_CHAINSTORE_VERSION;
+    use super::FLAT_CHAINSTORE_VERSION_FULL_CHECKSUM;
     use super::FlatChainStore;
     use super::FlatChainStoreConfig;
     use super::FlatChainstoreError;
@@ -1575,11 +1634,13 @@ mod tests {
             let store_id = rand::random();
             let mut store = get_test_chainstore(Some(store_id)).unwrap();
 
+            // A flush writes the current version, so the tweak goes in after it
+            store.flush().unwrap();
             let metadata = unsafe { store.get_metadata_mut().unwrap() };
             metadata.version = version;
             metadata.magic = magic;
+            store.metadata.flush().unwrap();
 
-            store.flush().unwrap();
             store_id
         }
 
@@ -1647,7 +1708,7 @@ mod tests {
 
         let expected = Metadata {
             magic: FLAT_CHAINSTORE_MAGIC,
-            version: FLAT_CHAINSTORE_VERSION,
+            version: FLAT_CHAINSTORE_VERSION_FULL_CHECKSUM,
             best_block: bhash!("000000004f74d42205b9d7ae1cb5c1591e723894a71358fce73b7e0919628161"),
             depth: 10_236,
             validation_index: bhash!(
@@ -1848,6 +1909,113 @@ mod tests {
             initial + header_size,
             "size should grow by exactly one HashedDiskHeader when depth increments",
         );
+    }
+
+    /// Fills a small store with the regtest headers and records them as the best chain.
+    fn store_with_regtest_headers() -> FlatChainStore {
+        let mut store = get_test_chainstore(None).unwrap();
+        let blocks = include_str!("../../testdata/regtest_blocks.txt");
+        let mut tip = None;
+
+        for (i, line) in blocks.lines().enumerate() {
+            let block: Block = deserialize(&hex::decode(line).unwrap()).unwrap();
+            store
+                .save_header(&DiskBlockHeader::FullyValid(block.header, i as u32))
+                .unwrap();
+            store
+                .update_block_index(i as u32, block.block_hash())
+                .unwrap();
+            tip = Some((i as u32, block.block_hash()));
+        }
+
+        let (depth, best_block) = tip.unwrap();
+        store
+            .save_height(&BestChain {
+                best_block,
+                depth,
+                validation_index: best_block,
+                alternative_tips: Vec::new(),
+            })
+            .unwrap();
+        store.flush().unwrap();
+        store
+    }
+
+    #[test]
+    fn checksum_covers_the_headers_in_use_only() {
+        let mut store = store_with_regtest_headers();
+        store.check_integrity().unwrap();
+
+        let in_use = store.headers_bytes_in_use().unwrap();
+        assert!(in_use < store.headers.len());
+        assert_eq!(
+            unsafe { store.get_metadata().unwrap() }.version,
+            FLAT_CHAINSTORE_VERSION
+        );
+
+        // A stray byte past the best block is not something the store relies on
+        store.headers[in_use] ^= 0xff;
+        store.headers[in_use + 4096] ^= 0xff;
+        store.check_integrity().unwrap();
+
+        // The last byte of the best block's slot, or any byte before it, is
+        for offset in [in_use - 1, in_use / 2] {
+            store.headers[offset] ^= 0xff;
+            assert!(matches!(
+                store.check_integrity(),
+                Err(FlatChainstoreError::CorruptedDatabase)
+            ));
+            store.headers[offset] ^= 0xff;
+            store.check_integrity().unwrap();
+        }
+
+        // Headers the best chain grows into are covered from the next flush on
+        store.headers[in_use] ^= 0xff;
+        let depth = unsafe { store.get_metadata().unwrap() }.depth;
+        let best_block = store.get_block_hash(depth).unwrap().unwrap();
+        store
+            .save_height(&BestChain {
+                best_block,
+                depth: depth + 1,
+                validation_index: best_block,
+                alternative_tips: Vec::new(),
+            })
+            .unwrap();
+        store.flush().unwrap();
+        store.check_integrity().unwrap();
+        store.headers[in_use + 1] ^= 0xff;
+        assert!(matches!(
+            store.check_integrity(),
+            Err(FlatChainstoreError::CorruptedDatabase)
+        ));
+    }
+
+    #[test]
+    fn a_version_one_store_is_checked_its_old_way_then_upgraded() {
+        let mut store = store_with_regtest_headers();
+
+        // What a store written by the previous version looks like: whole files hashed
+        let old_checksum = store
+            .compute_checksum_for(FLAT_CHAINSTORE_VERSION_FULL_CHECKSUM)
+            .unwrap();
+        let new_checksum = store.compute_checksum().unwrap();
+        assert_ne!(old_checksum, new_checksum);
+        {
+            let metadata = unsafe { store.get_metadata_mut().unwrap() };
+            metadata.version = FLAT_CHAINSTORE_VERSION_FULL_CHECKSUM;
+            metadata.checksum = old_checksum;
+        }
+        store.metadata.flush().unwrap();
+
+        // Verified the way it was written, so no false corruption on upgrade
+        store.check_integrity().unwrap();
+
+        // The next flush moves it to the current version and checksum
+        store.flush().unwrap();
+        let metadata = unsafe { store.get_metadata().unwrap() };
+        assert_eq!(metadata.version, FLAT_CHAINSTORE_VERSION);
+        assert_eq!(metadata.checksum, new_checksum);
+        store.check_integrity().unwrap();
     }
 
     #[test]
