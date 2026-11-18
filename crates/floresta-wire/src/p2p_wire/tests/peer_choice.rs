@@ -28,6 +28,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use crate::address_man::AddressMan;
+    use crate::block_proof::UtreexoProof;
     use crate::node::ConnectionKind;
     use crate::node::InflightRequests;
     use crate::node::LocalPeerView;
@@ -41,6 +42,7 @@ mod tests {
     use crate::p2p_wire::peer::PeerMessages;
     use crate::p2p_wire::peer::Version;
     use crate::p2p_wire::tests::utils::get_node_config;
+    use crate::p2p_wire::tests::utils::signet_blocks;
     use crate::p2p_wire::tests::utils::signet_headers;
     use crate::p2p_wire::transport::TransportProtocol;
 
@@ -325,5 +327,60 @@ mod tests {
             silent > other,
             "after a timeout the silent peer ({silent} ms) must rank below a slow one ({other} ms)"
         );
+    }
+
+    #[tokio::test]
+    async fn every_announcer_of_a_requested_block_is_credited() {
+        let datadir = format!("./tmp-db/{}.running_node", rand::random::<u32>());
+        let mut node: UtreexoNode<TestChain, RunningNode> = idle_node(&datadir);
+        let headers = signet_headers();
+        for header in &headers[1..=4] {
+            node.chain.accept_header(*header).unwrap();
+        }
+        let block = headers[4].block_hash();
+        let _first = add_peer(&mut node, 1, 4, 10.0);
+        let _second = add_peer(&mut node, 2, 0, 10.0);
+        let _third = add_peer(&mut node, 3, 0, 10.0);
+
+        // The block is already on its way from the first announcer
+        node.inflight
+            .insert(InflightRequests::Blocks(block), (1, Instant::now()));
+
+        deliver(&mut node, 2, PeerMessages::NewBlock(block)).await;
+        assert_eq!(node.peers[&2].height, 4, "a later inv announcer has it too");
+
+        deliver(&mut node, 3, PeerMessages::Headers(vec![headers[4]])).await;
+        assert_eq!(
+            node.peers[&3].height, 4,
+            "a later headers announcer has it too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proof_server_is_credited_with_the_block_height() {
+        let datadir = format!("./tmp-db/{}.peer_choice", rand::random::<u32>());
+        let mut node: TestNode = idle_node(&datadir);
+        let headers = signet_headers();
+        for header in &headers[1..=3] {
+            node.chain.accept_header(*header).unwrap();
+        }
+        let hash = headers[3].block_hash();
+        let block = signet_blocks().remove(&hash).unwrap();
+        let _block_peer = add_peer(&mut node, 1, 3, 10.0);
+        let _proof_peer = add_peer(&mut node, 2, 0, 10.0);
+
+        node.request_block_proof(block, 1).unwrap();
+        node.attach_proof(
+            UtreexoProof {
+                block_hash: hash,
+                proof_hashes: Vec::new(),
+                targets: Vec::new(),
+                leaf_data: Vec::new(),
+            },
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(node.peers[&2].height, 3);
     }
 }

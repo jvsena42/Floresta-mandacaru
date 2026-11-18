@@ -195,6 +195,14 @@ where
         self.inflight
             .remove(&InflightRequests::UtreexoProof(uproof.block_hash));
 
+        // A proof for a block we are waiting on: the peer has that block, whatever its
+        // handshake said.
+        if self.blocks.contains_key(&uproof.block_hash) {
+            if let Some(height) = self.known_height(&uproof.block_hash) {
+                self.note_peer_height(peer, height);
+            }
+        }
+
         let Some(block) = self.blocks.get_mut(&uproof.block_hash) else {
             warn!(
                 "Received utreexo proof for block {}, but we don't have it",

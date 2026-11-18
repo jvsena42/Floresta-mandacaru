@@ -714,6 +714,11 @@ where
                             }
                         }
 
+                        // A known block: the peer has it, whatever its handshake said
+                        if let Some(height) = self.known_height(&block) {
+                            self.note_peer_height(peer, height);
+                        }
+
                         // Don't request a block twice
                         let already_requested =
                             self.inflight.contains_key(&InflightRequests::Blocks(block))
@@ -723,10 +728,6 @@ where
                         }
 
                         if self.chain.get_block_header(&block).is_ok() {
-                            // A known block: the peer has it, whatever its handshake said
-                            if let Some(height) = self.known_height(&block) {
-                                self.note_peer_height(peer, height);
-                            }
                             return Ok(());
                         }
 
@@ -791,6 +792,11 @@ where
 
                         for header in headers.iter() {
                             let block_hash = header.block_hash();
+
+                            // A header we already know: the peer has that block too
+                            if let Some(height) = self.known_height(&block_hash) {
+                                self.note_peer_height(peer, height);
+                            }
 
                             // Don't request a block twice
                             let already_requested = self
@@ -861,7 +867,11 @@ where
                                 ])
                             });
                             if !serves_blocks {
-                                self.request_blocks(vec![block_hash])?;
+                                // Without a block-serving peer, the next maintenance tick's
+                                // `ask_missed_block` retries; keep accepting the other headers.
+                                if let Err(error) = self.request_blocks(vec![block_hash]) {
+                                    debug!("Could not request block {block_hash}: {error:?}");
+                                }
                                 continue;
                             }
 
