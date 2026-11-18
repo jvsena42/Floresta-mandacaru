@@ -289,7 +289,14 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             // A ticket that is gone took its undelivered matches with it; a failed one hands
             // them out before reporting the failure.
             let ticket_lost = matches!(error, FilterManError::RescanNotFound(_));
+            let range_end = last_progress.map(|progress| progress.end_height);
             match resume_height(last_progress, last_delivered, ticket_lost) {
+                // Everything up to the end of the range was delivered before the ticket went
+                // away: the scan is done, and asking for a range past its end would fail.
+                Some(resume) if range_end.is_some_and(|end| resume > end) => {
+                    info!("rescan complete: processed {processed} matched block(s)");
+                    return Ok(());
+                }
                 Some(resume) => {
                     request.start_height = Some(resume);
                     warn!(%error, ?delay, resume, "wallet rescan interrupted; resuming");
