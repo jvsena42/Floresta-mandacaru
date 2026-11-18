@@ -59,6 +59,9 @@ pub struct AddedPeerInfo {
 
     /// Don't dial again before this instant
     pub(crate) retry_after: Option<Instant>,
+
+    /// When we last dialed this peer, to measure how long the session lasted
+    pub(crate) dialed_at: Option<Instant>,
 }
 
 impl AddedPeerInfo {
@@ -73,6 +76,7 @@ impl AddedPeerInfo {
             v1_fallback,
             failed_attempts: 0,
             retry_after: None,
+            dialed_at: None,
         }
     }
 
@@ -89,13 +93,20 @@ impl AddedPeerInfo {
             .saturating_mul(1 << self.failed_attempts.min(6))
             .min(Self::MAX_RETRY);
         self.retry_after = Some(now + wait);
+        self.dialed_at = Some(now);
         self.failed_attempts = self.failed_attempts.saturating_add(1);
     }
 
-    /// A session lasted: the peer is reachable, the next drop is dialed right away again
-    pub(crate) fn note_stable_session(&mut self) {
-        self.failed_attempts = 0;
-        self.retry_after = None;
+    /// Records the end of a session. One that lasted means the peer is reachable, so the next
+    /// drop is dialed right away again.
+    pub(crate) fn note_session_end(&mut self, now: Instant) {
+        let lasted = self
+            .dialed_at
+            .is_some_and(|dialed_at| now.saturating_duration_since(dialed_at) >= Self::STABLE_SESSION);
+        if lasted {
+            self.failed_attempts = 0;
+            self.retry_after = None;
+        }
     }
 }
 
@@ -830,17 +841,14 @@ where
                 info!("Peer disconnected: {peer}");
             }
 
-            if p.is_manual_peer()
-                && p.state == PeerStatus::Ready
-                && p._last_message.elapsed() >= AddedPeerInfo::STABLE_SESSION
-            {
+            if p.kind.is_manual() && p.state == PeerStatus::Ready {
                 let address = p.address.as_bitcoin_socket_addr();
                 if let Some(added) = self
                     .added_peers
                     .iter_mut()
                     .find(|added| added.address == *address)
                 {
-                    added.note_stable_session();
+                    added.note_session_end(Instant::now());
                 }
             }
 
@@ -1506,17 +1514,16 @@ mod added_peer_tests {
             let retry_after = added.retry_after.unwrap();
             assert!(!added.due(start));
             assert!(added.due(retry_after));
-            waits.push(retry_after - start);
+            waits.push((retry_after - start).as_secs());
         }
-        // 10 s, 20 s, 40 s, ... capped at ten minutes
-        assert_eq!(waits[0], Duration::from_secs(10));
-        assert_eq!(waits[1], Duration::from_secs(20));
-        assert_eq!(waits[2], Duration::from_secs(40));
-        assert!(waits.windows(2).all(|pair| pair[1] >= pair[0]));
-        assert_eq!(*waits.last().unwrap(), Duration::from_secs(10 * 60));
+        assert_eq!(waits, [10, 20, 40, 80, 160, 320, 600, 600]);
+
+        // A session that ended quickly keeps the backoff
+        added.note_session_end(start + Duration::from_secs(5));
+        assert!(!added.due(start));
 
         // A session that lasted makes it a fresh start
-        added.note_stable_session();
+        added.note_session_end(start + AddedPeerInfo::STABLE_SESSION);
         assert!(added.due(start));
         added.note_attempt(start);
         assert_eq!(added.retry_after.unwrap() - start, Duration::from_secs(10));
