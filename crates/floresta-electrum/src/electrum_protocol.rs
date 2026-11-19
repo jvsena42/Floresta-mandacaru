@@ -999,8 +999,14 @@ impl<Blockchain: BlockchainInterface + Send + Sync + 'static> ElectrumServer<Blo
         &self,
         transactions: &[(Transaction, TxOut)],
     ) -> Result<(), crate::error::Error> {
+        // A script touched more than once in a block (spent from and paid, or paid twice)
+        // gets one notification: its status already covers the whole block.
+        let mut notified = HashSet::new();
         for (_, out) in transactions {
             let hash = get_spk_hash(&out.script_pubkey);
+            if !notified.insert(hash) {
+                continue;
+            }
             if let Some(client) = self.client_addresses.get(&hash) {
                 let history = self
                     .address_cache
