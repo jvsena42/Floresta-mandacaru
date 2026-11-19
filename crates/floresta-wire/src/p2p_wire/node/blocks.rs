@@ -127,8 +127,15 @@ where
             return Ok(());
         }
 
-        let block_req = NodeRequest::GetBlock(blocks.clone(), self.witness_mode);
-        let peer = self.send_to_fast_peer(block_req, ServiceFlags::NETWORK)?;
+        let height = blocks
+            .iter()
+            .filter_map(|hash| self.known_height(hash))
+            .max();
+        let peer = self.send_to_fast_peer_at_height(
+            NodeRequest::GetBlock(blocks.clone(), self.witness_mode),
+            ServiceFlags::NETWORK,
+            height,
+        )?;
 
         for block in blocks.iter() {
             self.inflight
@@ -154,14 +161,20 @@ where
         let txdata_len = block.txdata.len();
         debug!("Received block {block_hash} from peer {peer}, with {txdata_len} txs");
 
+        let height = self.known_height(&block_hash);
+        if let Some(height) = height {
+            self.note_peer_height(peer, height);
+        }
+
         self.blocks
             .insert(block_hash, InflightBlock::new(Arc::new(block), peer));
 
         // We only need auxiliary utreexo data if there are non-coinbase transactions
         if txdata_len != 1 {
-            let utreexo_peer = self.send_to_fast_peer(
+            let utreexo_peer = self.send_to_fast_peer_at_height(
                 NodeRequest::GetBlockProof((block_hash, Bitmap::new(), Bitmap::new())),
                 service_flags::UTREEXO.into(),
+                height,
             )?;
 
             self.inflight.insert(
@@ -181,6 +194,14 @@ where
         debug!("Received utreexo proof for block {}", uproof.block_hash);
         self.inflight
             .remove(&InflightRequests::UtreexoProof(uproof.block_hash));
+
+        // A proof for a block we are waiting on: the peer has that block, whatever its
+        // handshake said.
+        if self.blocks.contains_key(&uproof.block_hash) {
+            if let Some(height) = self.known_height(&uproof.block_hash) {
+                self.note_peer_height(peer, height);
+            }
+        }
 
         let Some(block) = self.blocks.get_mut(&uproof.block_hash) else {
             warn!(
@@ -232,9 +253,10 @@ where
             .collect::<Vec<_>>();
 
         for block_hash in pending_blocks {
-            let peer = self.send_to_fast_peer(
+            let peer = self.send_to_fast_peer_at_height(
                 NodeRequest::GetBlockProof((block_hash, Bitmap::new(), Bitmap::new())),
                 service_flags::UTREEXO.into(),
+                self.known_height(&block_hash),
             )?;
 
             self.inflight.insert(
