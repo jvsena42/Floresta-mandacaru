@@ -18,6 +18,7 @@ use floresta_compact_filters::filters_man::FilterManHandle;
 use floresta_compact_filters::filters_man::RescanProgress;
 use floresta_compact_filters::filters_man::RescanRequest;
 use floresta_compact_filters::filters_man::RescanStatus;
+use floresta_compact_filters::filters_man::RescanTicket;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::kv_database::KvDatabase;
 use serde_json::Value;
@@ -171,12 +172,46 @@ impl Drop for RescanTracker {
     }
 }
 
+/// Where a rescan that stopped after `progress` picks up again, or `None` to start over.
+///
+/// Every match below `start + scanned` was pushed to the ticket's queue. A failed ticket
+/// hands the queue out before reporting the failure, so that is the exact resume point.
+/// A lost ticket dropped its queue: nothing past the last block delivered is certain.
+fn resume_height(
+    progress: Option<RescanProgress>,
+    last_delivered: Option<u32>,
+    ticket_lost: bool,
+) -> Option<u32> {
+    let progress = progress?;
+    let scanned_to = progress
+        .start_height
+        .saturating_add(progress.scanned)
+        .max(progress.start_height);
+    if !ticket_lost {
+        return Some(scanned_to);
+    }
+    Some(match last_delivered {
+        Some(height) => scanned_to
+            .min(height.saturating_add(1))
+            .max(progress.start_height),
+        None => progress.start_height,
+    })
+}
+
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     const FILTER_SYNC_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+    /// How many times in a row a background rescan is resumed after a failure before giving
+    /// up. Progress resets the count.
+    const RESCAN_MAX_ATTEMPTS: u32 = 20;
+    const RESCAN_RETRY_BASE_DELAY: Duration = Duration::from_secs(15);
+    const RESCAN_RETRY_MAX_DELAY: Duration = Duration::from_secs(10 * 60);
+
     /// Scans `[start_height, stop_height]` for `addresses` and feeds every
     /// matched block to the wallet. `tracker`, when given, is kept up to date so
-    /// `getblockchaininfo` can report how far the scan has gone.
+    /// `getblockchaininfo` can report how far the scan has gone, and the scan
+    /// resumes after a transient failure instead of giving up: the ticket is lost
+    /// when the device sleeps long enough, the network comes and goes.
     pub(super) async fn rescan_with_block_filters(
         addresses: Vec<ScriptBuf>,
         chain: Blockchain,
@@ -186,34 +221,120 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         stop_height: Option<u32>,
         tracker: Option<&RescanTracker>,
     ) -> Result<()> {
-        let request = RescanRequest::new(addresses).with_range(start_height, stop_height);
-        let ticket = loop {
-            match filters.rescan(request.clone()).await {
-                Ok(ticket) => break ticket,
-                // A background rescan asked for during the filter-header sync waits for it,
-                // still reported as in progress. Failing would only show up in the logs and
-                // the client would take the wallet for scanned.
-                Err(FilterManError::FiltersNotSynced { .. }) if tracker.is_some() => {
-                    tokio::time::sleep(Self::FILTER_SYNC_POLL_INTERVAL).await;
-                }
-                Err(error) => return Err(JsonRpcError::Filters(error.to_string())),
-            }
-        };
+        let mut request = RescanRequest::new(addresses).with_range(start_height, stop_height);
         let mut processed: u32 = 0;
+        let mut attempts: u32 = 0;
+        // The range as first reported, so a resumed scan keeps reporting against it
+        let mut original_start: Option<u32> = None;
+        let mut furthest_scanned: u32 = 0;
 
         loop {
-            for block in filters
-                .get_blocks(ticket)
-                .await
-                .map_err(|error| JsonRpcError::Filters(error.to_string()))?
-            {
+            let ticket = loop {
+                match filters.rescan(request.clone()).await {
+                    Ok(ticket) => break ticket,
+                    // A background rescan asked for during the filter-header sync waits for it,
+                    // still reported as in progress. Failing would only show up in the logs and
+                    // the client would take the wallet for scanned.
+                    Err(FilterManError::FiltersNotSynced { .. }) if tracker.is_some() => {
+                        tokio::time::sleep(Self::FILTER_SYNC_POLL_INTERVAL).await;
+                    }
+                    Err(error) => return Err(JsonRpcError::Filters(error.to_string())),
+                }
+            };
+
+            let mut last_progress: Option<RescanProgress> = None;
+            let mut last_delivered: Option<u32> = None;
+            // A wallet error ends the rescan (`?`); a filter error may be resumed below
+            let outcome = Self::drain_rescan(
+                &chain,
+                &wallet,
+                &filters,
+                ticket,
+                tracker,
+                &mut processed,
+                &mut original_start,
+                &mut last_progress,
+                &mut last_delivered,
+            )
+            .await?;
+
+            let error = match outcome {
+                Ok(()) => {
+                    info!("rescan complete: processed {processed} matched block(s)");
+                    return Ok(());
+                }
+                Err(error) if tracker.is_none() => {
+                    return Err(JsonRpcError::Filters(error.to_string()));
+                }
+                Err(error) => error,
+            };
+
+            // Getting further than last time earns a fresh set of attempts
+            if let Some(progress) = &last_progress {
+                let scanned_to = progress.start_height.saturating_add(progress.scanned);
+                if scanned_to > furthest_scanned {
+                    furthest_scanned = scanned_to;
+                    attempts = 0;
+                }
+            }
+            if attempts >= Self::RESCAN_MAX_ATTEMPTS {
+                return Err(JsonRpcError::Filters(error.to_string()));
+            }
+
+            let delay = Self::RESCAN_RETRY_BASE_DELAY
+                .saturating_mul(1 << attempts.min(16))
+                .min(Self::RESCAN_RETRY_MAX_DELAY);
+            attempts += 1;
+
+            // A ticket that is gone took its undelivered matches with it; a failed one hands
+            // them out before reporting the failure.
+            let ticket_lost = matches!(error, FilterManError::RescanNotFound(_));
+            let range_end = last_progress.map(|progress| progress.end_height);
+            match resume_height(last_progress, last_delivered, ticket_lost) {
+                // Everything up to the end of the range was delivered before the ticket went
+                // away: the scan is done, and asking for a range past its end would fail.
+                Some(resume) if range_end.is_some_and(|end| resume > end) => {
+                    info!("rescan complete: processed {processed} matched block(s)");
+                    return Ok(());
+                }
+                Some(resume) => {
+                    request.start_height = Some(resume);
+                    warn!(%error, ?delay, resume, "wallet rescan interrupted; resuming");
+                }
+                None => warn!(%error, ?delay, "wallet rescan interrupted; restarting"),
+            }
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// Feeds the wallet every block a rescan ticket delivers until it is finished. The outer
+    /// error is the wallet's and ends the rescan; the inner one is the filter manager's.
+    #[allow(clippy::too_many_arguments)]
+    async fn drain_rescan(
+        chain: &Blockchain,
+        wallet: &AddressCache<KvDatabase>,
+        filters: &FilterManHandle,
+        ticket: RescanTicket,
+        tracker: Option<&RescanTracker>,
+        processed: &mut u32,
+        original_start: &mut Option<u32>,
+        last_progress: &mut Option<RescanProgress>,
+        last_delivered: &mut Option<u32>,
+    ) -> Result<core::result::Result<(), FilterManError>> {
+        loop {
+            let blocks = match filters.get_blocks(ticket).await {
+                Ok(blocks) => blocks,
+                Err(error) => return Ok(Err(error)),
+            };
+            for block in blocks {
                 // A matched block should always have a height; a miss means a
                 // chain-store error or a reorg evicted it while we scanned.
                 // Skip it rather than abandoning the rest of the rescan.
                 match chain.get_block_height(&block.block_hash()) {
                     Ok(Some(height)) => {
                         wallet.block_process(&block, height)?;
-                        processed += 1;
+                        *processed += 1;
+                        *last_delivered = Some(height.max(last_delivered.unwrap_or(0)));
                     }
                     Ok(None) => warn!(
                         "rescan: matched block {} has no height (reorged out?); skipping",
@@ -226,25 +347,26 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 }
             }
 
-            if let Some(tracker) = tracker {
-                if let Ok(progress) = filters.get_progress(ticket).await {
+            if let Ok(mut progress) = filters.get_progress(ticket).await {
+                *last_progress = Some(progress);
+                let start = *original_start.get_or_insert(progress.start_height);
+                if let Some(tracker) = tracker {
+                    // Report against the range the scan was asked for, also when resumed
+                    if progress.start_height > start {
+                        progress.scanned += progress.start_height - start;
+                        progress.start_height = start;
+                    }
                     tracker.report(&progress);
                 }
             }
 
-            match filters
-                .get_info(ticket)
-                .await
-                .map_err(|error| JsonRpcError::Filters(error.to_string()))?
-            {
-                RescanStatus::Finished => {
-                    info!("rescan complete: processed {processed} matched block(s)");
-                    return Ok(());
-                }
-                RescanStatus::Available => continue,
-                RescanStatus::Started | RescanStatus::Waiting => {
+            match filters.get_info(ticket).await {
+                Ok(RescanStatus::Finished) => return Ok(Ok(())),
+                Ok(RescanStatus::Available) => continue,
+                Ok(RescanStatus::Started | RescanStatus::Waiting) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+                Err(error) => return Ok(Err(error)),
             }
         }
     }
@@ -310,5 +432,60 @@ mod tests {
         state.request_followup();
         assert!(state.take_followup());
         assert!(!state.take_followup());
+    }
+}
+
+#[cfg(test)]
+mod resume_height_tests {
+    use floresta_compact_filters::filters_man::RescanProgress;
+
+    use super::resume_height;
+
+    fn progress(start_height: u32, scanned: u32) -> RescanProgress {
+        RescanProgress {
+            start_height,
+            end_height: 1_000,
+            scanned,
+        }
+    }
+
+    #[test]
+    fn no_progress_starts_over() {
+        assert_eq!(resume_height(None, Some(500), true), None);
+        assert_eq!(resume_height(None, None, false), None);
+    }
+
+    #[test]
+    fn a_failed_ticket_resumes_right_after_what_was_scanned() {
+        assert_eq!(
+            resume_height(Some(progress(100, 300)), None, false),
+            Some(400)
+        );
+        assert_eq!(
+            resume_height(Some(progress(100, 300)), Some(250), false),
+            Some(400)
+        );
+        assert_eq!(
+            resume_height(Some(progress(100, 0)), None, false),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn a_lost_ticket_resumes_after_the_last_delivered_block() {
+        assert_eq!(
+            resume_height(Some(progress(100, 300)), Some(250), true),
+            Some(251)
+        );
+        // Nothing delivered yet: everything scanned so far may still have been queued
+        assert_eq!(
+            resume_height(Some(progress(100, 300)), None, true),
+            Some(100)
+        );
+        // Delivered blocks never come from past what was scanned
+        assert_eq!(
+            resume_height(Some(progress(100, 300)), Some(900), true),
+            Some(400)
+        );
     }
 }
