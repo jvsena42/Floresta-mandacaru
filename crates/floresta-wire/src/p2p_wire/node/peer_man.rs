@@ -53,6 +53,66 @@ pub struct AddedPeerInfo {
 
     /// Whether we should allow V1 fallback for this connection
     pub(crate) v1_fallback: bool,
+
+    /// Connection attempts since the last session that lasted; each one waits longer
+    pub(crate) failed_attempts: u32,
+
+    /// Don't dial again before this instant
+    pub(crate) retry_after: Option<Instant>,
+
+    /// When we last dialed this peer, to measure how long the session lasted
+    pub(crate) dialed_at: Option<Instant>,
+}
+
+impl AddedPeerInfo {
+    /// How long a session has to last for the peer to count as reachable again
+    pub(crate) const STABLE_SESSION: Duration = Duration::from_secs(60);
+    const FIRST_RETRY: Duration = Duration::from_secs(10);
+    const MAX_RETRY: Duration = Duration::from_secs(10 * 60);
+
+    pub(crate) fn new(address: BitcoinSocketAddr, v1_fallback: bool) -> Self {
+        Self {
+            address,
+            v1_fallback,
+            failed_attempts: 0,
+            retry_after: None,
+            dialed_at: None,
+        }
+    }
+
+    /// Whether it is time to dial this peer again
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        self.retry_after
+            .is_none_or(|retry_after| now >= retry_after)
+    }
+
+    /// Records a dial. A peer that drops us right after the handshake would otherwise be
+    /// redialed on every maintenance tick, all day, which on a phone is battery and data.
+    /// The first redial after a session ends is not delayed, so a single drop (e.g. a peer
+    /// we disconnected for flooding us) is recovered as quickly as before.
+    pub(crate) fn note_attempt(&mut self, now: Instant) {
+        let wait = match self.failed_attempts {
+            0 => Duration::ZERO,
+            failed => Self::FIRST_RETRY
+                .saturating_mul(1 << (failed - 1).min(6))
+                .min(Self::MAX_RETRY),
+        };
+        self.retry_after = Some(now + wait);
+        self.dialed_at = Some(now);
+        self.failed_attempts = self.failed_attempts.saturating_add(1);
+    }
+
+    /// Records the end of a session. One that lasted means the peer is reachable, so the next
+    /// drop is dialed right away again.
+    pub(crate) fn note_session_end(&mut self, now: Instant) {
+        let lasted = self.dialed_at.is_some_and(|dialed_at| {
+            now.saturating_duration_since(dialed_at) >= Self::STABLE_SESSION
+        });
+        if lasted {
+            self.failed_attempts = 0;
+            self.retry_after = None;
+        }
+    }
 }
 
 impl<T, Chain> UtreexoNode<Chain, T>
@@ -786,6 +846,17 @@ where
                 info!("Peer disconnected: {peer}");
             }
 
+            if p.kind.is_manual() && p.state == PeerStatus::Ready {
+                let address = p.address.as_bitcoin_socket_addr();
+                if let Some(added) = self
+                    .added_peers
+                    .iter_mut()
+                    .find(|added| added.address == *address)
+                {
+                    added.note_session_end(Instant::now());
+                }
+            }
+
             std::mem::drop(p.channel);
 
             let now = SystemTime::now()
@@ -1351,10 +1422,8 @@ where
         self.address_man.push_addresses(&[local_address]);
 
         // Add a simple reference to the peer
-        self.added_peers.push(AddedPeerInfo {
-            address: peer_address,
-            v1_fallback: !v2_transport,
-        });
+        self.added_peers
+            .push(AddedPeerInfo::new(peer_address, !v2_transport));
 
         // Implementation detail for `addnode`: on bitcoin-core, the node doesn't connect immediately
         // after adding a peer, it just adds it to the `added_peers` list. Here we do almost the same,
@@ -1426,5 +1495,44 @@ where
         // Return true if exists or false if anything fails during connection
         // We allow V1 fallback iff the `v2` flag is not set
         self.open_connection(kind, local_address, !v2_transport)
+    }
+}
+
+#[cfg(test)]
+mod added_peer_tests {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use super::AddedPeerInfo;
+    use crate::address_man::LocalAddress;
+
+    #[test]
+    fn an_added_peer_that_keeps_dropping_us_is_redialed_less_and_less_often() {
+        let address = "127.0.0.1:8333".parse::<LocalAddress>().unwrap();
+        let mut added = AddedPeerInfo::new(address.as_bitcoin_socket_addr().clone(), false);
+        let start = Instant::now();
+        assert!(added.due(start));
+
+        let mut waits = Vec::new();
+        for _ in 0..9 {
+            added.note_attempt(start);
+            let retry_after = added.retry_after.unwrap();
+            assert!(added.due(retry_after));
+            waits.push((retry_after - start).as_secs());
+        }
+        // The first redial is immediate, so a single drop costs nothing
+        assert_eq!(waits, [0, 10, 20, 40, 80, 160, 320, 600, 600]);
+
+        // A session that ended quickly keeps the backoff
+        added.note_session_end(start + Duration::from_secs(5));
+        assert!(!added.due(start));
+
+        // A session that lasted makes it a fresh start
+        added.note_session_end(start + AddedPeerInfo::STABLE_SESSION);
+        assert!(added.due(start));
+        added.note_attempt(start);
+        assert!(added.due(start));
+        added.note_attempt(start);
+        assert_eq!(added.retry_after.unwrap() - start, Duration::from_secs(10));
     }
 }
