@@ -235,18 +235,33 @@ class TestRpcAuth:
                 return True
             return False
 
-        with ThreadPoolExecutor(max_workers=AUTH_SLOTS) as pool:
-            abandoned = list(pool.map(abandon, range(AUTH_SLOTS)))
-        assert all(abandoned), "guesses should have been abandoned mid-delay"
+        # The hold is measured against when the guesses were sent, not as a fixed
+        # fraction of the delay: on a loaded runner most of the hold can elapse
+        # before the measuring request goes out, so a fixed bound flakes. A
+        # guess sent at `sent_at` holds its slot until at least
+        # `sent_at + REJECT_DELAY`, so the next caller has to wait out what is
+        # left of that. Freeing the slot on hang-up measured ~0.005s here.
+        for _ in range(3):
+            sent_at = monotonic()
+            with ThreadPoolExecutor(max_workers=AUTH_SLOTS) as pool:
+                abandoned = list(pool.map(abandon, range(AUTH_SLOTS)))
+            assert all(abandoned), "guesses should have been abandoned mid-delay"
 
-        saturated = unsaturated()
+            remaining = sent_at + REJECT_DELAY - monotonic()
+            saturated = unsaturated()
+            if remaining >= REJECT_DELAY / 5:
+                break
+            # Too little of the hold was left to tell a held slot from a freed
+            # one; let the slots drain and try again.
+            unsaturated()
+        else:
+            raise AssertionError(
+                "the runner was too slow to leave any of the hold to measure"
+            )
 
-        # Half the delay, not the whole of it: some of the hold already elapsed
-        # while the guesses were being abandoned. A lower bound cannot flake,
-        # and freeing the slot on hang-up measured ~0.005s here.
-        assert saturated >= REJECT_DELAY / 2, (
+        assert saturated >= remaining - 0.02, (
             f"a correct request should wait for a slot, took {saturated:.3f}s "
-            f"against a {baseline:.3f}s baseline"
+            f"with {remaining:.3f}s of the hold left (baseline {baseline:.3f}s)"
         )
 
     def test_empty_rpc_password_falls_back_to_cookie(self, node_manager):
