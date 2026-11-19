@@ -15,7 +15,7 @@ unit test can check that a slot is held, not that the check needs one.
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from time import monotonic
+from time import monotonic, sleep
 
 from requests import post
 from requests.exceptions import ReadTimeout
@@ -235,18 +235,38 @@ class TestRpcAuth:
                 return True
             return False
 
-        with ThreadPoolExecutor(max_workers=AUTH_SLOTS) as pool:
-            abandoned = list(pool.map(abandon, range(AUTH_SLOTS)))
-        assert all(abandoned), "guesses should have been abandoned mid-delay"
+        # The hold is measured against when the guesses were sent, not as a fixed
+        # fraction of the delay: on a loaded runner most of the hold can elapse
+        # before the measuring request goes out, so a fixed bound flakes. Every
+        # guess takes its slot after `sent_at` and keeps it for REJECT_DELAY even
+        # after we hang up, so a correct request cannot be answered before
+        # `sent_at + REJECT_DELAY`. Freeing the slot on hang-up would answer it
+        # in ~0.005s.
+        for _ in range(3):
+            sent_at = monotonic()
+            with ThreadPoolExecutor(max_workers=AUTH_SLOTS) as pool:
+                abandoned = list(pool.map(abandon, range(AUTH_SLOTS)))
+            assert all(abandoned), "guesses should have been abandoned mid-delay"
 
-        saturated = unsaturated()
+            remaining = sent_at + REJECT_DELAY - monotonic()
+            unsaturated()
+            answered_at = monotonic()
+            if remaining >= REJECT_DELAY / 5:
+                break
+            # Too little of the hold was left to tell a held slot from a freed
+            # one. Let every hold from this round expire before trying again, or
+            # the next round's guesses would queue behind them instead of
+            # taking slots.
+            sleep(2 * REJECT_DELAY)
+        else:
+            raise AssertionError(
+                f"the runner left only {remaining:.3f}s of the hold to measure"
+            )
 
-        # Half the delay, not the whole of it: some of the hold already elapsed
-        # while the guesses were being abandoned. A lower bound cannot flake,
-        # and freeing the slot on hang-up measured ~0.005s here.
-        assert saturated >= REJECT_DELAY / 2, (
-            f"a correct request should wait for a slot, took {saturated:.3f}s "
-            f"against a {baseline:.3f}s baseline"
+        assert answered_at >= sent_at + REJECT_DELAY, (
+            "a correct request should wait for a slot, answered "
+            f"{answered_at - sent_at:.3f}s after the guesses were sent "
+            f"(baseline {baseline:.3f}s)"
         )
 
     def test_empty_rpc_password_falls_back_to_cookie(self, node_manager):
