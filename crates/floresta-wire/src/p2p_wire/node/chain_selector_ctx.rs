@@ -109,6 +109,10 @@ pub struct ChainSelector {
     /// responds to any of our pokes, force-close the all-done gate so an unresponsive
     /// peer cannot strand IBD indefinitely.
     looking_for_forks_first_entered: Option<Instant>,
+
+    /// How many times the header download was resumed because the assume-utreexo block
+    /// was missing from our header chain when every peer looked done.
+    assume_utreexo_resumes: u32,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -154,6 +158,11 @@ impl ChainSelector {
     /// Three poke rounds at `REQUEST_TIMEOUT` (10s) is plenty for a healthy peer to
     /// respond, so 30s is safe.
     const LOOKING_FOR_FORKS_MAX_WAIT: u64 = 30;
+
+    /// How many times we go back to downloading headers when the header phase ends
+    /// without the assume-utreexo block in our chain. Bounded so a snapshot whose block
+    /// no peer has can't keep the node in header sync forever.
+    const MAX_ASSUME_UTREEXO_RESUMES: u32 = 5;
 }
 
 impl NodeContext for ChainSelector {
@@ -190,6 +199,8 @@ where
         }
 
         let tip_before = self.chain.get_best_block()?;
+        let last = headers.last().unwrap().block_hash();
+        let already_had_last = self.chain.get_block_header(&last).is_ok();
 
         info!(
             "Downloading headers from peer={peer} at height={} hash={}",
@@ -211,7 +222,6 @@ where
             }
         }
 
-        let last = headers.last().unwrap().block_hash();
         self.context
             .tip_cache
             .entry(peer)
@@ -225,15 +235,39 @@ where
         // done and skip the recursive request_headers — otherwise competing-tip churn
         // produces a cascading getheaders fan-out that prevents the all-done gate from
         // ever closing.
-        if matches!(self.context.state, ChainSelectorState::LookingForForks(_))
-            && self.chain.get_best_block()? == tip_before
-        {
-            self.context.done_peers.insert(peer);
-            self.maybe_finish_looking_for_forks().await?;
+        let tip_after = self.chain.get_best_block()?;
+        if matches!(self.context.state, ChainSelectorState::LookingForForks(_)) {
+            if tip_after == tip_before {
+                self.context.done_peers.insert(peer);
+                self.maybe_finish_looking_for_forks().await?;
+                return Ok(());
+            }
+
+            // A peer moved our tip, so the header download wasn't over: some peer told us
+            // it had nothing more while the network is still ahead of us. Go back to
+            // downloading instead of letting the all-done gate close at a short tip.
+            info!(
+                "peer={peer} extended our headers to height={} while looking for forks; resuming header download",
+                tip_after.0
+            );
+            self.enter_downloading_headers();
+        }
+
+        // A batch we already had answers a request someone else already answered (a
+        // re-issued or poked `getheaders`). Following it up would run a second download
+        // of the same range in parallel with the one that extended our chain.
+        if already_had_last && tip_after == tip_before {
             return Ok(());
         }
 
         self.request_headers(last)
+    }
+
+    fn enter_downloading_headers(&mut self) {
+        self.context.state = ChainSelectorState::DownloadingHeaders;
+        self.context.done_peers.clear();
+        self.context.looking_for_forks_first_entered = None;
+        self.last_tip_update = Instant::now();
     }
 
     /// Parses a serialized Utreexo accumulator into a [`Stump`].
@@ -691,20 +725,50 @@ where
             }
         }
 
-        if let Some(assume_utreexo) = self.common.config.assume_utreexo.as_ref() {
-            self.context.state = ChainSelectorState::Done;
+        if let Some(assume_utreexo) = self.common.config.assume_utreexo.clone() {
             let validation_index = self.chain.get_validation_index().unwrap();
             // already assumed the chain
             if validation_index >= assume_utreexo.height {
+                self.context.state = ChainSelectorState::Done;
                 return Ok(());
             }
+
+            let in_best_chain = self
+                .chain
+                .get_block_hash(assume_utreexo.height)
+                .is_ok_and(|hash| hash == assume_utreexo.block_hash);
+
+            if !in_best_chain {
+                let (height, _) = self.chain.get_best_block()?;
+                if self.context.assume_utreexo_resumes < ChainSelector::MAX_ASSUME_UTREEXO_RESUMES {
+                    self.context.assume_utreexo_resumes += 1;
+                    warn!(
+                        "assume-utreexo block {} (height={}) is not in our best header chain (tip height={height}); resuming header download ({}/{})",
+                        assume_utreexo.block_hash,
+                        assume_utreexo.height,
+                        self.context.assume_utreexo_resumes,
+                        ChainSelector::MAX_ASSUME_UTREEXO_RESUMES,
+                    );
+                    self.enter_downloading_headers();
+                    return self.request_headers(self.chain.get_best_block()?.1);
+                }
+
+                error!(
+                    "assume-utreexo block {} (height={}) never showed up in our header chain (tip height={height}); validating from genesis without the snapshot",
+                    assume_utreexo.block_hash, assume_utreexo.height,
+                );
+                self.context.state = ChainSelectorState::Done;
+                return Ok(());
+            }
+
+            self.context.state = ChainSelectorState::Done;
             info!(
                 "Assuming chain with height={} tip={}",
                 assume_utreexo.height, assume_utreexo.block_hash
             );
             let acc = Stump {
                 leaves: assume_utreexo.leaves,
-                roots: assume_utreexo.roots.clone(),
+                roots: assume_utreexo.roots,
             };
             self.chain
                 .mark_chain_as_assumed(acc, assume_utreexo.block_hash)?;
@@ -1157,13 +1221,134 @@ where
 mod tests {
     use std::sync::Arc;
 
+    use floresta_chain::AssumeUtreexoValue;
+    use floresta_chain::BlockchainInterface;
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
     use rustreexo::node_hash::BitcoinNodeHash;
 
     use super::*;
+    use crate::p2p_wire::tests::utils::PeerData;
+    use crate::p2p_wire::tests::utils::SetupNodeArgs;
+    use crate::p2p_wire::tests::utils::setup_node;
+    use crate::p2p_wire::tests::utils::signet_blocks;
+    use crate::p2p_wire::tests::utils::signet_headers;
+    use crate::p2p_wire::tests::utils::signet_roots;
 
     type TestNode = UtreexoNode<Arc<ChainState<FlatChainStore>>, ChainSelector>;
+
+    const KNOWN_HEADERS: usize = 60;
+
+    /// A `ChainSelector` with signet headers up to `KNOWN_HEADERS` and two simulated peers
+    /// that never get their messages processed, so each test drives the handlers by hand.
+    fn header_sync_node() -> (TestNode, Vec<bitcoin::block::Header>) {
+        let headers = signet_headers();
+        let peers = vec![
+            PeerData::new(headers.clone(), signet_blocks(), signet_roots()),
+            PeerData::new(headers.clone(), signet_blocks(), signet_roots()),
+        ];
+        let datadir = format!("./tmp-db/{}.chain_selector_ctx", rand::random::<u32>());
+        let args = SetupNodeArgs::new(peers, false, Network::Signet, datadir, KNOWN_HEADERS);
+        let mut node = setup_node::<ChainSelector>(args);
+        node.peer_ids = vec![0, 1];
+        for peer in node.peers.values_mut() {
+            peer.message_times.add(1.0);
+        }
+        (node, headers)
+    }
+
+    fn assume_utreexo_at(headers: &[bitcoin::block::Header], height: usize) -> AssumeUtreexoValue {
+        AssumeUtreexoValue {
+            block_hash: headers[height].block_hash(),
+            height: height as u32,
+            roots: Vec::new(),
+            leaves: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn headers_that_extend_our_tip_while_looking_for_forks_resume_the_download() {
+        let (mut node, headers) = header_sync_node();
+        node.context.state = ChainSelectorState::LookingForForks(Instant::now());
+        node.context.done_peers.insert(1);
+
+        node.handle_headers(0, headers[KNOWN_HEADERS + 1..=KNOWN_HEADERS + 20].to_vec())
+            .await
+            .unwrap();
+
+        assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+        assert!(node.context.done_peers.is_empty());
+        assert!(node.inflight.contains_key(&InflightRequests::Headers));
+        assert_eq!(
+            node.chain.get_best_block().unwrap().0,
+            KNOWN_HEADERS as u32 + 20
+        );
+    }
+
+    #[tokio::test]
+    async fn headers_we_already_had_while_looking_for_forks_mark_the_peer_done() {
+        let (mut node, headers) = header_sync_node();
+        node.context.state = ChainSelectorState::LookingForForks(Instant::now());
+
+        node.handle_headers(0, headers[1..=20].to_vec())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            node.context.state,
+            ChainSelectorState::LookingForForks(_)
+        ));
+        assert!(node.context.done_peers.contains(&0));
+        assert!(!node.inflight.contains_key(&InflightRequests::Headers));
+    }
+
+    #[tokio::test]
+    async fn a_batch_we_already_had_does_not_start_a_parallel_download() {
+        let (mut node, headers) = header_sync_node();
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+
+        node.handle_headers(0, headers[KNOWN_HEADERS - 19..=KNOWN_HEADERS].to_vec())
+            .await
+            .unwrap();
+        assert!(!node.inflight.contains_key(&InflightRequests::Headers));
+
+        node.handle_headers(1, headers[KNOWN_HEADERS + 1..=KNOWN_HEADERS + 20].to_vec())
+            .await
+            .unwrap();
+        assert!(node.inflight.contains_key(&InflightRequests::Headers));
+    }
+
+    #[tokio::test]
+    async fn header_phase_does_not_finish_without_the_assume_utreexo_block() {
+        let (mut node, headers) = header_sync_node();
+        node.config.assume_utreexo = Some(assume_utreexo_at(&headers, KNOWN_HEADERS + 50));
+        node.context.state = ChainSelectorState::LookingForForks(Instant::now());
+        node.context.done_peers.insert(1);
+
+        node.empty_headers_message(0).await.unwrap();
+
+        assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+        assert!(node.context.done_peers.is_empty());
+        assert!(node.inflight.contains_key(&InflightRequests::Headers));
+    }
+
+    #[tokio::test]
+    async fn header_phase_gives_up_on_an_assume_utreexo_block_no_peer_has() {
+        let (mut node, headers) = header_sync_node();
+        node.config.assume_utreexo = Some(assume_utreexo_at(&headers, KNOWN_HEADERS + 50));
+
+        for _ in 0..ChainSelector::MAX_ASSUME_UTREEXO_RESUMES {
+            node.context.state = ChainSelectorState::LookingForForks(Instant::now());
+            node.context.done_peers.extend([0, 1]);
+            node.maybe_finish_looking_for_forks().await.unwrap();
+            assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+        }
+
+        node.context.state = ChainSelectorState::LookingForForks(Instant::now());
+        node.context.done_peers.extend([0, 1]);
+        node.maybe_finish_looking_for_forks().await.unwrap();
+        assert_eq!(node.context.state, ChainSelectorState::Done);
+    }
 
     fn parse_acc(acc: &[u8]) -> Result<Stump, WireError> {
         TestNode::parse_acc(acc)
