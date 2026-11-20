@@ -110,6 +110,14 @@ where
             return Err(WireError::NoAddressesAvailable);
         };
 
+        if conn_kind.is_regular()
+            && peer_address.get_onion_addr().is_some()
+            && !onion_slot_available(self.regular_onion_peers(), self.socks5.is_some())
+        {
+            debug!("Skipping onion address {peer_address:?}: onion peer limit reached");
+            return Err(WireError::NoAddressesAvailable);
+        }
+
         debug!("Attempting connection with address={peer_address:?} kind={conn_kind:?}",);
 
         let now = SystemTime::now()
@@ -167,6 +175,14 @@ where
     /// We don't open the connection here, we create a [`Peer`] actor that will try to open
     /// a connection with the given address and kind. If it succeeds, it will send a
     /// [`PeerMessages::Ready`](crate::p2p_wire::peer::PeerMessages) to the node after handshaking.
+    /// Regular (non-manual, long-lived) peers we have, or are connecting to, over onion.
+    pub(crate) fn regular_onion_peers(&self) -> usize {
+        self.peers
+            .values()
+            .filter(|peer| peer.kind.is_regular() && peer.address.get_onion_addr().is_some())
+            .count()
+    }
+
     /// The SOCKS5 proxy a connection to `address` goes through, or `None` to connect directly.
     pub(crate) fn proxy_for(&self, address: &LocalAddress) -> Option<SocketAddr> {
         proxy_route(
@@ -542,7 +558,7 @@ where
 
     /// Try disconnecting the slowest non-protected-service peer.
     ///
-    /// For clearnet peers that don't have any of the `protected_services`, we disconnect the
+    /// For peers that don't have any of the `protected_services`, we disconnect the
     /// highest-latency one when any of these hold:
     /// - Its latency is more than 1.5x the median latency across eligible peers.
     /// - `always` is true.
@@ -559,13 +575,14 @@ where
         /// This is the same value as the `libbitcoin` default `allowed_deviation`.
         const ALLOWED_DEVIATION: f64 = 1.5;
 
-        // Use latency samples only from regular, non-protected-service peers. Onion peers are
-        // left out: a Tor circuit is always slower than a direct connection, so comparing them
-        // against clearnet peers would keep evicting the few onion peers we have.
+        // Use latency samples only from regular, non-protected-service peers. A Tor circuit is
+        // always slower than a direct connection, so while we only have a few onion peers they
+        // are left out; otherwise they would always be the ones evicted.
+        let protect_onion = self.regular_onion_peers() <= MAX_SPLIT_ROUTING_ONION_PEERS;
         let is_eligible_peer = |peer: &LocalPeerView| {
             peer.kind.is_regular()
                 && !peer.has_any_service(protected_services)
-                && peer.address.get_onion_addr().is_none()
+                && !(protect_onion && peer.address.get_onion_addr().is_some())
         };
 
         let mut samples: Vec<_> = self
@@ -638,6 +655,16 @@ where
     }
 }
 
+/// How many regular onion peers a node keeps when only onion peers go through Tor. Onion
+/// circuits are slow, so the rest of the outbound slots stay on clearnet to keep sync fast.
+pub(crate) const MAX_SPLIT_ROUTING_ONION_PEERS: usize = 2;
+
+/// Whether another regular onion peer may be opened. With `routes_everything` (a general proxy)
+/// every peer goes through Tor anyway, so onion peers are not limited.
+pub(crate) fn onion_slot_available(regular_onion_peers: usize, routes_everything: bool) -> bool {
+    routes_everything || regular_onion_peers < MAX_SPLIT_ROUTING_ONION_PEERS
+}
+
 /// Picks the SOCKS5 proxy for a peer: onion peers prefer the onion-only proxy and fall back to
 /// the general one, every other peer uses the general one. `None` means a direct connection.
 pub(crate) fn proxy_route(
@@ -656,6 +683,8 @@ pub(crate) fn proxy_route(
 mod tests {
     use core::net::SocketAddr;
 
+    use super::MAX_SPLIT_ROUTING_ONION_PEERS;
+    use super::onion_slot_available;
     use super::proxy_route;
 
     fn addr(port: u16) -> Option<SocketAddr> {
@@ -678,6 +707,24 @@ mod tests {
     fn onion_proxy_carries_only_onion_peers() {
         assert_eq!(proxy_route(false, None, addr(9050)), None);
         assert_eq!(proxy_route(true, None, addr(9050)), addr(9050));
+    }
+
+    #[test]
+    fn split_routing_keeps_onion_peers_a_minority() {
+        assert!(onion_slot_available(0, false));
+        assert!(onion_slot_available(
+            MAX_SPLIT_ROUTING_ONION_PEERS - 1,
+            false
+        ));
+        assert!(!onion_slot_available(MAX_SPLIT_ROUTING_ONION_PEERS, false));
+    }
+
+    #[test]
+    fn routing_everything_through_tor_does_not_limit_onion_peers() {
+        assert!(onion_slot_available(
+            MAX_SPLIT_ROUTING_ONION_PEERS + 5,
+            true
+        ));
     }
 
     #[test]
