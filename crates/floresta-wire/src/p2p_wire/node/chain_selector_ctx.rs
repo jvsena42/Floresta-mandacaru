@@ -298,9 +298,10 @@ where
             // range we have. A peer far behind us answers our requests this way every time,
             // so it's dropped.
             let (our_height, _) = self.chain.get_best_block()?;
-            if let Some(height) = self.non_manual_peer_height(peer)
-                && Self::is_far_behind(height, our_height)
-            {
+            let far_behind_height = self
+                .non_manual_peer_height(peer)
+                .filter(|&height| Self::is_far_behind(height, our_height));
+            if let Some(height) = far_behind_height {
                 self.drop_peer_that_cannot_serve_headers(peer, height, our_height);
                 return self.request_headers(tip_after.1);
             }
