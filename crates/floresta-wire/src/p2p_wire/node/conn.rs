@@ -94,9 +94,13 @@ where
                 })
                 .map(|addr| (0, addr.clone()))
         } else {
-            self.address_man.get_address_to_connect(
+            // Under split routing, stop picking onion addresses once we have enough onion peers.
+            let allow_onion = !conn_kind.is_regular()
+                || onion_slot_available(self.regular_onion_peers(), self.socks5.is_some());
+            self.address_man.get_address_to_connect_with(
                 required_services,
                 matches!(conn_kind, ConnectionKind::Feeler),
+                allow_onion,
             )
         };
 
@@ -109,14 +113,6 @@ where
 
             return Err(WireError::NoAddressesAvailable);
         };
-
-        if conn_kind.is_regular()
-            && peer_address.get_onion_addr().is_some()
-            && !onion_slot_available(self.regular_onion_peers(), self.socks5.is_some())
-        {
-            debug!("Skipping onion address {peer_address:?}: onion peer limit reached");
-            return Err(WireError::NoAddressesAvailable);
-        }
 
         debug!("Attempting connection with address={peer_address:?} kind={conn_kind:?}",);
 
@@ -163,18 +159,11 @@ where
         Ok(())
     }
 
-    /// Creates a new outgoing connection with `address`.
-    ///
-    /// `kind` may be a short-lived connection type, such as [`ConnectionKind::Feeler`] or
-    /// [`ConnectionKind::AddrFetch`], or a long-lived connection type, such as
-    /// [`ConnectionKind::OutboundFullRelay`], [`ConnectionKind::BlockRelayOnly`],
-    /// [`ConnectionKind::Manual`] or [`ConnectionKind::Extra`].
-    ///
-    /// We will always try to open a V2 connection first. If the `allow_v1_fallback` is set,
-    /// we may retry the connection with the old V1 protocol if the V2 connection fails.
-    /// We don't open the connection here, we create a [`Peer`] actor that will try to open
-    /// a connection with the given address and kind. If it succeeds, it will send a
-    /// [`PeerMessages::Ready`](crate::p2p_wire::peer::PeerMessages) to the node after handshaking.
+    /// Whether only onion peers go through Tor while every other peer connects directly.
+    pub(crate) fn uses_split_routing(&self) -> bool {
+        self.onion_socks5.is_some() && self.socks5.is_none()
+    }
+
     /// Regular (non-manual, long-lived) peers we have, or are connecting to, over onion.
     pub(crate) fn regular_onion_peers(&self) -> usize {
         self.peers
@@ -192,6 +181,18 @@ where
         )
     }
 
+    /// Creates a new outgoing connection with `address`.
+    ///
+    /// `kind` may be a short-lived connection type, such as [`ConnectionKind::Feeler`] or
+    /// [`ConnectionKind::AddrFetch`], or a long-lived connection type, such as
+    /// [`ConnectionKind::OutboundFullRelay`], [`ConnectionKind::BlockRelayOnly`],
+    /// [`ConnectionKind::Manual`] or [`ConnectionKind::Extra`].
+    ///
+    /// We will always try to open a V2 connection first. If the `allow_v1_fallback` is set,
+    /// we may retry the connection with the old V1 protocol if the V2 connection fails.
+    /// We don't open the connection here, we create a [`Peer`] actor that will try to open
+    /// a connection with the given address and kind. If it succeeds, it will send a
+    /// [`PeerMessages::Ready`](crate::p2p_wire::peer::PeerMessages) to the node after handshaking.
     pub(crate) fn open_connection(
         &mut self,
         kind: ConnectionKind,
@@ -491,6 +492,14 @@ where
         }
 
         for address in anchors {
+            // A node that used to route everything through Tor may have saved more onion
+            // anchors than split routing keeps.
+            let is_onion = address.get_onion_addr().is_some();
+            if is_onion && !onion_slot_available(self.regular_onion_peers(), self.socks5.is_some())
+            {
+                continue;
+            }
+
             self.open_connection(
                 ConnectionKind::OutboundFullRelay(service_flags::UTREEXO.into()),
                 address,
@@ -565,7 +574,7 @@ where
     /// even when the outbound slots are full, like Bitcoin Core's extra connection to a reachable
     /// network we have no peer on. At most one such attempt is in flight at a time.
     fn maybe_open_onion_connection(&mut self) {
-        if self.onion_socks5.is_none() || self.socks5.is_some() || self.has_fixed_peers() {
+        if !self.uses_split_routing() || self.has_fixed_peers() {
             return;
         }
 
@@ -574,8 +583,16 @@ where
         }
 
         let Some((peer_id, peer_address)) = self.address_man.get_onion_address_to_connect() else {
+            // Gossip has not brought any onion address yet: fall back to the onion seeds.
+            let net = self.network;
+            self.address_man.add_fixed_addresses(net);
             return;
         };
+
+        // A manually added peer is not tracked as connected in the address manager.
+        if self.peers.values().any(|peer| peer.address == peer_address) {
+            return;
+        }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -615,7 +632,8 @@ where
         // Use latency samples only from regular, non-protected-service peers. A Tor circuit is
         // always slower than a direct connection, so while we only have a few onion peers they
         // are left out; otherwise they would always be the ones evicted.
-        let protect_onion = self.regular_onion_peers() <= MAX_SPLIT_ROUTING_ONION_PEERS;
+        let protect_onion = self.uses_split_routing()
+            && self.regular_onion_peers() <= MAX_SPLIT_ROUTING_ONION_PEERS;
         let is_eligible_peer = |peer: &LocalPeerView| {
             peer.kind.is_regular()
                 && !peer.has_any_service(protected_services)
@@ -702,6 +720,16 @@ pub(crate) fn onion_slot_available(regular_onion_peers: usize, routes_everything
     routes_everything || regular_onion_peers < MAX_SPLIT_ROUTING_ONION_PEERS
 }
 
+/// Whether a peer that just finished its handshake is the one onion peer split routing keeps,
+/// which may stay even when the outbound slots are full. `regular_onion_peers` includes it.
+pub(crate) fn is_onion_minimum(
+    split_routing: bool,
+    is_regular_onion_peer: bool,
+    regular_onion_peers: usize,
+) -> bool {
+    split_routing && is_regular_onion_peer && regular_onion_peers <= 1
+}
+
 /// Picks the SOCKS5 proxy for a peer: onion peers prefer the onion-only proxy and fall back to
 /// the general one, every other peer uses the general one. `None` means a direct connection.
 pub(crate) fn proxy_route(
@@ -721,6 +749,7 @@ mod tests {
     use core::net::SocketAddr;
 
     use super::MAX_SPLIT_ROUTING_ONION_PEERS;
+    use super::is_onion_minimum;
     use super::onion_slot_available;
     use super::proxy_route;
 
@@ -754,6 +783,14 @@ mod tests {
             false
         ));
         assert!(!onion_slot_available(MAX_SPLIT_ROUTING_ONION_PEERS, false));
+    }
+
+    #[test]
+    fn only_the_single_split_routing_onion_peer_may_exceed_the_limit() {
+        assert!(is_onion_minimum(true, true, 1));
+        assert!(!is_onion_minimum(true, true, 2));
+        assert!(!is_onion_minimum(true, false, 1));
+        assert!(!is_onion_minimum(false, true, 1));
     }
 
     #[test]

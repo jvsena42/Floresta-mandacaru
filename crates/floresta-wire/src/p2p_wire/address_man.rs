@@ -583,7 +583,7 @@ impl AddressMan {
     /// are banned, connected or recently failed don't count: evicting a healthy
     /// peer for them only ends with another peer lacking the service.
     pub fn has_address_for_service(&self, service: ServiceFlags) -> bool {
-        self.try_with_service(service).is_some()
+        self.try_with_service(service, true).is_some()
     }
 
     /// Returns address manager statistics broken down by network type.
@@ -778,6 +778,17 @@ impl AddressMan {
         required_service: ServiceFlags,
         feeler: bool,
     ) -> Option<(usize, LocalAddress)> {
+        self.get_address_to_connect_with(required_service, feeler, true)
+    }
+
+    /// Like [`Self::get_address_to_connect`], but never returns an onion address unless
+    /// `allow_onion` is set. Feelers ignore it.
+    pub fn get_address_to_connect_with(
+        &mut self,
+        required_service: ServiceFlags,
+        feeler: bool,
+        allow_onion: bool,
+    ) -> Option<(usize, LocalAddress)> {
         if self.addresses.is_empty() {
             return None;
         }
@@ -802,8 +813,8 @@ impl AddressMan {
 
         for _ in 0..10 {
             let (id, peer) = self
-                .get_address_by_service(required_service)
-                .or_else(|| self.get_random_address(required_service))?;
+                .get_address_by_service(required_service, allow_onion)
+                .or_else(|| self.get_random_address(required_service, allow_onion))?;
 
             match peer.state {
                 AddressState::NeverTried | AddressState::Tried(_) => {
@@ -868,14 +879,20 @@ impl AddressMan {
         Ok(())
     }
 
-    fn get_address_by_service(&self, service: ServiceFlags) -> Option<(usize, LocalAddress)> {
+    fn get_address_by_service(
+        &self,
+        service: ServiceFlags,
+        allow_onion: bool,
+    ) -> Option<(usize, LocalAddress)> {
         let candidates = self.good_peers_by_service.get(&service)?;
 
         candidates
             .iter()
             .filter_map(|id| {
                 let addr = self.addresses.get(id)?;
-                (addr.state != AddressState::Connected).then_some((id, addr))
+                (addr.state != AddressState::Connected
+                    && (allow_onion || addr.get_onion_addr().is_none()))
+                .then_some((id, addr))
             })
             .choose(&mut rand::rng())
             .map(|(id, addr)| (*id, addr.to_owned()))
@@ -945,12 +962,20 @@ impl AddressMan {
     /// If we cannot find a peer that advertises the required service, we return any peer
     /// that we have in our list of known peers. Luckily, either we'll connect to a peer that has
     /// this but we didn't know, or one of those peers will give us useful addresses.
-    fn try_with_service(&self, service: ServiceFlags) -> Option<(usize, LocalAddress)> {
+    fn try_with_service(
+        &self,
+        service: ServiceFlags,
+        allow_onion: bool,
+    ) -> Option<(usize, LocalAddress)> {
         if let Some(peers) = self.peers_by_service.get(&service) {
             let peers = peers
                 .iter()
                 .filter(|&x| {
                     if let Some(address) = self.addresses.get(x) {
+                        if !allow_onion && address.get_onion_addr().is_some() {
+                            return false;
+                        }
+
                         if let AddressState::Failed(when) = address.state {
                             let now = Self::time_since_unix();
 
@@ -996,12 +1021,16 @@ impl AddressMan {
             .map(|(id, addr)| (*id, addr.to_owned()))
     }
 
-    fn get_random_address(&self, service: ServiceFlags) -> Option<(usize, LocalAddress)> {
+    fn get_random_address(
+        &self,
+        service: ServiceFlags,
+        allow_onion: bool,
+    ) -> Option<(usize, LocalAddress)> {
         if self.addresses.is_empty() {
             return None;
         }
 
-        if let Some(address) = self.try_with_service(service) {
+        if let Some(address) = self.try_with_service(service, allow_onion) {
             return Some(address);
         }
 
@@ -1017,10 +1046,11 @@ impl AddressMan {
         }
 
         // No service requirement: any peer will do.
-        let idx = rand::rng().random_range(0..self.addresses.len());
-        let peer = self.addresses.keys().nth(idx)?;
-
-        Some((*peer, self.addresses.get(peer)?.to_owned()))
+        self.addresses
+            .iter()
+            .filter(|(_, addr)| allow_onion || addr.get_onion_addr().is_none())
+            .choose(&mut rand::rng())
+            .map(|(id, addr)| (*id, addr.to_owned()))
     }
 
     /// Updates the state of an address
@@ -1942,6 +1972,35 @@ mod test {
     }
 
     #[test]
+    fn test_onion_addresses_are_skipped_when_not_allowed() {
+        let mut address_man = AddressMan::new(None, &ReachableNetworks::reachable(true));
+        let flags = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+        address_man.push_addresses(&[
+            LocalAddress::new(
+                BitcoinSocketAddr::new(AddrV2::Ipv4("12.146.182.45".parse().unwrap()), 8333),
+                0,
+                AddressState::NeverTried,
+                flags,
+                1,
+            ),
+            LocalAddress::new(
+                BitcoinSocketAddr::new(AddrV2::TorV3([9; 32]), 8333),
+                0,
+                AddressState::NeverTried,
+                flags,
+                2,
+            ),
+        ]);
+
+        for _ in 0..50 {
+            let (_, picked) = address_man
+                .get_address_to_connect_with(ServiceFlags::NONE, false, false)
+                .unwrap();
+            assert!(picked.get_onion_addr().is_none());
+        }
+    }
+
+    #[test]
     fn test_unreachable_anchors_are_not_returned() {
         let datadir = std::env::temp_dir().join(format!(
             "floresta-anchors-{}-{}",
@@ -1999,7 +2058,7 @@ mod test {
         // cleanly instead of returning the unrelated NETWORK|WITNESS peer.
         assert!(
             address_man
-                .get_random_address(ServiceFlags::COMPACT_FILTERS)
+                .get_random_address(ServiceFlags::COMPACT_FILTERS, true)
                 .is_none()
         );
         assert!(
@@ -2009,7 +2068,11 @@ mod test {
         );
 
         // Without a service requirement, we still return the one peer we have.
-        assert!(address_man.get_random_address(ServiceFlags::NONE).is_some());
+        assert!(
+            address_man
+                .get_random_address(ServiceFlags::NONE, true)
+                .is_some()
+        );
     }
 
     #[test]
@@ -2072,7 +2135,7 @@ mod test {
         assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS));
 
         let picked = address_man
-            .get_random_address(ServiceFlags::COMPACT_FILTERS)
+            .get_random_address(ServiceFlags::COMPACT_FILTERS, true)
             .expect("should find the CF-advertising peer");
         assert!(picked.1.services.has(ServiceFlags::COMPACT_FILTERS));
     }

@@ -35,7 +35,8 @@ pub struct UtreexoNodeConfig {
     pub datadir: PathBuf,
     /// A SOCKS5 proxy to use. Defaults to None.
     ///
-    /// Every outbound connection goes through it, and DNS seeds are queried over it.
+    /// Every outbound connection goes through it (onion peers use `onion_proxy` instead when
+    /// that is set), and DNS seeds are queried over it.
     pub proxy: Option<SocketAddr>,
     /// A SOCKS5 proxy used only for Tor onion peers. Defaults to None.
     ///

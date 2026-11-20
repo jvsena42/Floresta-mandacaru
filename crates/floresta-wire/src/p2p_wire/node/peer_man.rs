@@ -30,6 +30,7 @@ use super::LocalPeerView;
 use super::NodeRequest;
 use super::PeerStatus;
 use super::UtreexoNode;
+use super::conn::is_onion_minimum;
 use crate::address_man::AddressMan;
 use crate::address_man::AddressState;
 use crate::address_man::LocalAddress;
@@ -389,12 +390,22 @@ where
 
         let good_peers_count = self.connected_peers();
         if good_peers_count > T::MAX_OUTGOING_PEERS {
-            // We allow utreexo, extra and manual peers to bypass our connection limits
+            // We allow utreexo, extra and manual peers to bypass our connection limits, and the
+            // one onion peer split routing keeps (see `maybe_open_onion_connection`).
             let is_utreexo_peer = matches!(version.kind, ConnectionKind::OutboundFullRelay(services) if services.has(service_flags::UTREEXO.into()));
             let is_manual_peer = version.kind.is_manual();
             let is_extra = version.kind == ConnectionKind::Extra;
+            let is_onion = self
+                .peers
+                .get(&peer)
+                .is_some_and(|p| p.address.get_onion_addr().is_some());
+            let is_only_onion_peer = is_onion_minimum(
+                self.uses_split_routing(),
+                is_onion && version.kind.is_regular(),
+                self.regular_onion_peers(),
+            );
 
-            if !(is_utreexo_peer || is_manual_peer || is_extra) {
+            if !(is_utreexo_peer || is_manual_peer || is_extra || is_only_onion_peer) {
                 debug!(
                     "Already have {} peers, treating peer {peer} as addr-fetch before disconnecting to avoid blowing up our max of {}",
                     good_peers_count,

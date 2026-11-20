@@ -9,3 +9,15 @@ florestad --proxy 127.0.0.1:9050
 ```
 
 This will route all your connections through the Tor network, effectively masking your IP address.
+
+## Onion peers only
+
+To also connect to Tor onion peers while every other peer keeps connecting directly, pass the proxy with `--onion-proxy` instead, like Bitcoin Core's `-onion`:
+
+```bash
+florestad --onion-proxy 127.0.0.1:9050
+```
+
+Only onion peers go through Tor, so your IP address stays visible to clearnet peers, but syncing is not slowed down. The node keeps one or two onion peers alongside its clearnet peers. If both flags are set, onion peers use `--onion-proxy` and every other peer uses `--proxy`.
+
+Without either flag, onion addresses are not stored or dialled, since they cannot be reached.
