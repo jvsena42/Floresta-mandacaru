@@ -271,6 +271,7 @@ where
         if tip_after != tip_before {
             self.context.assume_utreexo_resumes = 0;
             self.context.stalls_with_only_known_batches = 0;
+            self.context.known_batch_since_stall_check = None;
         }
 
         if matches!(self.context.state, ChainSelectorState::LookingForForks(_)) {
@@ -1188,7 +1189,7 @@ where
         }
 
         if let ChainSelectorState::DownloadingHeaders = self.context.state {
-            self.check_header_stall().await?;
+            try_and_log!(self.check_header_stall().await);
         }
 
         if self.context.state == ChainSelectorState::CreatingConnections {
