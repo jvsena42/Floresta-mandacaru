@@ -55,6 +55,7 @@ use bitcoin::BlockHash;
 use bitcoin::block::Header;
 use bitcoin::network::Network;
 use bitcoin::p2p::ServiceFlags;
+use floresta_chain::BlockchainError;
 use floresta_chain::ChainBackend;
 use floresta_chain::CompactLeafData;
 use floresta_chain::proof_util;
@@ -212,8 +213,21 @@ where
             headers[0].block_hash()
         );
 
-        for header in headers.iter() {
+        for (i, header) in headers.iter().enumerate() {
             if let Err(e) = self.chain.accept_header(*header) {
+                // Headers that don't connect to ours are usually a new block announced via
+                // `sendheaders` while we're still behind. That isn't misbehavior, and
+                // following it up would send a `getheaders` with an empty locator for a tip
+                // we don't have, which some peers answer with an empty `headers` that ends
+                // the download early. The download already in flight carries on.
+                if i == 0 && matches!(e, BlockchainError::BlockNotPresent) {
+                    info!(
+                        "Ignoring headers from peer={peer} that don't connect to our chain (first={})",
+                        header.block_hash()
+                    );
+                    return Ok(());
+                }
+
                 error!("Error while downloading headers from peer={peer} err={e}");
 
                 self.disconnect_and_ban(peer)?;
@@ -1242,6 +1256,7 @@ mod tests {
     use rustreexo::node_hash::BitcoinNodeHash;
 
     use super::*;
+    use crate::node::PeerStatus;
     use crate::p2p_wire::tests::utils::PeerData;
     use crate::p2p_wire::tests::utils::SetupNodeArgs;
     use crate::p2p_wire::tests::utils::setup_node;
@@ -1383,6 +1398,21 @@ mod tests {
             node.chain.get_validation_index().unwrap(),
             KNOWN_HEADERS as u32
         );
+    }
+
+    #[tokio::test]
+    async fn headers_that_do_not_connect_are_ignored_without_a_ban_or_follow_up() {
+        let (mut node, headers) = header_sync_node();
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+
+        node.handle_headers(0, vec![headers[KNOWN_HEADERS + 10]])
+            .await
+            .unwrap();
+
+        assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+        assert!(!node.inflight.contains_key(&InflightRequests::Headers));
+        assert_eq!(node.peers[&0].state, PeerStatus::Ready);
+        assert!(!node.context.tip_cache.contains_key(&0));
     }
 
     #[tokio::test]
