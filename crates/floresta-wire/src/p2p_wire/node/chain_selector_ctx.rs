@@ -49,6 +49,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use bitcoin::Block;
 use bitcoin::BlockHash;
@@ -169,6 +171,10 @@ impl ChainSelector {
     /// Most headers a peer sends in one `headers` message. A shorter batch means the peer
     /// has nothing after its last header.
     const MAX_HEADERS_PER_MESSAGE: usize = 2_000;
+
+    /// How far behind our tip a peer's advertised height may be for its empty `headers`
+    /// to still count as "nothing after ours". About a day of blocks.
+    const PEER_BEHIND_MARGIN: u32 = 144;
 }
 
 impl NodeContext for ChainSelector {
@@ -751,14 +757,22 @@ where
     ///
     /// Bitcoin Core answers `getheaders` with an empty `headers` while its own chain has
     /// less than the minimum chain work, i.e. while it's still in IBD, to tell us to go
-    /// away. It still advertised a height above our tip, so the chain doesn't end here.
+    /// away. If the peer advertised a height above our tip, the chain doesn't end here.
+    /// If it advertised one far below our tip, it's behind us and can't tell us where the
+    /// chain ends either: an honest peer at the tip connected during header sync, minutes
+    /// ago, so it can't be more than `PEER_BEHIND_MARGIN` blocks behind.
     /// Manual peers are kept: with only them, ending the download is all we can do.
     fn peer_cannot_serve_headers(&mut self, peer: PeerId) -> Result<bool, WireError> {
         let Some(peer_data) = self.peers.get(&peer) else {
             return Ok(false);
         };
         let (our_height, _) = self.chain.get_best_block()?;
-        if peer_data.height <= our_height || peer_data.kind.is_manual() {
+        let ahead_of_us = peer_data.height > our_height;
+        let far_behind_us = peer_data
+            .height
+            .saturating_add(ChainSelector::PEER_BEHIND_MARGIN)
+            < our_height;
+        if !(ahead_of_us || far_behind_us) || peer_data.kind.is_manual() {
             return Ok(false);
         }
 
@@ -771,6 +785,15 @@ where
         self.context.done_peers.remove(&peer);
         self.context.tip_cache.remove(&peer);
         self.handle_disconnection(peer, idx)?;
+
+        // `handle_disconnection` records a peer that completed the handshake as a good
+        // address; don't come back to one that can't serve headers right away.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        self.address_man
+            .update_set_state(idx, AddressState::Failed(now));
         Ok(true)
     }
 
@@ -1291,6 +1314,7 @@ mod tests {
     use rustreexo::node_hash::BitcoinNodeHash;
 
     use super::*;
+    use crate::node::ConnectionKind;
     use crate::node::PeerStatus;
     use crate::p2p_wire::tests::utils::PeerData;
     use crate::p2p_wire::tests::utils::SetupNodeArgs;
@@ -1464,6 +1488,35 @@ mod tests {
             node.inflight.get(&InflightRequests::Headers).map(|r| r.0),
             Some(1)
         );
+    }
+
+    #[tokio::test]
+    async fn empty_headers_from_a_peer_far_behind_us_drop_it_and_keep_downloading() {
+        let (mut node, _) = header_sync_node_with(1_000);
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+        node.peers.get_mut(&0).unwrap().height = 1_000 - ChainSelector::PEER_BEHIND_MARGIN - 1;
+
+        node.empty_headers_message(0).await.unwrap();
+
+        assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+        assert!(!node.peers.contains_key(&0));
+    }
+
+    #[tokio::test]
+    async fn empty_headers_from_a_manual_peer_end_the_download() {
+        let (mut node, _) = header_sync_node();
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+        let peer = node.peers.get_mut(&0).unwrap();
+        peer.height = KNOWN_HEADERS as u32 + 1_000;
+        peer.kind = ConnectionKind::Manual;
+
+        node.empty_headers_message(0).await.unwrap();
+
+        assert!(matches!(
+            node.context.state,
+            ChainSelectorState::LookingForForks(_)
+        ));
+        assert!(node.peers.contains_key(&0));
     }
 
     #[tokio::test]
