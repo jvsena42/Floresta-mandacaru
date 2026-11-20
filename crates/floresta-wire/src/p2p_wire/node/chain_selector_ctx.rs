@@ -726,6 +726,10 @@ where
     async fn empty_headers_message(&mut self, peer: PeerId) -> Result<(), WireError> {
         match self.context.state {
             ChainSelectorState::DownloadingHeaders => {
+                if self.peer_cannot_serve_headers(peer)? {
+                    return self.request_headers(self.chain.get_best_block()?.1);
+                }
+
                 info!("Finished downloading headers from peer={peer}, checking if our peers agree");
                 self.poke_peers()?;
                 self.context.state = ChainSelectorState::LookingForForks(Instant::now());
@@ -740,6 +744,34 @@ where
         }
 
         Ok(())
+    }
+
+    /// Whether an empty `headers` from `peer` means it can't serve us headers, rather than
+    /// that we reached the end of the chain. Such a peer is disconnected.
+    ///
+    /// Bitcoin Core answers `getheaders` with an empty `headers` while its own chain has
+    /// less than the minimum chain work, i.e. while it's still in IBD, to tell us to go
+    /// away. It still advertised a height above our tip, so the chain doesn't end here.
+    /// Manual peers are kept: with only them, ending the download is all we can do.
+    fn peer_cannot_serve_headers(&mut self, peer: PeerId) -> Result<bool, WireError> {
+        let Some(peer_data) = self.peers.get(&peer) else {
+            return Ok(false);
+        };
+        let (our_height, _) = self.chain.get_best_block()?;
+        if peer_data.height <= our_height || peer_data.kind.is_manual() {
+            return Ok(false);
+        }
+
+        info!(
+            "peer={peer} advertised height={} but sent no headers after ours (height={our_height}); disconnecting it and asking another peer",
+            peer_data.height
+        );
+        let idx = peer_data.address.id;
+        let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
+        self.context.done_peers.remove(&peer);
+        self.context.tip_cache.remove(&peer);
+        self.handle_disconnection(peer, idx)?;
+        Ok(true)
     }
 
     /// Checks the all-peers-done gate while in `LookingForForks`. If every connected peer
@@ -1416,6 +1448,37 @@ mod tests {
         assert!(!node.inflight.contains_key(&InflightRequests::Headers));
         assert_eq!(node.peers[&0].state, PeerStatus::Ready);
         assert!(!node.context.tip_cache.contains_key(&0));
+    }
+
+    #[tokio::test]
+    async fn empty_headers_from_a_peer_that_claims_more_blocks_drop_it_and_keep_downloading() {
+        let (mut node, _) = header_sync_node();
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+        node.peers.get_mut(&0).unwrap().height = KNOWN_HEADERS as u32 + 1_000;
+
+        node.empty_headers_message(0).await.unwrap();
+
+        assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+        assert!(!node.peers.contains_key(&0));
+        assert_eq!(
+            node.inflight.get(&InflightRequests::Headers).map(|r| r.0),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_headers_from_a_peer_at_our_height_end_the_download() {
+        let (mut node, _) = header_sync_node();
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+        node.peers.get_mut(&0).unwrap().height = KNOWN_HEADERS as u32;
+
+        node.empty_headers_message(0).await.unwrap();
+
+        assert!(matches!(
+            node.context.state,
+            ChainSelectorState::LookingForForks(_)
+        ));
+        assert!(node.peers.contains_key(&0));
     }
 
     #[tokio::test]
