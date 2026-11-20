@@ -759,8 +759,9 @@ where
     /// less than the minimum chain work, i.e. while it's still in IBD, to tell us to go
     /// away. If the peer advertised a height above our tip, the chain doesn't end here.
     /// If it advertised one far below our tip, it's behind us and can't tell us where the
-    /// chain ends either: an honest peer at the tip connected during header sync, minutes
-    /// ago, so it can't be more than `PEER_BEHIND_MARGIN` blocks behind.
+    /// chain ends either. An honest peer at the tip connected during header sync, usually
+    /// minutes ago, so it's rarely more than `PEER_BEHIND_MARGIN` blocks behind; if it is,
+    /// dropping it costs a reconnect, and the new connection advertises a fresh height.
     /// Manual peers are kept: with only them, ending the download is all we can do.
     fn peer_cannot_serve_headers(&mut self, peer: PeerId) -> Result<bool, WireError> {
         let Some(peer_data) = self.peers.get(&peer) else {
@@ -784,7 +785,9 @@ where
         let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
         self.context.done_peers.remove(&peer);
         self.context.tip_cache.remove(&peer);
-        self.handle_disconnection(peer, idx)?;
+        if let Err(e) = self.handle_disconnection(peer, idx) {
+            warn!("Failed to disconnect peer={peer} that can't serve headers: {e}");
+        }
 
         // `handle_disconnection` records a peer that completed the handshake as a good
         // address; don't come back to one that can't serve headers right away.
