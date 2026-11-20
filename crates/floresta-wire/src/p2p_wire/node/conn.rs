@@ -511,6 +511,8 @@ where
         // try to connect with manually added peers
         self.maybe_open_connection_with_added_peers()?;
 
+        self.maybe_open_onion_connection();
+
         // If the caller requires a specific service flag and we currently have zero
         // connected peers advertising it, we must open a new connection even when
         // already at MAX_OUTGOING_PEERS. Otherwise, a peer rotation initiated by the
@@ -554,6 +556,41 @@ where
         }
 
         Ok(())
+    }
+
+    /// With split routing, keep at least one onion peer.
+    ///
+    /// Random selection alone can fill every outbound slot with clearnet peers and never come
+    /// back to onion, so while we have no onion peer (connected or connecting) this opens one
+    /// even when the outbound slots are full, like Bitcoin Core's extra connection to a reachable
+    /// network we have no peer on. At most one such attempt is in flight at a time.
+    fn maybe_open_onion_connection(&mut self) {
+        if self.onion_socks5.is_none() || self.socks5.is_some() || self.has_fixed_peers() {
+            return;
+        }
+
+        if self.regular_onion_peers() > 0 {
+            return;
+        }
+
+        let Some((peer_id, peer_address)) = self.address_man.get_onion_address_to_connect() else {
+            return;
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.address_man
+            .update_set_state(peer_id, AddressState::Failed(now));
+
+        debug!("Opening an onion connection to keep network diversity: {peer_address:?}");
+        let allow_v1_fallback = self.config.allow_v1_fallback;
+        try_and_log!(self.open_connection(
+            ConnectionKind::OutboundFullRelay(ServiceFlags::NONE),
+            peer_address,
+            allow_v1_fallback,
+        ));
     }
 
     /// Try disconnecting the slowest non-protected-service peer.

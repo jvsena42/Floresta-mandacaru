@@ -979,6 +979,23 @@ impl AddressMan {
         None
     }
 
+    /// A random onion address worth dialling: not connected, not banned, and not failed within
+    /// the retry window.
+    pub fn get_onion_address_to_connect(&self) -> Option<(usize, LocalAddress)> {
+        let now = Self::time_since_unix();
+
+        self.addresses
+            .iter()
+            .filter(|(_, addr)| addr.get_onion_addr().is_some())
+            .filter(|(_, addr)| match addr.state {
+                AddressState::NeverTried | AddressState::Tried(_) => true,
+                AddressState::Failed(when) => when + RETRY_TIME < now,
+                AddressState::Connected | AddressState::Banned(_) => false,
+            })
+            .choose(&mut rand::rng())
+            .map(|(id, addr)| (*id, addr.to_owned()))
+    }
+
     fn get_random_address(&self, service: ServiceFlags) -> Option<(usize, LocalAddress)> {
         if self.addresses.is_empty() {
             return None;
@@ -1888,6 +1905,40 @@ mod test {
                 .filter_map(|addr| addr.get_onion_addr())
                 .all(|onion| onion.to_string().ends_with(".onion"))
         );
+    }
+
+    #[test]
+    fn test_onion_address_to_connect_skips_unusable_states() {
+        let mut address_man = AddressMan::new(None, &ReachableNetworks::reachable(true));
+        let flags = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+        let onion = |id: usize, state: AddressState| {
+            LocalAddress::new(
+                BitcoinSocketAddr::new(AddrV2::TorV3([id as u8; 32]), 8333),
+                0,
+                state,
+                flags,
+                id,
+            )
+        };
+        let now = AddressMan::time_since_unix();
+        address_man.push_addresses(&[
+            LocalAddress::new(
+                BitcoinSocketAddr::new(AddrV2::Ipv4("12.146.182.45".parse().unwrap()), 8333),
+                0,
+                AddressState::NeverTried,
+                flags,
+                1,
+            ),
+            onion(2, AddressState::Connected),
+            onion(3, AddressState::Banned(now)),
+            onion(4, AddressState::Failed(now)),
+        ]);
+        assert!(address_man.get_onion_address_to_connect().is_none());
+
+        address_man.push_addresses(&[onion(5, AddressState::Failed(now - RETRY_TIME - 1))]);
+        let (id, picked) = address_man.get_onion_address_to_connect().unwrap();
+        assert_eq!(id, 5);
+        assert!(picked.get_onion_addr().is_some());
     }
 
     #[test]
