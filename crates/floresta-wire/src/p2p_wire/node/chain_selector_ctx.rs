@@ -168,10 +168,6 @@ impl ChainSelector {
     /// no peer has can't keep the node in header sync forever.
     const MAX_ASSUME_UTREEXO_RESUMES: u32 = 5;
 
-    /// Most headers a peer sends in one `headers` message. A shorter batch means the peer
-    /// has nothing after its last header.
-    const MAX_HEADERS_PER_MESSAGE: usize = 2_000;
-
     /// How far behind our tip a peer's advertised height may be for its empty `headers`
     /// to still count as "nothing after ours". About a day of blocks.
     const PEER_BEHIND_MARGIN: u32 = 144;
@@ -283,16 +279,19 @@ where
         }
 
         if already_had_last && tip_after == tip_before {
-            // A full batch we already had answers a request someone else already answered
-            // (a re-issued or poked `getheaders`). Following it up would run a second
-            // download of the same range in parallel with the one that extended our chain.
-            if headers.len() >= ChainSelector::MAX_HEADERS_PER_MESSAGE {
-                return Ok(());
+            // A batch we already had is a duplicate answer to a re-issued or poked
+            // `getheaders`, or the announcement of a block we already fetched. Neither says
+            // where the chain ends, and following it up would run a second download of a
+            // range we have. A peer far behind us answers our requests this way every time,
+            // so it's dropped.
+            let (our_height, _) = self.chain.get_best_block()?;
+            if let Some(height) = self.non_manual_peer_height(peer)
+                && Self::is_far_behind(height, our_height)
+            {
+                self.drop_peer_that_cannot_serve_headers(peer, height, our_height);
+                return self.request_headers(tip_after.1);
             }
-
-            // A short batch we already had ends at the peer's tip, which isn't past ours:
-            // it has nothing new for us, the same as an empty `headers`.
-            return self.empty_headers_message(peer).await;
+            return Ok(());
         }
 
         self.request_headers(last)
@@ -764,24 +763,35 @@ where
     /// dropping it costs a reconnect, and the new connection advertises a fresh height.
     /// Manual peers are kept: with only them, ending the download is all we can do.
     fn peer_cannot_serve_headers(&mut self, peer: PeerId) -> Result<bool, WireError> {
-        let Some(peer_data) = self.peers.get(&peer) else {
+        let Some(height) = self.non_manual_peer_height(peer) else {
             return Ok(false);
         };
         let (our_height, _) = self.chain.get_best_block()?;
-        let ahead_of_us = peer_data.height > our_height;
-        let far_behind_us = peer_data
-            .height
-            .saturating_add(ChainSelector::PEER_BEHIND_MARGIN)
-            < our_height;
-        if !(ahead_of_us || far_behind_us) || peer_data.kind.is_manual() {
+        if height <= our_height && !Self::is_far_behind(height, our_height) {
             return Ok(false);
         }
 
+        self.drop_peer_that_cannot_serve_headers(peer, height, our_height);
+        Ok(true)
+    }
+
+    /// The height a peer advertised, unless it's a manual peer, which we never drop.
+    fn non_manual_peer_height(&self, peer: PeerId) -> Option<u32> {
+        let peer_data = self.peers.get(&peer)?;
+        (!peer_data.kind.is_manual()).then_some(peer_data.height)
+    }
+
+    fn is_far_behind(peer_height: u32, our_height: u32) -> bool {
+        peer_height.saturating_add(ChainSelector::PEER_BEHIND_MARGIN) < our_height
+    }
+
+    fn drop_peer_that_cannot_serve_headers(&mut self, peer: PeerId, height: u32, our_height: u32) {
+        let Some(idx) = self.peers.get(&peer).map(|p| p.address.id) else {
+            return;
+        };
         info!(
-            "peer={peer} advertised height={} but sent no headers after ours (height={our_height}); disconnecting it and asking another peer",
-            peer_data.height
+            "peer={peer} advertised height={height} but sent no headers after ours (height={our_height}); disconnecting it and asking another peer"
         );
-        let idx = peer_data.address.id;
         let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
         self.context.done_peers.remove(&peer);
         self.context.tip_cache.remove(&peer);
@@ -797,7 +807,6 @@ where
             .unwrap_or_default();
         self.address_man
             .update_set_state(idx, AddressState::Failed(now));
-        Ok(true)
     }
 
     /// Checks the all-peers-done gate while in `LookingForForks`. If every connected peer
@@ -1398,38 +1407,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_batch_we_already_had_does_not_start_a_parallel_download() {
-        let max = ChainSelector::MAX_HEADERS_PER_MESSAGE;
-        let known = max;
-        let (mut node, headers) = header_sync_node_with(known);
+    async fn a_batch_we_already_had_does_not_start_a_parallel_download() {
+        let (mut node, headers) = header_sync_node();
         node.context.state = ChainSelectorState::DownloadingHeaders;
 
-        node.handle_headers(0, headers[1..=max].to_vec())
+        node.handle_headers(0, headers[1..=KNOWN_HEADERS].to_vec())
             .await
             .unwrap();
         assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
         assert!(!node.inflight.contains_key(&InflightRequests::Headers));
 
-        node.handle_headers(1, headers[known + 1..=known + 10].to_vec())
+        node.handle_headers(1, headers[KNOWN_HEADERS + 1..=KNOWN_HEADERS + 10].to_vec())
             .await
             .unwrap();
         assert!(node.inflight.contains_key(&InflightRequests::Headers));
     }
 
     #[tokio::test]
-    async fn a_short_batch_we_already_had_ends_the_download_like_empty_headers() {
+    async fn an_announcement_we_already_had_does_not_end_the_download() {
         let (mut node, headers) = header_sync_node();
         node.context.state = ChainSelectorState::DownloadingHeaders;
+        node.peers.get_mut(&0).unwrap().kind = ConnectionKind::Manual;
 
-        node.handle_headers(0, headers[1..=KNOWN_HEADERS - 20].to_vec())
+        node.handle_headers(0, vec![headers[KNOWN_HEADERS]])
             .await
             .unwrap();
 
-        assert!(matches!(
-            node.context.state,
-            ChainSelectorState::LookingForForks(_)
-        ));
-        assert!(node.context.done_peers.contains(&0));
+        assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+        assert!(node.context.done_peers.is_empty());
+        assert!(node.peers.contains_key(&0));
+    }
+
+    #[tokio::test]
+    async fn a_batch_we_already_had_from_a_peer_far_behind_us_drops_it() {
+        let (mut node, headers) = header_sync_node_with(1_000);
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+        node.peers.get_mut(&0).unwrap().height = 1_000 - ChainSelector::PEER_BEHIND_MARGIN - 1;
+
+        node.handle_headers(0, headers[1..=100].to_vec())
+            .await
+            .unwrap();
+
+        assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+        assert!(!node.peers.contains_key(&0));
+        assert_eq!(
+            node.inflight.get(&InflightRequests::Headers).map(|r| r.0),
+            Some(1)
+        );
     }
 
     #[tokio::test]
