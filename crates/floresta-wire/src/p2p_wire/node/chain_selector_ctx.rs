@@ -163,6 +163,10 @@ impl ChainSelector {
     /// without the assume-utreexo block in our chain. Bounded so a snapshot whose block
     /// no peer has can't keep the node in header sync forever.
     const MAX_ASSUME_UTREEXO_RESUMES: u32 = 5;
+
+    /// Most headers a peer sends in one `headers` message. A shorter batch means the peer
+    /// has nothing after its last header.
+    const MAX_HEADERS_PER_MESSAGE: usize = 2_000;
 }
 
 impl NodeContext for ChainSelector {
@@ -236,6 +240,10 @@ where
         // produces a cascading getheaders fan-out that prevents the all-done gate from
         // ever closing.
         let tip_after = self.chain.get_best_block()?;
+        if tip_after != tip_before {
+            self.context.assume_utreexo_resumes = 0;
+        }
+
         if matches!(self.context.state, ChainSelectorState::LookingForForks(_)) {
             if tip_after == tip_before {
                 self.context.done_peers.insert(peer);
@@ -253,11 +261,17 @@ where
             self.enter_downloading_headers();
         }
 
-        // A batch we already had answers a request someone else already answered (a
-        // re-issued or poked `getheaders`). Following it up would run a second download
-        // of the same range in parallel with the one that extended our chain.
         if already_had_last && tip_after == tip_before {
-            return Ok(());
+            // A full batch we already had answers a request someone else already answered
+            // (a re-issued or poked `getheaders`). Following it up would run a second
+            // download of the same range in parallel with the one that extended our chain.
+            if headers.len() >= ChainSelector::MAX_HEADERS_PER_MESSAGE {
+                return Ok(());
+            }
+
+            // A short batch we already had ends at the peer's tip, which isn't past ours:
+            // it has nothing new for us, the same as an empty `headers`.
+            return self.empty_headers_message(peer).await;
         }
 
         self.request_headers(last)
@@ -1239,16 +1253,20 @@ mod tests {
 
     const KNOWN_HEADERS: usize = 60;
 
-    /// A `ChainSelector` with signet headers up to `KNOWN_HEADERS` and two simulated peers
-    /// that never get their messages processed, so each test drives the handlers by hand.
     fn header_sync_node() -> (TestNode, Vec<bitcoin::block::Header>) {
+        header_sync_node_with(KNOWN_HEADERS)
+    }
+
+    /// A `ChainSelector` with signet headers up to `known_headers` and two simulated peers
+    /// that never get their messages processed, so each test drives the handlers by hand.
+    fn header_sync_node_with(known_headers: usize) -> (TestNode, Vec<bitcoin::block::Header>) {
         let headers = signet_headers();
         let peers = vec![
             PeerData::new(headers.clone(), signet_blocks(), signet_roots()),
             PeerData::new(headers.clone(), signet_blocks(), signet_roots()),
         ];
         let datadir = format!("./tmp-db/{}.chain_selector_ctx", rand::random::<u32>());
-        let args = SetupNodeArgs::new(peers, false, Network::Signet, datadir, KNOWN_HEADERS);
+        let args = SetupNodeArgs::new(peers, false, Network::Signet, datadir, known_headers);
         let mut node = setup_node::<ChainSelector>(args);
         node.peer_ids = vec![0, 1];
         for peer in node.peers.values_mut() {
@@ -1303,19 +1321,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_batch_we_already_had_does_not_start_a_parallel_download() {
-        let (mut node, headers) = header_sync_node();
+    async fn a_full_batch_we_already_had_does_not_start_a_parallel_download() {
+        let max = ChainSelector::MAX_HEADERS_PER_MESSAGE;
+        let known = max;
+        let (mut node, headers) = header_sync_node_with(known);
         node.context.state = ChainSelectorState::DownloadingHeaders;
 
-        node.handle_headers(0, headers[KNOWN_HEADERS - 19..=KNOWN_HEADERS].to_vec())
+        node.handle_headers(0, headers[1..=max].to_vec())
             .await
             .unwrap();
+        assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
         assert!(!node.inflight.contains_key(&InflightRequests::Headers));
 
-        node.handle_headers(1, headers[KNOWN_HEADERS + 1..=KNOWN_HEADERS + 20].to_vec())
+        node.handle_headers(1, headers[known + 1..=known + 10].to_vec())
             .await
             .unwrap();
         assert!(node.inflight.contains_key(&InflightRequests::Headers));
+    }
+
+    #[tokio::test]
+    async fn a_short_batch_we_already_had_ends_the_download_like_empty_headers() {
+        let (mut node, headers) = header_sync_node();
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+
+        node.handle_headers(0, headers[1..=KNOWN_HEADERS - 20].to_vec())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            node.context.state,
+            ChainSelectorState::LookingForForks(_)
+        ));
+        assert!(node.context.done_peers.contains(&0));
+    }
+
+    #[tokio::test]
+    async fn the_resume_budget_refills_when_headers_make_progress() {
+        let (mut node, headers) = header_sync_node();
+        node.config.assume_utreexo = Some(assume_utreexo_at(&headers, KNOWN_HEADERS + 50));
+        node.context.assume_utreexo_resumes = ChainSelector::MAX_ASSUME_UTREEXO_RESUMES;
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+
+        node.handle_headers(0, headers[KNOWN_HEADERS + 1..=KNOWN_HEADERS + 20].to_vec())
+            .await
+            .unwrap();
+
+        assert_eq!(node.context.assume_utreexo_resumes, 0);
+    }
+
+    #[tokio::test]
+    async fn header_phase_assumes_the_snapshot_once_its_block_is_in_the_best_chain() {
+        let (mut node, headers) = header_sync_node();
+        node.config.assume_utreexo = Some(assume_utreexo_at(&headers, KNOWN_HEADERS));
+        node.context.state = ChainSelectorState::LookingForForks(Instant::now());
+        node.context.done_peers.extend([0, 1]);
+
+        node.maybe_finish_looking_for_forks().await.unwrap();
+
+        assert_eq!(node.context.state, ChainSelectorState::Done);
+        assert_eq!(
+            node.chain.get_validation_index().unwrap(),
+            KNOWN_HEADERS as u32
+        );
     }
 
     #[tokio::test]
