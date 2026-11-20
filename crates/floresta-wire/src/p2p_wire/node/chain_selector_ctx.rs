@@ -117,6 +117,13 @@ pub struct ChainSelector {
     /// How many times the header download was resumed because the assume-utreexo block
     /// was missing from our header chain when every peer looked done.
     assume_utreexo_resumes: u32,
+
+    /// The last peer that answered with headers we already had, if it did so since the
+    /// last stall check.
+    known_batch_since_stall_check: Option<PeerId>,
+
+    /// Consecutive stall checks in which peers only sent headers we already had.
+    stalls_with_only_known_batches: u32,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -171,6 +178,10 @@ impl ChainSelector {
     /// How far behind our tip a peer's advertised height may be for its empty `headers`
     /// to still count as "nothing after ours". About a day of blocks.
     const PEER_BEHIND_MARGIN: u32 = 144;
+
+    /// Stall checks in a row with only known headers coming in after which we take it
+    /// that our peers have nothing past our tip, like an empty `headers`.
+    const MAX_STALLS_WITH_ONLY_KNOWN_BATCHES: u32 = 3;
 }
 
 impl NodeContext for ChainSelector {
@@ -259,6 +270,7 @@ where
         let tip_after = self.chain.get_best_block()?;
         if tip_after != tip_before {
             self.context.assume_utreexo_resumes = 0;
+            self.context.stalls_with_only_known_batches = 0;
         }
 
         if matches!(self.context.state, ChainSelectorState::LookingForForks(_)) {
@@ -291,10 +303,32 @@ where
                 self.drop_peer_that_cannot_serve_headers(peer, height, our_height);
                 return self.request_headers(tip_after.1);
             }
+            self.context.known_batch_since_stall_check = Some(peer);
             return Ok(());
         }
 
         self.request_headers(last)
+    }
+
+    /// Called on each stall check. Whether peers answered only with headers we already
+    /// had for `MAX_STALLS_WITH_ONLY_KNOWN_BATCHES` checks in a row. A stall where nobody
+    /// answers resets the count: that's a slow peer, not the end of its chain.
+    fn peers_only_send_known_headers(&mut self) -> bool {
+        if self.context.known_batch_since_stall_check.is_none() {
+            self.context.stalls_with_only_known_batches = 0;
+            return false;
+        }
+
+        self.context.stalls_with_only_known_batches += 1;
+        if self.context.stalls_with_only_known_batches
+            < ChainSelector::MAX_STALLS_WITH_ONLY_KNOWN_BATCHES
+        {
+            self.context.known_batch_since_stall_check = None;
+            return false;
+        }
+
+        self.context.stalls_with_only_known_batches = 0;
+        true
     }
 
     fn enter_downloading_headers(&mut self) {
@@ -1061,6 +1095,39 @@ where
         connected_peers >= ChainSelector::MAX_OUTGOING_PEERS
     }
 
+    /// Re-requests headers when the download made no progress for `REQUEST_TIMEOUT`, or
+    /// ends it when peers only keep sending headers we already have.
+    async fn check_header_stall(&mut self) -> Result<(), WireError> {
+        let elapsed = self.last_tip_update.elapsed().as_secs();
+        let should_request = elapsed > ChainSelector::REQUEST_TIMEOUT
+            && !self.inflight.contains_key(&InflightRequests::Headers);
+
+        if should_request {
+            let (height, _) = self.chain.get_best_block()?;
+            if self.peers_only_send_known_headers() {
+                let peer = self.context.known_batch_since_stall_check.take();
+                if let Some(peer) = peer.filter(|p| self.peers.contains_key(p)) {
+                    // A peer behind our stored headers (e.g. the only `--connect`
+                    // peer after a restart) answers every request with headers we
+                    // have. Without this the download would wait for it forever.
+                    info!(
+                        "Peers only sent headers we already have for {} stall checks at height={height}; treating it as the end of their chain",
+                        ChainSelector::MAX_STALLS_WITH_ONLY_KNOWN_BATCHES
+                    );
+                    self.empty_headers_message(peer).await?;
+                    return Ok(());
+                }
+            }
+
+            info!(
+                "Header IBD stalled for {elapsed}s at height={height}; re-requesting from a fresh peer"
+            );
+            self.request_headers(self.chain.get_best_block()?.1)?;
+        }
+
+        Ok(())
+    }
+
     /// Performs the periodic maintenance tasks, including checking for the cancel signal, peer
     /// connections, and inflight request timeouts.
     ///
@@ -1121,17 +1188,7 @@ where
         }
 
         if let ChainSelectorState::DownloadingHeaders = self.context.state {
-            let elapsed = self.last_tip_update.elapsed().as_secs();
-            let should_request = elapsed > ChainSelector::REQUEST_TIMEOUT
-                && !self.inflight.contains_key(&InflightRequests::Headers);
-
-            if should_request {
-                let (height, _) = self.chain.get_best_block()?;
-                info!(
-                    "Header IBD stalled for {elapsed}s at height={height}; re-requesting from a fresh peer"
-                );
-                self.request_headers(self.chain.get_best_block()?.1)?;
-            }
+            self.check_header_stall().await?;
         }
 
         if self.context.state == ChainSelectorState::CreatingConnections {
@@ -1404,6 +1461,48 @@ mod tests {
         ));
         assert!(node.context.done_peers.contains(&0));
         assert!(!node.inflight.contains_key(&InflightRequests::Headers));
+    }
+
+    #[tokio::test]
+    async fn a_manual_peer_behind_us_ends_the_download_after_three_stall_checks() {
+        let (mut node, headers) = header_sync_node();
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+        node.peers.get_mut(&0).unwrap().kind = ConnectionKind::Manual;
+        let stalled = Instant::now() - Duration::from_secs(ChainSelector::REQUEST_TIMEOUT + 1);
+
+        for check in 1..=ChainSelector::MAX_STALLS_WITH_ONLY_KNOWN_BATCHES {
+            node.handle_headers(0, headers[1..=20].to_vec())
+                .await
+                .unwrap();
+            node.last_tip_update = stalled;
+            node.inflight.remove(&InflightRequests::Headers);
+            node.check_header_stall().await.unwrap();
+
+            if check < ChainSelector::MAX_STALLS_WITH_ONLY_KNOWN_BATCHES {
+                assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+            }
+        }
+
+        assert!(matches!(
+            node.context.state,
+            ChainSelectorState::LookingForForks(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stall_where_nobody_answers_does_not_end_the_download() {
+        let (mut node, _) = header_sync_node();
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+        let stalled = Instant::now() - Duration::from_secs(ChainSelector::REQUEST_TIMEOUT + 1);
+
+        for _ in 0..=ChainSelector::MAX_STALLS_WITH_ONLY_KNOWN_BATCHES {
+            node.last_tip_update = stalled;
+            node.inflight.remove(&InflightRequests::Headers);
+            node.check_header_stall().await.unwrap();
+        }
+
+        assert_eq!(node.context.state, ChainSelectorState::DownloadingHeaders);
+        assert!(node.inflight.contains_key(&InflightRequests::Headers));
     }
 
     #[tokio::test]
