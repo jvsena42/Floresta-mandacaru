@@ -167,6 +167,15 @@ where
     /// We don't open the connection here, we create a [`Peer`] actor that will try to open
     /// a connection with the given address and kind. If it succeeds, it will send a
     /// [`PeerMessages::Ready`](crate::p2p_wire::peer::PeerMessages) to the node after handshaking.
+    /// The SOCKS5 proxy a connection to `address` goes through, or `None` to connect directly.
+    pub(crate) fn proxy_for(&self, address: &LocalAddress) -> Option<SocketAddr> {
+        proxy_route(
+            address.get_onion_addr().is_some(),
+            self.socks5.as_ref().map(|proxy| proxy.address),
+            self.onion_socks5.as_ref().map(|proxy| proxy.address),
+        )
+    }
+
     pub(crate) fn open_connection(
         &mut self,
         kind: ConnectionKind,
@@ -183,11 +192,11 @@ where
             (peer_count, Instant::now()),
         );
 
-        if let Some(ref proxy) = self.socks5 {
+        if let Some(proxy) = self.proxy_for(&peer_address) {
             spawn(timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(T::PROXY_CONNECTION_TIMEOUT),
                 Self::open_proxy_connection(
-                    proxy.address,
+                    proxy,
                     kind,
                     self.mempool.clone(),
                     self.network,
@@ -205,7 +214,7 @@ where
             ));
         } else {
             spawn(timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(T::CONNECTION_TIMEOUT),
                 Self::open_non_proxy_connection(
                     kind,
                     peer_address.clone(),
@@ -533,7 +542,7 @@ where
 
     /// Try disconnecting the slowest non-protected-service peer.
     ///
-    /// For peers that don't have any of the `protected_services`, we disconnect the
+    /// For clearnet peers that don't have any of the `protected_services`, we disconnect the
     /// highest-latency one when any of these hold:
     /// - Its latency is more than 1.5x the median latency across eligible peers.
     /// - `always` is true.
@@ -550,9 +559,13 @@ where
         /// This is the same value as the `libbitcoin` default `allowed_deviation`.
         const ALLOWED_DEVIATION: f64 = 1.5;
 
-        // Use latency samples only from regular, non-protected-service peers.
+        // Use latency samples only from regular, non-protected-service peers. Onion peers are
+        // left out: a Tor circuit is always slower than a direct connection, so comparing them
+        // against clearnet peers would keep evicting the few onion peers we have.
         let is_eligible_peer = |peer: &LocalPeerView| {
-            peer.kind.is_regular() && !peer.has_any_service(protected_services)
+            peer.kind.is_regular()
+                && !peer.has_any_service(protected_services)
+                && peer.address.get_onion_addr().is_none()
         };
 
         let mut samples: Vec<_> = self
@@ -622,5 +635,54 @@ where
             self.open_connection(ConnectionKind::Manual, address, v1_fallback)?
         }
         Ok(())
+    }
+}
+
+/// Picks the SOCKS5 proxy for a peer: onion peers prefer the onion-only proxy and fall back to
+/// the general one, every other peer uses the general one. `None` means a direct connection.
+pub(crate) fn proxy_route(
+    is_onion: bool,
+    proxy: Option<SocketAddr>,
+    onion_proxy: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    if is_onion {
+        return onion_proxy.or(proxy);
+    }
+
+    proxy
+}
+
+#[cfg(test)]
+mod tests {
+    use core::net::SocketAddr;
+
+    use super::proxy_route;
+
+    fn addr(port: u16) -> Option<SocketAddr> {
+        Some(SocketAddr::from(([127, 0, 0, 1], port)))
+    }
+
+    #[test]
+    fn no_proxy_connects_directly() {
+        assert_eq!(proxy_route(false, None, None), None);
+        assert_eq!(proxy_route(true, None, None), None);
+    }
+
+    #[test]
+    fn general_proxy_carries_every_peer() {
+        assert_eq!(proxy_route(false, addr(9050), None), addr(9050));
+        assert_eq!(proxy_route(true, addr(9050), None), addr(9050));
+    }
+
+    #[test]
+    fn onion_proxy_carries_only_onion_peers() {
+        assert_eq!(proxy_route(false, None, addr(9050)), None);
+        assert_eq!(proxy_route(true, None, addr(9050)), addr(9050));
+    }
+
+    #[test]
+    fn onion_proxy_wins_for_onion_peers_when_both_are_set() {
+        assert_eq!(proxy_route(true, addr(9050), addr(9150)), addr(9150));
+        assert_eq!(proxy_route(false, addr(9050), addr(9150)), addr(9050));
     }
 }

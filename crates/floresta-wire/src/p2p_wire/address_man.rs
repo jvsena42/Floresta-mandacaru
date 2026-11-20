@@ -97,6 +97,15 @@ impl ReachableNetworks {
 
     /// Networks this implementation currently supports.
     pub const SUPPORTED: [Self; 3] = [Self::IPv4, Self::IPv6, Self::TorV3];
+
+    /// The supported networks a node can actually reach. Onion services need a SOCKS5 proxy
+    /// that routes to Tor; without one, onion addresses would only waste connection attempts.
+    pub fn reachable(has_onion_route: bool) -> Vec<Self> {
+        Self::SUPPORTED
+            .into_iter()
+            .filter(|net| has_onion_route || *net != Self::TorV3)
+            .collect()
+    }
 }
 
 impl Display for ReachableNetworks {
@@ -892,6 +901,7 @@ impl AddressMan {
             Ok(anchors
                 .into_iter()
                 .map(Into::<LocalAddress>::into)
+                .filter(|anchor| self.is_net_reachable(anchor))
                 .collect::<Vec<_>>())
         });
 
@@ -1839,6 +1849,82 @@ mod test {
         let mut address_man = AddressMan::new(None, &ReachableNetworks::SUPPORTED);
         address_man.add_fixed_addresses(Network::Signet);
         assert!(!address_man.addresses.is_empty());
+    }
+
+    #[test]
+    fn test_onion_is_reachable_only_with_an_onion_route() {
+        assert_eq!(
+            ReachableNetworks::reachable(false),
+            vec![ReachableNetworks::IPv4, ReachableNetworks::IPv6]
+        );
+        assert_eq!(
+            ReachableNetworks::reachable(true),
+            ReachableNetworks::SUPPORTED.to_vec()
+        );
+    }
+
+    #[test]
+    fn test_mainnet_onion_seeds_follow_reachability() {
+        let count_onion = |address_man: &AddressMan| {
+            address_man
+                .addresses
+                .values()
+                .filter(|addr| addr.get_onion_addr().is_some())
+                .count()
+        };
+
+        let mut without_tor = AddressMan::new(None, &ReachableNetworks::reachable(false));
+        without_tor.add_fixed_addresses(Network::Bitcoin);
+        assert!(!without_tor.addresses.is_empty());
+        assert_eq!(count_onion(&without_tor), 0);
+
+        let mut with_tor = AddressMan::new(None, &ReachableNetworks::reachable(true));
+        with_tor.add_fixed_addresses(Network::Bitcoin);
+        assert!(count_onion(&with_tor) > 0);
+        assert!(
+            with_tor
+                .addresses
+                .values()
+                .filter_map(|addr| addr.get_onion_addr())
+                .all(|onion| onion.to_string().ends_with(".onion"))
+        );
+    }
+
+    #[test]
+    fn test_unreachable_anchors_are_not_returned() {
+        let datadir = std::env::temp_dir().join(format!(
+            "floresta-anchors-{}-{}",
+            std::process::id(),
+            AddressMan::time_since_unix()
+        ));
+        std::fs::create_dir_all(&datadir).unwrap();
+
+        let ipv4 = LocalAddress::new(
+            BitcoinSocketAddr::new(AddrV2::Ipv4("12.146.182.45".parse().unwrap()), 8333),
+            0,
+            AddressState::Tried(0),
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+            1,
+        );
+        let onion = LocalAddress::new(
+            BitcoinSocketAddr::new(AddrV2::TorV3([7; 32]), 8333),
+            0,
+            AddressState::Tried(0),
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+            2,
+        );
+        AddressMan::dump_utreexo_peers(&datadir, &[ipv4, onion]).unwrap();
+
+        let anchors =
+            AddressMan::new(None, &ReachableNetworks::reachable(false)).start_addr_man(&datadir);
+        assert_eq!(anchors.len(), 1);
+        assert!(anchors[0].get_onion_addr().is_none());
+
+        let anchors =
+            AddressMan::new(None, &ReachableNetworks::reachable(true)).start_addr_man(&datadir);
+        assert_eq!(anchors.len(), 2);
+
+        std::fs::remove_dir_all(&datadir).unwrap();
     }
 
     #[test]

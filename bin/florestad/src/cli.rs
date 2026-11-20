@@ -65,6 +65,11 @@ pub struct Cli {
     /// The url of a proxy we should open p2p connections through (e.g. 127.0.0.1:9050)
     pub proxy: Option<String>,
 
+    #[arg(long, default_value = None, value_name = "address[:<port>]")]
+    /// A SOCKS5 proxy used only for Tor onion peers (e.g. 127.0.0.1:9050). Other peers keep
+    /// connecting directly, or through --proxy if set
+    pub onion_proxy: Option<String>,
+
     #[arg(long, value_name = "XPUB")]
     /// Add an xpub to our wallet
     ///

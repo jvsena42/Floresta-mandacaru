@@ -104,7 +104,7 @@ class TestP2pAddrRelay:
 
         # Generates I2P, Onion, IPv4, and IPv6 addresses; only IPv4/IPv6 are stored, others are
         # rejected by node configuration.
-        self.check_addr_received(ipv4_expected=2, ipv6_expected=3, onion_expected=3)
+        self.check_addr_received(ipv4_expected=2, ipv6_expected=3)
 
         self.log.info(
             "Testing addrv2 message with varying number of addresses to check for disconnection on "

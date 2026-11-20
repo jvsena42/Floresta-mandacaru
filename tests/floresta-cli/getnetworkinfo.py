@@ -91,7 +91,7 @@ def test_get_network_info(florestad_node):
     expected_reachable = {
         "ipv4": True,
         "ipv6": True,
-        "onion": True,
+        "onion": False,
         "i2p": False,
         "cjdns": False,
     }

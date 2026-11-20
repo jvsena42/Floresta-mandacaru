@@ -81,6 +81,10 @@ pub trait NodeContext {
     /// greater than `TRY_NEW_CONNECTION` in order to clear timed-out requests at the same pace.
     const CONNECTION_TIMEOUT: u64 = 10; // 10 seconds
 
+    /// [`Self::CONNECTION_TIMEOUT`] for connections made through a SOCKS5 proxy. Building a Tor
+    /// circuit, especially to an onion service, routinely takes longer than a direct connection.
+    const PROXY_CONNECTION_TIMEOUT: u64 = 30; // 30 seconds
+
     /// How many blocks we can ask in the same request
     const BLOCKS_PER_GETDATA: usize = 5;
 

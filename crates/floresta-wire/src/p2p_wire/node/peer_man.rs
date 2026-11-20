@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::HashSet;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -988,16 +989,23 @@ where
     pub(crate) fn check_for_timeout(&mut self) -> Result<(), WireError> {
         let now = Instant::now();
 
-        let timed_out_fn = |req: &InflightRequests, time: &Instant| match req {
-            InflightRequests::Connect(_)
-                if now.duration_since(*time).as_secs() > T::CONNECTION_TIMEOUT =>
-            {
-                Some(req.clone())
-            }
+        let proxied_peers: HashSet<u32> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| self.proxy_for(&peer.address).is_some())
+            .map(|(&id, _)| id)
+            .collect();
 
-            _ if now.duration_since(*time).as_secs() > T::REQUEST_TIMEOUT => Some(req.clone()),
+        let timed_out_fn = |req: &InflightRequests, time: &Instant| {
+            let limit = match req {
+                InflightRequests::Connect(peer) if proxied_peers.contains(peer) => {
+                    T::PROXY_CONNECTION_TIMEOUT
+                }
+                InflightRequests::Connect(_) => T::CONNECTION_TIMEOUT,
+                _ => T::REQUEST_TIMEOUT,
+            };
 
-            _ => None,
+            (now.duration_since(*time).as_secs() > limit).then(|| req.clone())
         };
 
         let timed_out: Vec<_> = self

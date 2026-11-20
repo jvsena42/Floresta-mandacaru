@@ -644,7 +644,10 @@ mod tests {
             chain,
             mempool,
             kill_signal,
-            AddressMan::new(None, &[]),
+            AddressMan::new(
+                None,
+                &crate::address_man::ReachableNetworks::reachable(false),
+            ),
         )
         .unwrap();
 
