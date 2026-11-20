@@ -71,6 +71,7 @@ use rustreexo::stump::Stump;
 use tokio::time;
 use tokio::time::MissedTickBehavior;
 use tokio::time::timeout;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -221,7 +222,7 @@ where
                 // we don't have, which some peers answer with an empty `headers` that ends
                 // the download early. The download already in flight carries on.
                 if i == 0 && matches!(e, BlockchainError::BlockNotPresent) {
-                    info!(
+                    debug!(
                         "Ignoring headers from peer={peer} that don't connect to our chain (first={})",
                         header.block_hash()
                     );
@@ -913,10 +914,12 @@ where
     /// our peer is in a fork, so we can learn about all blocks in that fork and
     /// compare the candidate chains to pick the best one.
     fn request_headers(&mut self, tip: BlockHash) -> Result<(), WireError> {
-        let locator = self
-            .chain
-            .get_block_locator_for_tip(tip)
-            .unwrap_or_default();
+        // A `tip` we don't have (from headers that failed to validate) has no locator. An
+        // empty one gets an empty `headers` from some peers, which would end the download.
+        let locator = match self.chain.get_block_locator_for_tip(tip) {
+            Ok(locator) => locator,
+            Err(_) => self.chain.get_block_locator()?,
+        };
 
         let peer = self.send_to_fast_peer(NodeRequest::GetHeaders(locator), ServiceFlags::NONE)?;
 
