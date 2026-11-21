@@ -19,6 +19,7 @@ use floresta_domain::wallet::error::WatchOnlyError;
 use super::AddressCacheDatabase;
 use super::CachedAddress;
 use super::CachedTransaction;
+use super::RescanJob;
 use super::Stats;
 
 #[derive(Debug, Default)]
@@ -29,6 +30,7 @@ struct Inner {
     height: u32,
     descriptors: Vec<String>,
     pending_rescan: Vec<ScriptBuf>,
+    rescan_job: Option<RescanJob>,
 }
 
 #[derive(Debug)]
@@ -141,6 +143,17 @@ impl AddressCacheDatabase for MemoryDatabase {
     /// Get the addresses still to be rescanned.
     fn get_pending_rescan(&self) -> Result<Vec<ScriptBuf>> {
         Ok(self.get_inner()?.pending_rescan.clone())
+    }
+
+    /// Replace or remove the unfinished rescan.
+    fn save_rescan_job(&self, job: Option<&RescanJob>) -> Result<()> {
+        self.get_inner_mut()?.rescan_job = job.cloned();
+        Ok(())
+    }
+
+    /// Get the unfinished rescan.
+    fn get_rescan_job(&self) -> Result<Option<RescanJob>> {
+        Ok(self.get_inner()?.rescan_job.clone())
     }
 
     /// Get the [`MemoryDatabase`]'s descriptors.

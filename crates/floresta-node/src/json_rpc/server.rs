@@ -408,28 +408,31 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             }
         };
 
+        let state = Arc::new(Self {
+            chain,
+            wallet,
+            node,
+            filters,
+            kill_signal,
+            network,
+            inflight: Arc::new(RwLock::new(HashMap::new())),
+            log_path: log_path.as_ref().into(),
+            start_time: Instant::now(),
+            rescan: RescanState::default(),
+            user_agent,
+            proxy,
+            onion_proxy,
+            default_connection_is_v2,
+        });
+        state.resume_wallet_rescan();
+
         let router = Router::new()
             .route("/", post(json_rpc_request).get(cannot_get))
             .layer(axum::middleware::from_fn_with_state(
                 credentials,
                 auth_middleware,
             ))
-            .with_state(Arc::new(Self {
-                chain,
-                wallet,
-                node,
-                filters,
-                kill_signal,
-                network,
-                inflight: Arc::new(RwLock::new(HashMap::new())),
-                log_path: log_path.as_ref().into(),
-                start_time: Instant::now(),
-                rescan: RescanState::default(),
-                user_agent,
-                proxy,
-                onion_proxy,
-                default_connection_is_v2,
-            }));
+            .with_state(state);
 
         axum::serve(
             listener,
