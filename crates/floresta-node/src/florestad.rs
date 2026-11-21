@@ -132,7 +132,8 @@ pub struct Config {
     /// A proxy that we should use to connect with others
     ///
     /// This should be a socks5 proxy, like Tor's socks. If provided, all our outgoing connections
-    /// will be made through this one, and DNS seeds are queried over it.
+    /// will be made through this one (onion peers use `onion_proxy` instead, when set), and DNS
+    /// seeds are queried over it.
     pub proxy: Option<String>,
 
     /// A SOCKS5 proxy used only to reach Tor onion peers, like Bitcoin Core's `-onion`.

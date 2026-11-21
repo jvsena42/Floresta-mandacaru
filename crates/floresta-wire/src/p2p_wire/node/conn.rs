@@ -163,6 +163,15 @@ where
         self.onion_socks5.is_some() && self.socks5.is_none()
     }
 
+    /// Connected peers that count against `MAX_OUTGOING_PEERS`. The onion peer split routing
+    /// keeps is extra, like Bitcoin Core's extra connection to a network it has no peer on, so
+    /// it never takes a slot from (or gets a service rotation's new peer demoted).
+    pub(crate) fn peers_toward_limit(&self) -> usize {
+        let extra_onion =
+            usize::from(self.uses_split_routing() && self.ready_regular_onion_peers() > 0);
+        self.connected_peers().saturating_sub(extra_onion)
+    }
+
     /// Regular (non-manual, long-lived) peers we have, or are connecting to, over onion.
     pub(crate) fn regular_onion_peers(&self) -> usize {
         self.peers
@@ -184,12 +193,15 @@ where
         onion_slot_available(self.regular_onion_peers(), self.socks5.is_some())
     }
 
-    /// [`Self::can_dial_onion`] for a dial that needs `service`. A needed service wins over the
-    /// onion cap: if only onion addresses advertise it, we dial one rather than go without.
+    /// [`Self::can_dial_onion`] for a dial that needs `service`. A needed utreexo or
+    /// compact-filters service wins over the onion cap: if no clearnet address offering it can be
+    /// dialled, we dial an onion one rather than go without. Other flags are not indexed by the
+    /// address manager, so they never override the cap.
     pub(crate) fn can_dial_onion_for(&self, service: ServiceFlags) -> bool {
+        let indexed =
+            service == service_flags::UTREEXO.into() || service == ServiceFlags::COMPACT_FILTERS;
         self.can_dial_onion()
-            || (service != ServiceFlags::NONE
-                && !self.address_man.has_address_for_service(service, false))
+            || (indexed && !self.address_man.has_address_for_service(service, false))
     }
 
     /// Regular onion peers that finished their handshake.
@@ -567,7 +579,7 @@ where
                 .map(|peers| peers.is_empty())
                 .unwrap_or(true);
 
-        if self.connected_peers() >= T::MAX_OUTGOING_PEERS && !lacks_required_service {
+        if self.peers_toward_limit() >= T::MAX_OUTGOING_PEERS && !lacks_required_service {
             return Ok(());
         }
 

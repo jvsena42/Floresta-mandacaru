@@ -126,7 +126,7 @@ where
         // We are looking for at least two utreexo peers to diversify our requests
         let needs_utreexo = utreexo_peers < 2;
 
-        if self.connected_peers() >= SyncNode::MAX_OUTGOING_PEERS {
+        if self.peers_toward_limit() >= SyncNode::MAX_OUTGOING_PEERS {
             // If we need more utreexo peers, always disconnect the slowest peer
             let always_disconnect = needs_utreexo;
             // Don't disconnect from utreexo peers in any case

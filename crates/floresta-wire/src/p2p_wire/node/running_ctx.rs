@@ -183,7 +183,7 @@ where
         // if we have 10 connections, but not a single utreexo or CBF one, disconnect one random
         // peer and create a utreexo and CBS connection
         if !self.has_utreexo_peers() {
-            if self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
+            if self.peers_toward_limit() >= RunningNode::MAX_OUTGOING_PEERS {
                 self.peers
                     .values()
                     .filter(|peer| peer.kind.is_regular())
@@ -204,7 +204,7 @@ where
                 self.can_dial_onion_for(ServiceFlags::COMPACT_FILTERS),
             );
 
-            if has_cf_candidate && self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
+            if has_cf_candidate && self.peers_toward_limit() >= RunningNode::MAX_OUTGOING_PEERS {
                 if let Some(peer) = self.expendable_regular_peer() {
                     // The peer task may be gone already; nothing to do about it here
                     let _ = self.send_to_peer(peer, NodeRequest::Shutdown);

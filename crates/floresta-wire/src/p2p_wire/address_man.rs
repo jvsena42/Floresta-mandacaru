@@ -1995,6 +1995,15 @@ mod test {
             ),
         ]);
 
+        assert_eq!(
+            address_man
+                .addresses
+                .values()
+                .filter(|addr| addr.get_onion_addr().is_some())
+                .count(),
+            1
+        );
+
         for _ in 0..50 {
             let (_, picked) = address_man
                 .get_address_to_connect_with(ServiceFlags::NONE, false, false)
@@ -2018,6 +2027,38 @@ mod test {
 
         assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS, true));
         assert!(!address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS, false));
+    }
+
+    #[test]
+    fn test_addresses_saved_as_connected_load_as_tried() {
+        let datadir = std::env::temp_dir().join(format!(
+            "floresta-stale-connected-{}-{}",
+            std::process::id(),
+            AddressMan::time_since_unix()
+        ));
+        std::fs::create_dir_all(&datadir).unwrap();
+
+        let mut before = AddressMan::new(None, &ReachableNetworks::reachable(false));
+        before.push_addresses(&[LocalAddress::new(
+            BitcoinSocketAddr::new(AddrV2::Ipv4("12.146.182.45".parse().unwrap()), 8333),
+            100,
+            AddressState::Connected,
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+            1,
+        )]);
+        before.dump_peers(&datadir).unwrap();
+
+        let mut after = AddressMan::new(None, &ReachableNetworks::reachable(false));
+        after.start_addr_man(&datadir);
+        std::fs::remove_dir_all(&datadir).unwrap();
+
+        assert!(
+            after
+                .addresses
+                .values()
+                .all(|address| matches!(address.state, AddressState::Tried(_)))
+        );
+        assert_eq!(after.addresses.len(), 1);
     }
 
     #[test]

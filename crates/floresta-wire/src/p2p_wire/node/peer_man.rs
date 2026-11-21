@@ -388,7 +388,7 @@ where
             p.state = PeerStatus::Ready;
         });
 
-        let good_peers_count = self.connected_peers();
+        let good_peers_count = self.peers_toward_limit();
         if good_peers_count > T::MAX_OUTGOING_PEERS {
             // We allow utreexo, extra and manual peers to bypass our connection limits, and the
             // one onion peer split routing keeps (see `maybe_open_onion_connection`).
