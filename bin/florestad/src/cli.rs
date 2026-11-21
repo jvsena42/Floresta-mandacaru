@@ -62,7 +62,8 @@ pub struct Cli {
     pub no_cfilters: bool,
 
     #[arg(long, short, default_value = None, value_name = "address[:<port>]")]
-    /// The url of a proxy we should open p2p connections through (e.g. 127.0.0.1:9050)
+    /// The url of a proxy we should open p2p connections through (e.g. 127.0.0.1:9050). Onion
+    /// peers use --onion-proxy instead, if that is set
     pub proxy: Option<String>,
 
     #[arg(long, default_value = None, value_name = "address[:<port>]")]
