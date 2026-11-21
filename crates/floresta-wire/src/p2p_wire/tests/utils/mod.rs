@@ -524,6 +524,7 @@ mod tests {
     use super::signet_roots;
     use crate::p2p_wire::address_man::AddressMan;
     use crate::p2p_wire::address_man::LocalAddress;
+    use crate::p2p_wire::address_man::ReachableNetworks;
     use crate::p2p_wire::node::ConnectionKind;
     use crate::p2p_wire::node::LocalPeerView;
     use crate::p2p_wire::node::PeerStatus;
@@ -644,7 +645,7 @@ mod tests {
             chain,
             mempool,
             kill_signal,
-            AddressMan::new(None, &[]),
+            AddressMan::new(None, &ReachableNetworks::reachable(false)),
         )
         .unwrap();
 

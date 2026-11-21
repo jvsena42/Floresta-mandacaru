@@ -94,9 +94,12 @@ where
                 })
                 .map(|addr| (0, addr.clone()))
         } else {
-            self.address_man.get_address_to_connect(
+            // Under split routing, stop picking onion addresses once we have enough onion peers.
+            let allow_onion = !conn_kind.is_regular() || self.can_dial_onion_for(required_services);
+            self.address_man.get_address_to_connect_with(
                 required_services,
                 matches!(conn_kind, ConnectionKind::Feeler),
+                allow_onion,
             )
         };
 
@@ -155,6 +158,73 @@ where
         Ok(())
     }
 
+    /// Whether only onion peers go through Tor while every other peer connects directly.
+    pub(crate) fn uses_split_routing(&self) -> bool {
+        self.onion_socks5.is_some() && self.socks5.is_none()
+    }
+
+    /// Connected peers that count against `MAX_OUTGOING_PEERS`. The onion peer split routing
+    /// keeps is extra, like Bitcoin Core's extra connection to a network it has no peer on, so
+    /// it never takes a slot from (or gets a service rotation's new peer demoted).
+    pub(crate) fn peers_toward_limit(&self) -> usize {
+        let extra_onion =
+            usize::from(self.uses_split_routing() && self.ready_regular_onion_peers() > 0);
+        self.connected_peers().saturating_sub(extra_onion)
+    }
+
+    /// Regular (non-manual, long-lived) peers we have, or are connecting to, over onion.
+    pub(crate) fn regular_onion_peers(&self) -> usize {
+        self.peers
+            .values()
+            .filter(|peer| peer.kind.is_regular() && peer.address.get_onion_addr().is_some())
+            .count()
+    }
+
+    /// Whether `peer` is one of the few onion peers split routing keeps, which peer rotation
+    /// must not pick: a Tor circuit is always slower, so it would otherwise always be chosen.
+    pub(crate) fn is_protected_onion_peer(&self, peer: &LocalPeerView) -> bool {
+        self.uses_split_routing()
+            && peer.address.get_onion_addr().is_some()
+            && self.regular_onion_peers() <= MAX_SPLIT_ROUTING_ONION_PEERS
+    }
+
+    /// Whether another regular connection may go to an onion address.
+    pub(crate) fn can_dial_onion(&self) -> bool {
+        onion_slot_available(self.regular_onion_peers(), self.socks5.is_some())
+    }
+
+    /// [`Self::can_dial_onion`] for a dial that needs `service`. A needed utreexo or
+    /// compact-filters service wins over the onion cap: if no clearnet address offering it can be
+    /// dialled, we dial an onion one rather than go without. Other flags are not indexed by the
+    /// address manager, so they never override the cap.
+    pub(crate) fn can_dial_onion_for(&self, service: ServiceFlags) -> bool {
+        let indexed =
+            service == service_flags::UTREEXO.into() || service == ServiceFlags::COMPACT_FILTERS;
+        self.can_dial_onion()
+            || (indexed && !self.address_man.has_address_for_service(service, false))
+    }
+
+    /// Regular onion peers that finished their handshake.
+    pub(crate) fn ready_regular_onion_peers(&self) -> usize {
+        self.peers
+            .values()
+            .filter(|peer| {
+                peer.state == PeerStatus::Ready
+                    && peer.kind.is_regular()
+                    && peer.address.get_onion_addr().is_some()
+            })
+            .count()
+    }
+
+    /// The SOCKS5 proxy a connection to `address` goes through, or `None` to connect directly.
+    pub(crate) fn proxy_for(&self, address: &LocalAddress) -> Option<SocketAddr> {
+        proxy_route(
+            address.get_onion_addr().is_some(),
+            self.socks5.as_ref().map(|proxy| proxy.address),
+            self.onion_socks5.as_ref().map(|proxy| proxy.address),
+        )
+    }
+
     /// Creates a new outgoing connection with `address`.
     ///
     /// `kind` may be a short-lived connection type, such as [`ConnectionKind::Feeler`] or
@@ -183,11 +253,11 @@ where
             (peer_count, Instant::now()),
         );
 
-        if let Some(ref proxy) = self.socks5 {
+        if let Some(proxy) = self.proxy_for(&peer_address) {
             spawn(timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(T::PROXY_CONNECTION_TIMEOUT),
                 Self::open_proxy_connection(
-                    proxy.address,
+                    proxy,
                     kind,
                     self.mempool.clone(),
                     self.network,
@@ -205,7 +275,7 @@ where
             ));
         } else {
             spawn(timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(T::CONNECTION_TIMEOUT),
                 Self::open_non_proxy_connection(
                     kind,
                     peer_address.clone(),
@@ -466,6 +536,13 @@ where
         }
 
         for address in anchors {
+            // A node that used to route everything through Tor may have saved more onion
+            // anchors than split routing keeps.
+            let is_onion = address.get_onion_addr().is_some();
+            if is_onion && !self.can_dial_onion_for(service_flags::UTREEXO.into()) {
+                continue;
+            }
+
             self.open_connection(
                 ConnectionKind::OutboundFullRelay(service_flags::UTREEXO.into()),
                 address,
@@ -486,6 +563,8 @@ where
         // try to connect with manually added peers
         self.maybe_open_connection_with_added_peers()?;
 
+        self.maybe_open_onion_connection();
+
         // If the caller requires a specific service flag and we currently have zero
         // connected peers advertising it, we must open a new connection even when
         // already at MAX_OUTGOING_PEERS. Otherwise, a peer rotation initiated by the
@@ -500,7 +579,7 @@ where
                 .map(|peers| peers.is_empty())
                 .unwrap_or(true);
 
-        if self.connected_peers() >= T::MAX_OUTGOING_PEERS && !lacks_required_service {
+        if self.peers_toward_limit() >= T::MAX_OUTGOING_PEERS && !lacks_required_service {
             return Ok(());
         }
 
@@ -531,6 +610,62 @@ where
         Ok(())
     }
 
+    /// With split routing, keep at least one onion peer.
+    ///
+    /// Random selection alone can fill every outbound slot with clearnet peers and never come
+    /// back to onion, so while we have no onion peer (connected or connecting) this opens one
+    /// even when the outbound slots are full, like Bitcoin Core's extra connection to a reachable
+    /// network we have no peer on. At most one such attempt is in flight at a time.
+    fn maybe_open_onion_connection(&mut self) {
+        if !self.uses_split_routing() || self.has_fixed_peers() {
+            return;
+        }
+
+        if self.regular_onion_peers() > 0 {
+            return;
+        }
+
+        let Some((peer_id, peer_address)) = self.address_man.get_onion_address_to_connect() else {
+            // Gossip has not brought any onion address yet: fall back to the hardcoded seeds,
+            // which hold onion entries on mainnet, once and after the usual grace period.
+            if !self.used_fixed_addresses
+                && self.startup_time.elapsed() >= HARDCODED_ADDRESSES_GRACE_PERIOD
+            {
+                self.used_fixed_addresses = true;
+                let net = self.network;
+                self.address_man.add_fixed_addresses(net);
+            }
+            return;
+        };
+
+        // A manually added peer is not tracked as connected in the address manager. Put the
+        // address in the retry window so the next pick moves on instead of choosing it again.
+        if self.peers.values().any(|peer| peer.address == peer_address) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            self.address_man
+                .update_set_state(peer_id, AddressState::Failed(now));
+            return;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.address_man
+            .update_set_state(peer_id, AddressState::Failed(now));
+
+        debug!("Opening an onion connection to keep network diversity: {peer_address:?}");
+        let allow_v1_fallback = self.config.allow_v1_fallback;
+        try_and_log!(self.open_connection(
+            ConnectionKind::OutboundFullRelay(ServiceFlags::NONE),
+            peer_address,
+            allow_v1_fallback,
+        ));
+    }
+
     /// Try disconnecting the slowest non-protected-service peer.
     ///
     /// For peers that don't have any of the `protected_services`, we disconnect the
@@ -552,7 +687,9 @@ where
 
         // Use latency samples only from regular, non-protected-service peers.
         let is_eligible_peer = |peer: &LocalPeerView| {
-            peer.kind.is_regular() && !peer.has_any_service(protected_services)
+            peer.kind.is_regular()
+                && !peer.has_any_service(protected_services)
+                && !self.is_protected_onion_peer(peer)
         };
 
         let mut samples: Vec<_> = self
@@ -622,5 +759,104 @@ where
             self.open_connection(ConnectionKind::Manual, address, v1_fallback)?
         }
         Ok(())
+    }
+}
+
+/// How many regular onion peers a node keeps when only onion peers go through Tor. Onion
+/// circuits are slow, so the rest of the outbound slots stay on clearnet to keep sync fast.
+pub(crate) const MAX_SPLIT_ROUTING_ONION_PEERS: usize = 2;
+
+/// Whether another regular onion peer may be opened. With `routes_everything` (a general proxy)
+/// every peer goes through Tor anyway, so onion peers are not limited.
+pub(crate) fn onion_slot_available(regular_onion_peers: usize, routes_everything: bool) -> bool {
+    routes_everything || regular_onion_peers < MAX_SPLIT_ROUTING_ONION_PEERS
+}
+
+/// Whether a peer that just finished its handshake is the one onion peer split routing keeps,
+/// which may stay even when the outbound slots are full. `ready_onion_peers` includes it; peers
+/// still connecting are left out, since they may never finish.
+pub(crate) fn is_onion_minimum(
+    split_routing: bool,
+    is_regular_onion_peer: bool,
+    ready_onion_peers: usize,
+) -> bool {
+    split_routing && is_regular_onion_peer && ready_onion_peers <= 1
+}
+
+/// Picks the SOCKS5 proxy for a peer: onion peers prefer the onion-only proxy and fall back to
+/// the general one, every other peer uses the general one. `None` means a direct connection.
+pub(crate) fn proxy_route(
+    is_onion: bool,
+    proxy: Option<SocketAddr>,
+    onion_proxy: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    if is_onion {
+        return onion_proxy.or(proxy);
+    }
+
+    proxy
+}
+
+#[cfg(test)]
+mod tests {
+    use core::net::SocketAddr;
+
+    use super::MAX_SPLIT_ROUTING_ONION_PEERS;
+    use super::is_onion_minimum;
+    use super::onion_slot_available;
+    use super::proxy_route;
+
+    fn addr(port: u16) -> Option<SocketAddr> {
+        Some(SocketAddr::from(([127, 0, 0, 1], port)))
+    }
+
+    #[test]
+    fn no_proxy_connects_directly() {
+        assert_eq!(proxy_route(false, None, None), None);
+        assert_eq!(proxy_route(true, None, None), None);
+    }
+
+    #[test]
+    fn general_proxy_carries_every_peer() {
+        assert_eq!(proxy_route(false, addr(9050), None), addr(9050));
+        assert_eq!(proxy_route(true, addr(9050), None), addr(9050));
+    }
+
+    #[test]
+    fn onion_proxy_carries_only_onion_peers() {
+        assert_eq!(proxy_route(false, None, addr(9050)), None);
+        assert_eq!(proxy_route(true, None, addr(9050)), addr(9050));
+    }
+
+    #[test]
+    fn split_routing_keeps_onion_peers_a_minority() {
+        assert!(onion_slot_available(0, false));
+        assert!(onion_slot_available(
+            MAX_SPLIT_ROUTING_ONION_PEERS - 1,
+            false
+        ));
+        assert!(!onion_slot_available(MAX_SPLIT_ROUTING_ONION_PEERS, false));
+    }
+
+    #[test]
+    fn only_the_single_split_routing_onion_peer_may_exceed_the_limit() {
+        assert!(is_onion_minimum(true, true, 1));
+        assert!(!is_onion_minimum(true, true, 2));
+        assert!(!is_onion_minimum(true, false, 1));
+        assert!(!is_onion_minimum(false, true, 1));
+    }
+
+    #[test]
+    fn routing_everything_through_tor_does_not_limit_onion_peers() {
+        assert!(onion_slot_available(
+            MAX_SPLIT_ROUTING_ONION_PEERS + 5,
+            true
+        ));
+    }
+
+    #[test]
+    fn onion_proxy_wins_for_onion_peers_when_both_are_set() {
+        assert_eq!(proxy_route(true, addr(9050), addr(9150)), addr(9150));
+        assert_eq!(proxy_route(false, addr(9050), addr(9150)), addr(9050));
     }
 }

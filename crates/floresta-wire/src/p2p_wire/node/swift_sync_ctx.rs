@@ -196,7 +196,7 @@ where
             return self.maybe_open_connection(ServiceFlags::NETWORK);
         }
 
-        if self.connected_peers() >= SwiftSync::MAX_OUTGOING_PEERS {
+        if self.peers_toward_limit() >= SwiftSync::MAX_OUTGOING_PEERS {
             self.maybe_disconnect_slowest_peer(&[], false)?;
         }
 

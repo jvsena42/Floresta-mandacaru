@@ -344,6 +344,7 @@ pub struct NodeCommon<Chain: ChainBackend> {
 
     // 4. Networking Configuration
     pub(crate) socks5: Option<Socks5StreamBuilder>,
+    pub(crate) onion_socks5: Option<Socks5StreamBuilder>,
     pub(crate) fixed_peers: Vec<LocalAddress>,
 
     // 5. Time and Event Tracking
@@ -436,6 +437,7 @@ where
     ) -> Result<Self, WireError> {
         let (node_tx, node_rx) = unbounded_channel();
         let socks5 = config.proxy.map(Socks5StreamBuilder::new);
+        let onion_socks5 = config.onion_proxy.map(Socks5StreamBuilder::new);
 
         // Dedup the resolved fixed peers so we don't open multiple connections to the same host.
         let mut seen = HashSet::new();
@@ -482,6 +484,7 @@ where
                 datadir: config.datadir.clone(),
                 max_banscore: config.max_banscore,
                 socks5,
+                onion_socks5,
                 fixed_peers,
                 config,
                 kill_signal,

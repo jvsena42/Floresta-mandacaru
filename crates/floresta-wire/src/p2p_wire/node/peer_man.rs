@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::HashSet;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -29,6 +30,7 @@ use super::LocalPeerView;
 use super::NodeRequest;
 use super::PeerStatus;
 use super::UtreexoNode;
+use super::conn::is_onion_minimum;
 use crate::address_man::AddressMan;
 use crate::address_man::AddressState;
 use crate::address_man::LocalAddress;
@@ -386,14 +388,24 @@ where
             p.state = PeerStatus::Ready;
         });
 
-        let good_peers_count = self.connected_peers();
+        let good_peers_count = self.peers_toward_limit();
         if good_peers_count > T::MAX_OUTGOING_PEERS {
-            // We allow utreexo, extra and manual peers to bypass our connection limits
+            // We allow utreexo, extra and manual peers to bypass our connection limits, and the
+            // one onion peer split routing keeps (see `maybe_open_onion_connection`).
             let is_utreexo_peer = matches!(version.kind, ConnectionKind::OutboundFullRelay(services) if services.has(service_flags::UTREEXO.into()));
             let is_manual_peer = version.kind.is_manual();
             let is_extra = version.kind == ConnectionKind::Extra;
+            let is_onion = self
+                .peers
+                .get(&peer)
+                .is_some_and(|p| p.address.get_onion_addr().is_some());
+            let is_only_onion_peer = is_onion_minimum(
+                self.uses_split_routing(),
+                is_onion && version.kind.is_regular(),
+                self.ready_regular_onion_peers(),
+            );
 
-            if !(is_utreexo_peer || is_manual_peer || is_extra) {
+            if !(is_utreexo_peer || is_manual_peer || is_extra || is_only_onion_peer) {
                 debug!(
                     "Already have {} peers, treating peer {peer} as addr-fetch before disconnecting to avoid blowing up our max of {}",
                     good_peers_count,
@@ -988,16 +1000,23 @@ where
     pub(crate) fn check_for_timeout(&mut self) -> Result<(), WireError> {
         let now = Instant::now();
 
-        let timed_out_fn = |req: &InflightRequests, time: &Instant| match req {
-            InflightRequests::Connect(_)
-                if now.duration_since(*time).as_secs() > T::CONNECTION_TIMEOUT =>
-            {
-                Some(req.clone())
-            }
+        let proxied_peers: HashSet<u32> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| self.proxy_for(&peer.address).is_some())
+            .map(|(&id, _)| id)
+            .collect();
 
-            _ if now.duration_since(*time).as_secs() > T::REQUEST_TIMEOUT => Some(req.clone()),
+        let timed_out_fn = |req: &InflightRequests, time: &Instant| {
+            let limit = match req {
+                InflightRequests::Connect(peer) if proxied_peers.contains(peer) => {
+                    T::PROXY_CONNECTION_TIMEOUT
+                }
+                InflightRequests::Connect(_) => T::CONNECTION_TIMEOUT,
+                _ => T::REQUEST_TIMEOUT,
+            };
 
-            _ => None,
+            (now.duration_since(*time).as_secs() > limit).then(|| req.clone())
         };
 
         let timed_out: Vec<_> = self

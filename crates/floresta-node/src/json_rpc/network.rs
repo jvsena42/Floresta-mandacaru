@@ -217,20 +217,27 @@ impl<Blockchain: RpcChain> NetworkRpc for RpcImpl<Blockchain> {
         let local_services = format!("{:016x}", advertised_services.to_u64());
         let local_services_names = service_flags_strings(&advertised_services);
 
-        let proxy_str = self.proxy.map(|addr| addr.to_string()).unwrap_or_default();
-        let proxy_set = self.proxy.is_some();
+        let onion_route = self.onion_proxy.or(self.proxy);
+        let reachable_networks = ReachableNetworks::reachable(onion_route.is_some());
 
         let networks = ReachableNetworks::ALL
             .into_iter()
             .map(|net| {
-                let reachable = ReachableNetworks::SUPPORTED.contains(&net);
+                let reachable = reachable_networks.contains(&net);
+                let proxy = match net {
+                    _ if !reachable => None,
+                    ReachableNetworks::TorV3 => onion_route,
+                    _ => self.proxy,
+                };
 
                 GetNetworkInfoNetwork {
                     name: net.to_string(),
                     limited: !reachable,
                     reachable,
-                    proxy: proxy_str.clone(),
-                    proxy_randomize_credentials: proxy_set,
+                    proxy: proxy.map(|addr| addr.to_string()).unwrap_or_default(),
+                    // The SOCKS5 handshake only offers "no authentication", so there are no
+                    // per-connection credentials to randomize.
+                    proxy_randomize_credentials: false,
                 }
             })
             .collect();

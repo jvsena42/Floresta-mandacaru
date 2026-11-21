@@ -87,6 +87,7 @@ pub struct RpcImpl<Blockchain: RpcChain> {
     pub(super) rescan: RescanState,
     pub(super) user_agent: String,
     pub(super) proxy: Option<SocketAddr>,
+    pub(super) onion_proxy: Option<SocketAddr>,
     pub(super) default_connection_is_v2: bool,
 }
 
@@ -381,6 +382,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         log_path: impl AsRef<Path>,
         user_agent: String,
         proxy: Option<SocketAddr>,
+        onion_proxy: Option<SocketAddr>,
         default_connection_is_v2: bool,
         credentials: Arc<Auth>,
     ) {
@@ -425,6 +427,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 rescan: RescanState::default(),
                 user_agent,
                 proxy,
+                onion_proxy,
                 default_connection_is_v2,
             }));
 

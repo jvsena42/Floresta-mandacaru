@@ -69,6 +69,7 @@ fn main() {
         debug: params.debug,
         cfilters: !params.no_cfilters,
         proxy: params.proxy,
+        onion_proxy: params.onion_proxy,
         assume_utreexo: !params.no_assume_utreexo,
         connect: params.connect,
         wallet_xpub: params.wallet_xpub,

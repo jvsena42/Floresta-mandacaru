@@ -67,12 +67,13 @@ async fn main() {
     // Finally, we are using the chain state created above, the node will use it to determine
     // what blocks and headers to download, and hand them to it to validate.
     let config = UtreexoNodeConfig::default();
+    let config_has_proxy = config.proxy.is_some() || config.onion_proxy.is_some();
     let p2p: UtreexoNode<Arc<ChainState<FlatChainStore>>, RunningNode> = UtreexoNode::new(
         config,
         chain.clone(),
         Arc::new(Mutex::new(Mempool::new(MEMPOOL_SIZE))),
         Arc::new(tokio::sync::RwLock::new(false)),
-        AddressMan::new(None, &ReachableNetworks::SUPPORTED),
+        AddressMan::new(None, &ReachableNetworks::reachable(config_has_proxy)),
     )
     .unwrap();
     // A handle is a simple way to interact with the node. It implements a queue of requests

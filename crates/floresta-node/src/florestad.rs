@@ -132,8 +132,15 @@ pub struct Config {
     /// A proxy that we should use to connect with others
     ///
     /// This should be a socks5 proxy, like Tor's socks. If provided, all our outgoing connections
-    /// will be made through this one, except dns seed connections.
+    /// will be made through this one (onion peers use `onion_proxy` instead, when set), and DNS
+    /// seeds are queried over it.
     pub proxy: Option<String>,
+
+    /// A SOCKS5 proxy used only to reach Tor onion peers, like Bitcoin Core's `-onion`.
+    ///
+    /// Onion peers go through it while every other peer follows `proxy` (or connects directly),
+    /// so a node can reach onion peers without routing clearnet traffic through Tor.
+    pub onion_proxy: Option<String>,
 
     /// The network we are running in, it may be one of: bitcoin, signet, regtest or testnet.
     pub network: Network,
@@ -274,6 +281,7 @@ impl Config {
             wallet_descriptor: None,
             config_file: None,
             proxy: None,
+            onion_proxy: None,
             network,
             cfilters: false,
             filters_start_height: None,
@@ -582,11 +590,22 @@ impl Florestad {
             .map(|addr| Self::resolve_hostname(addr, 9050))
             .transpose()?;
 
+        let onion_proxy = self
+            .config
+            .onion_proxy
+            .as_ref()
+            .map(|addr| Self::resolve_hostname(addr, 9050))
+            .transpose()?;
+
+        let reachable_networks =
+            ReachableNetworks::reachable(proxy.is_some() || onion_proxy.is_some());
+
         let config = UtreexoNodeConfig {
             disable_dns_seeds: self.config.disable_dns_seeds,
             network: self.config.network,
             pow_fraud_proofs: false,
             proxy,
+            onion_proxy,
             datadir: datadir.into(),
             fixed_peers: self.config.connect.clone(),
             assume_utreexo: picked,
@@ -612,7 +631,7 @@ impl Florestad {
             blockchain_state.clone(),
             mempool,
             kill_signal.clone(),
-            AddressMan::new(None, &ReachableNetworks::SUPPORTED),
+            AddressMan::new(None, &reachable_networks),
         )
         .map_err(|e| FlorestadError::CouldNotCreateChainProvider(format!("{e}")))?;
 
@@ -776,6 +795,7 @@ impl Florestad {
                 self.config.log_file.clone().unwrap_or_default(),
                 self.config.user_agent.clone(),
                 proxy,
+                onion_proxy,
                 !self.config.allow_v1_fallback,
                 credentials,
             ));

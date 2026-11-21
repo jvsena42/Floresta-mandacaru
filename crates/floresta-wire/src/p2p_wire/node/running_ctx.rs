@@ -183,7 +183,7 @@ where
         // if we have 10 connections, but not a single utreexo or CBF one, disconnect one random
         // peer and create a utreexo and CBS connection
         if !self.has_utreexo_peers() {
-            if self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
+            if self.peers_toward_limit() >= RunningNode::MAX_OUTGOING_PEERS {
                 self.peers
                     .values()
                     .filter(|peer| peer.kind.is_regular())
@@ -199,11 +199,12 @@ where
             // compact-filters candidate to dial. Otherwise we'd disconnect a healthy
             // regular peer and fill the slot with another non-CF peer, making no
             // progress and thrashing connections while filters stay stalled.
-            let has_cf_candidate = self
-                .address_man
-                .has_address_for_service(ServiceFlags::COMPACT_FILTERS);
+            let has_cf_candidate = self.address_man.has_address_for_service(
+                ServiceFlags::COMPACT_FILTERS,
+                self.can_dial_onion_for(ServiceFlags::COMPACT_FILTERS),
+            );
 
-            if has_cf_candidate && self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
+            if has_cf_candidate && self.peers_toward_limit() >= RunningNode::MAX_OUTGOING_PEERS {
                 if let Some(peer) = self.expendable_regular_peer() {
                     // The peer task may be gone already; nothing to do about it here
                     let _ = self.send_to_peer(peer, NodeRequest::Shutdown);
@@ -554,7 +555,11 @@ where
     /// are scarce, so they are only picked when nothing else is left.
     fn expendable_regular_peer(&self) -> Option<PeerId> {
         let utreexo: ServiceFlags = service_flags::UTREEXO.into();
-        let regular_peers = || self.peers.iter().filter(|(_, peer)| peer.kind.is_regular());
+        let regular_peers = || {
+            self.peers
+                .iter()
+                .filter(|(_, peer)| peer.kind.is_regular() && !self.is_protected_onion_peer(peer))
+        };
 
         regular_peers()
             .filter(|(_, peer)| !peer.services.has(utreexo))

@@ -102,9 +102,9 @@ class TestP2pAddrRelay:
         assert self.p2p_conn.is_connected
         assert self.floresta_has_peer_count(expected_peer_count=1)
 
-        # Generates I2P, Onion, IPv4, and IPv6 addresses; only IPv4/IPv6 are stored, others are
-        # rejected by node configuration.
-        self.check_addr_received(ipv4_expected=2, ipv6_expected=3, onion_expected=3)
+        # Generates I2P, Onion, IPv4, and IPv6 addresses; only IPv4/IPv6 are stored. Onion is
+        # rejected because no proxy is configured to reach it, and I2P is not supported.
+        self.check_addr_received(ipv4_expected=2, ipv6_expected=3)
 
         self.log.info(
             "Testing addrv2 message with varying number of addresses to check for disconnection on "

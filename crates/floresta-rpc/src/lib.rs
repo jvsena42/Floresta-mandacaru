@@ -442,9 +442,9 @@ mod tests {
         let names: Vec<&str> = info.networks.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, vec!["ipv4", "ipv6", "onion", "i2p", "cjdns"]);
 
-        // Only ipv4, ipv6 and Onion are currently SUPPORTED; the rest are limited.
+        // Without a proxy only ipv4 and ipv6 are reachable; onion needs a route to Tor.
         for net in &info.networks {
-            let supported = matches!(net.name.as_str(), "ipv4" | "ipv6" | "onion");
+            let supported = matches!(net.name.as_str(), "ipv4" | "ipv6");
             assert_eq!(net.reachable, supported);
             assert_eq!(net.limited, !supported);
         }

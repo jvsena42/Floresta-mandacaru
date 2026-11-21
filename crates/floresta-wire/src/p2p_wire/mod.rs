@@ -34,7 +34,16 @@ pub struct UtreexoNodeConfig {
     /// Data directory for the node. Defaults to `.floresta-node`.
     pub datadir: PathBuf,
     /// A SOCKS5 proxy to use. Defaults to None.
+    ///
+    /// Every outbound connection goes through it (onion peers use `onion_proxy` instead when
+    /// that is set), and DNS seeds are queried over it.
     pub proxy: Option<SocketAddr>,
+    /// A SOCKS5 proxy used only for Tor onion peers. Defaults to None.
+    ///
+    /// Onion peers go through it while every other peer connects as `proxy` dictates, so a node
+    /// can reach onion peers without routing clearnet traffic through Tor. Without it, onion
+    /// peers use `proxy`; with neither, onion addresses are unreachable and are not stored.
+    pub onion_proxy: Option<SocketAddr>,
     /// If enabled, the node will assume that the provided Utreexo state is valid, and will
     /// start running from there
     pub assume_utreexo: Option<AssumeUtreexoValue>,
@@ -63,6 +72,7 @@ impl Default for UtreexoNodeConfig {
             max_banscore: 100,
             datadir: ".floresta-node".into(),
             proxy: None,
+            onion_proxy: None,
             backfill: false,
             assume_utreexo: None,
             user_agent: format!("floresta:{}", env!("CARGO_PKG_VERSION")),
