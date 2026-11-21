@@ -402,7 +402,7 @@ where
             let is_only_onion_peer = is_onion_minimum(
                 self.uses_split_routing(),
                 is_onion && version.kind.is_regular(),
-                self.regular_onion_peers(),
+                self.ready_regular_onion_peers(),
             );
 
             if !(is_utreexo_peer || is_manual_peer || is_extra || is_only_onion_peer) {

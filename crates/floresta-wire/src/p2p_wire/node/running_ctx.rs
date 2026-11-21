@@ -199,9 +199,10 @@ where
             // compact-filters candidate to dial. Otherwise we'd disconnect a healthy
             // regular peer and fill the slot with another non-CF peer, making no
             // progress and thrashing connections while filters stay stalled.
-            let has_cf_candidate = self
-                .address_man
-                .has_address_for_service(ServiceFlags::COMPACT_FILTERS);
+            let has_cf_candidate = self.address_man.has_address_for_service(
+                ServiceFlags::COMPACT_FILTERS,
+                self.can_dial_onion_for(ServiceFlags::COMPACT_FILTERS),
+            );
 
             if has_cf_candidate && self.connected_peers() >= RunningNode::MAX_OUTGOING_PEERS {
                 if let Some(peer) = self.expendable_regular_peer() {

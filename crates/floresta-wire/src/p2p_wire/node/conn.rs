@@ -95,8 +95,7 @@ where
                 .map(|addr| (0, addr.clone()))
         } else {
             // Under split routing, stop picking onion addresses once we have enough onion peers.
-            let allow_onion = !conn_kind.is_regular()
-                || onion_slot_available(self.regular_onion_peers(), self.socks5.is_some());
+            let allow_onion = !conn_kind.is_regular() || self.can_dial_onion_for(required_services);
             self.address_man.get_address_to_connect_with(
                 required_services,
                 matches!(conn_kind, ConnectionKind::Feeler),
@@ -169,6 +168,31 @@ where
         self.peers
             .values()
             .filter(|peer| peer.kind.is_regular() && peer.address.get_onion_addr().is_some())
+            .count()
+    }
+
+    /// Whether another regular connection may go to an onion address.
+    pub(crate) fn can_dial_onion(&self) -> bool {
+        onion_slot_available(self.regular_onion_peers(), self.socks5.is_some())
+    }
+
+    /// [`Self::can_dial_onion`] for a dial that needs `service`. A needed service wins over the
+    /// onion cap: if only onion addresses advertise it, we dial one rather than go without.
+    pub(crate) fn can_dial_onion_for(&self, service: ServiceFlags) -> bool {
+        self.can_dial_onion()
+            || (service != ServiceFlags::NONE
+                && !self.address_man.has_address_for_service(service, false))
+    }
+
+    /// Regular onion peers that finished their handshake.
+    pub(crate) fn ready_regular_onion_peers(&self) -> usize {
+        self.peers
+            .values()
+            .filter(|peer| {
+                peer.state == PeerStatus::Ready
+                    && peer.kind.is_regular()
+                    && peer.address.get_onion_addr().is_some()
+            })
             .count()
     }
 
@@ -495,8 +519,7 @@ where
             // A node that used to route everything through Tor may have saved more onion
             // anchors than split routing keeps.
             let is_onion = address.get_onion_addr().is_some();
-            if is_onion && !onion_slot_available(self.regular_onion_peers(), self.socks5.is_some())
-            {
+            if is_onion && !self.can_dial_onion_for(service_flags::UTREEXO.into()) {
                 continue;
             }
 
@@ -583,9 +606,15 @@ where
         }
 
         let Some((peer_id, peer_address)) = self.address_man.get_onion_address_to_connect() else {
-            // Gossip has not brought any onion address yet: fall back to the onion seeds.
-            let net = self.network;
-            self.address_man.add_fixed_addresses(net);
+            // Gossip has not brought any onion address yet: fall back to the hardcoded seeds,
+            // which hold onion entries on mainnet, once and after the usual grace period.
+            if !self.used_fixed_addresses
+                && self.startup_time.elapsed() >= HARDCODED_ADDRESSES_GRACE_PERIOD
+            {
+                self.used_fixed_addresses = true;
+                let net = self.network;
+                self.address_man.add_fixed_addresses(net);
+            }
             return;
         };
 
@@ -721,13 +750,14 @@ pub(crate) fn onion_slot_available(regular_onion_peers: usize, routes_everything
 }
 
 /// Whether a peer that just finished its handshake is the one onion peer split routing keeps,
-/// which may stay even when the outbound slots are full. `regular_onion_peers` includes it.
+/// which may stay even when the outbound slots are full. `ready_onion_peers` includes it; peers
+/// still connecting are left out, since they may never finish.
 pub(crate) fn is_onion_minimum(
     split_routing: bool,
     is_regular_onion_peer: bool,
-    regular_onion_peers: usize,
+    ready_onion_peers: usize,
 ) -> bool {
-    split_routing && is_regular_onion_peer && regular_onion_peers <= 1
+    split_routing && is_regular_onion_peer && ready_onion_peers <= 1
 }
 
 /// Picks the SOCKS5 proxy for a peer: onion peers prefer the onion-only proxy and fall back to

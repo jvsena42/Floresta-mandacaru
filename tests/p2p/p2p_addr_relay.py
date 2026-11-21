@@ -103,7 +103,7 @@ class TestP2pAddrRelay:
         assert self.floresta_has_peer_count(expected_peer_count=1)
 
         # Generates I2P, Onion, IPv4, and IPv6 addresses; only IPv4/IPv6 are stored, others are
-        # rejected by node configuration.
+        # rejected because no proxy is configured to reach them.
         self.check_addr_received(ipv4_expected=2, ipv6_expected=3)
 
         self.log.info(

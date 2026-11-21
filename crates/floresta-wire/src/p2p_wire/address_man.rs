@@ -582,8 +582,11 @@ impl AddressMan {
     /// unless we actually have a replacement candidate to dial. Addresses that
     /// are banned, connected or recently failed don't count: evicting a healthy
     /// peer for them only ends with another peer lacking the service.
-    pub fn has_address_for_service(&self, service: ServiceFlags) -> bool {
-        self.try_with_service(service, true).is_some()
+    ///
+    /// `allow_onion` must match what the dial will use, or an onion-only candidate would justify
+    /// an eviction the dial then cannot fill.
+    pub fn has_address_for_service(&self, service: ServiceFlags, allow_onion: bool) -> bool {
+        self.try_with_service(service, allow_onion).is_some()
     }
 
     /// Returns address manager statistics broken down by network type.
@@ -2001,6 +2004,23 @@ mod test {
     }
 
     #[test]
+    fn test_service_offered_only_over_onion_is_hidden_when_onion_is_excluded() {
+        let mut address_man = AddressMan::new(None, &ReachableNetworks::reachable(true));
+        let cf =
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS;
+        address_man.push_addresses(&[LocalAddress::new(
+            BitcoinSocketAddr::new(AddrV2::TorV3([3; 32]), 8333),
+            0,
+            AddressState::NeverTried,
+            cf,
+            1,
+        )]);
+
+        assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS, true));
+        assert!(!address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS, false));
+    }
+
+    #[test]
     fn test_unreachable_anchors_are_not_returned() {
         let datadir = std::env::temp_dir().join(format!(
             "floresta-anchors-{}-{}",
@@ -2052,7 +2072,7 @@ mod test {
         address_man.push_addresses(&[non_cf_peer]);
 
         assert!(!address_man.addresses.is_empty());
-        assert!(!address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS));
+        assert!(!address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS, true));
 
         // With no CF-advertising peer known, requiring COMPACT_FILTERS must fail
         // cleanly instead of returning the unrelated NETWORK|WITNESS peer.
@@ -2090,7 +2110,7 @@ mod test {
         };
         address_man.push_addresses(&[cf_peer]);
         let id = *address_man.addresses.keys().next().unwrap();
-        assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS));
+        assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS, true));
 
         // Evicting a peer to dial any of these would only fill the slot with a non-CF peer.
         let now = AddressMan::time_since_unix();
@@ -2100,12 +2120,12 @@ mod test {
             AddressState::Connected,
         ] {
             address_man.update_set_state(id, state);
-            assert!(!address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS));
+            assert!(!address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS, true));
         }
 
         // A failure old enough to be retried counts again.
         address_man.update_set_state(id, AddressState::Failed(now - RETRY_TIME - 1));
-        assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS));
+        assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS, true));
     }
 
     #[test]
@@ -2132,7 +2152,7 @@ mod test {
 
         address_man.push_addresses(&[cf_peer.clone(), non_cf_peer]);
 
-        assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS));
+        assert!(address_man.has_address_for_service(ServiceFlags::COMPACT_FILTERS, true));
 
         let picked = address_man
             .get_random_address(ServiceFlags::COMPACT_FILTERS, true)
