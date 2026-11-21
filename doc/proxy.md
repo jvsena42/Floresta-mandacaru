@@ -18,6 +18,6 @@ To also connect to Tor onion peers while every other peer keeps connecting direc
 florestad --onion-proxy 127.0.0.1:9050
 ```
 
-Only onion peers go through Tor, so your IP address stays visible to clearnet peers, but syncing is not slowed down. The node keeps one or two onion peers alongside its clearnet peers. If both flags are set, onion peers use `--onion-proxy` and every other peer uses `--proxy`.
+Only onion peers go through Tor, so your IP address stays visible to clearnet peers, but syncing is not slowed down. The node keeps at least one onion peer alongside its clearnet peers, and normally no more than two; it goes over that only to reach a peer service (such as Utreexo or compact filters) that no clearnet address offers. If both flags are set, onion peers use `--onion-proxy` and every other peer uses `--proxy`.
 
 Without either flag, onion addresses are not stored or dialled, since they cannot be reached.

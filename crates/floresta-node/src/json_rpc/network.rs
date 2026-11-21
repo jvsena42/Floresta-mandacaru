@@ -225,6 +225,7 @@ impl<Blockchain: RpcChain> NetworkRpc for RpcImpl<Blockchain> {
             .map(|net| {
                 let reachable = reachable_networks.contains(&net);
                 let proxy = match net {
+                    _ if !reachable => None,
                     ReachableNetworks::TorV3 => onion_route,
                     _ => self.proxy,
                 };

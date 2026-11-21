@@ -555,7 +555,11 @@ where
     /// are scarce, so they are only picked when nothing else is left.
     fn expendable_regular_peer(&self) -> Option<PeerId> {
         let utreexo: ServiceFlags = service_flags::UTREEXO.into();
-        let regular_peers = || self.peers.iter().filter(|(_, peer)| peer.kind.is_regular());
+        let regular_peers = || {
+            self.peers
+                .iter()
+                .filter(|(_, peer)| peer.kind.is_regular() && !self.is_protected_onion_peer(peer))
+        };
 
         regular_peers()
             .filter(|(_, peer)| !peer.services.has(utreexo))

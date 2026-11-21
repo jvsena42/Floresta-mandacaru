@@ -171,6 +171,14 @@ where
             .count()
     }
 
+    /// Whether `peer` is one of the few onion peers split routing keeps, which peer rotation
+    /// must not pick: a Tor circuit is always slower, so it would otherwise always be chosen.
+    pub(crate) fn is_protected_onion_peer(&self, peer: &LocalPeerView) -> bool {
+        self.uses_split_routing()
+            && peer.address.get_onion_addr().is_some()
+            && self.regular_onion_peers() <= MAX_SPLIT_ROUTING_ONION_PEERS
+    }
+
     /// Whether another regular connection may go to an onion address.
     pub(crate) fn can_dial_onion(&self) -> bool {
         onion_slot_available(self.regular_onion_peers(), self.socks5.is_some())
@@ -618,8 +626,15 @@ where
             return;
         };
 
-        // A manually added peer is not tracked as connected in the address manager.
+        // A manually added peer is not tracked as connected in the address manager. Put the
+        // address in the retry window so the next pick moves on instead of choosing it again.
         if self.peers.values().any(|peer| peer.address == peer_address) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            self.address_man
+                .update_set_state(peer_id, AddressState::Failed(now));
             return;
         }
 
@@ -658,15 +673,11 @@ where
         /// This is the same value as the `libbitcoin` default `allowed_deviation`.
         const ALLOWED_DEVIATION: f64 = 1.5;
 
-        // Use latency samples only from regular, non-protected-service peers. A Tor circuit is
-        // always slower than a direct connection, so while we only have a few onion peers they
-        // are left out; otherwise they would always be the ones evicted.
-        let protect_onion = self.uses_split_routing()
-            && self.regular_onion_peers() <= MAX_SPLIT_ROUTING_ONION_PEERS;
+        // Use latency samples only from regular, non-protected-service peers.
         let is_eligible_peer = |peer: &LocalPeerView| {
             peer.kind.is_regular()
                 && !peer.has_any_service(protected_services)
-                && !(protect_onion && peer.address.get_onion_addr().is_some())
+                && !self.is_protected_onion_peer(peer)
         };
 
         let mut samples: Vec<_> = self
