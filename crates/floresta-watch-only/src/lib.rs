@@ -133,6 +133,38 @@ pub struct Stats {
     pub derivation_index: u32,
 }
 
+/// A wallet rescan that has not finished yet, kept so that a restart resumes it instead of
+/// dropping it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RescanJob {
+    /// First height of the range, or `None` for the default start (the wallet birthday).
+    pub start: Option<u32>,
+    /// Last height of the range, or `None` to follow the tip.
+    pub stop: Option<u32>,
+    /// Every cached address has been scanned from the start of the range up to this height,
+    /// exclusively. `None` until the scan has got that far, and again whenever addresses
+    /// whose history may predate it are added.
+    pub resume: Option<u32>,
+    /// The first height of the range once resolved, so a resumed scan keeps reporting its
+    /// progress against the whole range.
+    pub range_start: Option<u32>,
+    /// The addresses that were queued for a rescan when this job was created: their history
+    /// may be anywhere, so only a pass over the whole default range from its start covers
+    /// them.
+    pub inherited: Vec<ScriptBuf>,
+    /// A pass over the default range is owed once this range is done: a descriptor was
+    /// loaded while a rescan over another range ran.
+    pub followup: bool,
+    /// The wallet's derivation horizon when `resume` was last made to cover every address
+    /// derived so far. A different horizon at a restart means addresses were derived after
+    /// that, and the scan goes back a little for them.
+    pub horizon: Option<u32>,
+    /// How many passes in a row failed without getting further. Past a few, a start of the
+    /// node no longer resumes the job by itself.
+    pub failures: u32,
+}
+
 /// Public trait defining a common interface for databases to be used with our cache
 pub trait AddressCacheDatabase {
     type Error: Debug + Send + Sync + 'static;
@@ -161,6 +193,10 @@ pub trait AddressCacheDatabase {
     fn save_pending_rescan(&self, addresses: &[ScriptBuf]) -> Result<(), Self::Error>;
     /// Loads the derived addresses whose history still has to be rescanned
     fn get_pending_rescan(&self) -> Result<Vec<ScriptBuf>, Self::Error>;
+    /// Saves the rescan that has not finished yet, or removes it with `None`
+    fn save_rescan_job(&self, job: Option<&RescanJob>) -> Result<(), Self::Error>;
+    /// Loads the rescan that has not finished yet, if any
+    fn get_rescan_job(&self) -> Result<Option<RescanJob>, Self::Error>;
     /// Get a transaction from the database
     fn get_transaction(&self, txid: &Txid) -> Result<CachedTransaction, Self::Error>;
     /// Saves a transaction to the database
@@ -184,8 +220,9 @@ struct AddressCacheInner<D: AddressCacheDatabase> {
     /// rebuilt in [`AddressCacheInner::new`].
     derived_index: HashMap<Hash, u32>,
     /// Addresses derived past the horizon after a payment near it. They are followed from
-    /// then on, but their history in blocks already processed is only found by a rescan.
-    /// They leave the queue once a rescan that covered them succeeds. Mirrored in the
+    /// then on, but their history in blocks already processed is only found by a rescan (a
+    /// running one takes them up from about where they were derived). They leave the queue
+    /// once a rescan that covered them succeeds. Mirrored in the
     /// database, so an app killed before then does not lose them.
     pending_rescan: Vec<ScriptBuf>,
 }
@@ -453,8 +490,8 @@ where
         self.database.save_stats(&stats)?;
 
         // A payment near the horizon is often found by a rescan, or in a block that also paid
-        // the next addresses: queue them so their history in the range already scanned is
-        // looked for too. Scripts of descriptors without a wildcard come back with every
+        // the next addresses: queue them so their history in the blocks already processed
+        // is looked for too. Scripts of descriptors without a wildcard come back with every
         // batch: they are not new.
         let derived = derived
             .into_iter()
@@ -936,6 +973,18 @@ where
         inner.database.save_pending_rescan(&remaining)?;
         inner.pending_rescan = remaining;
         Ok(())
+    }
+
+    /// The rescan that has not finished yet, if any. See [`RescanJob`].
+    pub fn get_rescan_job(&self) -> Result<Option<RescanJob>, WatchOnlyError> {
+        let inner = self.get_inner()?;
+        Ok(inner.database.get_rescan_job()?)
+    }
+
+    /// Saves the rescan that has not finished yet, or removes it with `None`.
+    pub fn save_rescan_job(&self, job: Option<&RescanJob>) -> Result<(), WatchOnlyError> {
+        let inner = self.get_inner()?;
+        Ok(inner.database.save_rescan_job(job)?)
     }
 
     pub fn get_stats(&self) -> Result<Stats, WatchOnlyError> {

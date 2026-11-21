@@ -52,7 +52,12 @@ impl<Blockchain: RpcChain> WalletRpc for RpcImpl<Blockchain> {
 
         let start = (start_height != 0).then_some(start_height);
         let stop = (stop_height != 0).then_some(stop_height);
-        self.spawn_wallet_rescan(filters, addresses, start, stop, tracker);
+        if let Err(error) = self.rescan.start_job(&self.wallet, start, stop) {
+            drop(tracker);
+            self.run_owed_rescan(filters);
+            return Err(error.into());
+        }
+        self.spawn_wallet_rescan(filters, tracker);
 
         Ok(true)
     }
@@ -68,42 +73,55 @@ impl<Blockchain: RpcChain> WalletRpc for RpcImpl<Blockchain> {
 
     // loaddescriptor
     async fn load_descriptor(&self, descriptor: String) -> Result<bool, JsonRpcError> {
-        let addresses = self.wallet.push_descriptor(&descriptor)?;
+        let Some(filters) = self.filters.clone() else {
+            // Owed a rescan for when the node runs with block filters
+            let addresses = self
+                .rescan
+                .add_descriptor(&self.wallet, &descriptor, false)?;
+            info!("Descriptor pushed: {descriptor}");
+            if addresses.is_empty() {
+                return Ok(true);
+            }
+            return Err(JsonRpcError::NoBlockFilters);
+        };
+
+        // Only one rescan runs at a time. One already running starts over with the new
+        // addresses, or owes a pass over the default range for them.
+        let tracker = self.rescan.try_start();
+        let added = self
+            .rescan
+            .add_descriptor(&self.wallet, &descriptor, tracker.is_none());
+        let addresses = match added {
+            Ok(addresses) if !addresses.is_empty() => addresses,
+            other => {
+                if let Some(tracker) = tracker {
+                    drop(tracker);
+                    self.run_owed_rescan(filters);
+                }
+                return other.map(|_| true).map_err(Into::into);
+            }
+        };
         info!("Descriptor pushed: {descriptor}");
         debug!("Rescanning with block filters for addresses: {addresses:?}");
 
-        if addresses.is_empty() {
-            return Ok(true);
-        }
-
-        let filters = self.filters.clone().ok_or(JsonRpcError::NoBlockFilters)?;
-
-        // Always persist the descriptor; only kick off a rescan if one isn't
-        // already running. Otherwise ask the running one for a follow-up pass:
-        // it took its addresses before this descriptor was cached.
-        let tracker = match self.rescan.try_start() {
+        let tracker = match tracker {
             Some(tracker) => tracker,
             None => {
-                debug!(
-                    "rescan already in progress; descriptor cached, a follow-up rescan will cover it"
-                );
-                self.rescan.request_followup();
-
+                debug!("rescan already in progress; descriptor cached, the rescan will cover it");
                 // The running rescan may have ended between our failed claim and the request,
                 // after it last looked for one. Then nobody is left to take it: run it ourselves.
                 let Some(tracker) = self.rescan.try_start() else {
                     return Ok(true);
                 };
-                if !self.rescan.take_followup() {
-                    // Whoever ended in between saw the request and is running the follow-up.
-                    return Ok(true);
-                }
+                // Holding the slot, we run the pass whoever ended in between left to us. Their
+                // job may be gone with what we recorded in it: record it again.
+                self.rescan.take_followup();
+                self.rescan.owe_full_pass(&self.wallet);
                 tracker
             }
         };
 
-        let addresses = self.wallet.get_cached_addresses()?;
-        self.spawn_wallet_rescan(filters, addresses, None, None, tracker);
+        self.spawn_wallet_rescan(filters, tracker);
 
         Ok(true)
     }
@@ -130,7 +148,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             .get_best_block()
             .map_err(|_| JsonRpcError::Chain)?;
 
-        if stop > tip {
+        if stop > tip || start > tip {
             return Err(JsonRpcError::InvalidRescanVal);
         }
 

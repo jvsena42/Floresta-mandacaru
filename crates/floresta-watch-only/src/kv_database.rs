@@ -22,12 +22,17 @@ use kv::Store;
 use super::AddressCacheDatabase;
 use super::CachedAddress;
 use super::CachedTransaction;
+use super::RescanJob;
 use super::Stats;
 
 /// Bucket, and key in it, of the derived addresses whose history is still to be rescanned.
 /// Kept out of the addresses bucket, whose every other key [`KvDatabase::load`] reads as a
 /// [`CachedAddress`] (so a build without this bucket still opens the database).
 const PENDING_RESCAN: &str = "pending_rescan";
+
+/// Bucket, and key in it, of the wallet rescan that has not finished yet. Kept out of the
+/// addresses bucket for the same reason as [`PENDING_RESCAN`].
+const RESCAN_JOB: &str = "rescan_job";
 
 /// A key-value database for the watch-only wallet.
 pub struct KvDatabase(Store, Bucket<'static, String, Vec<u8>>);
@@ -187,6 +192,32 @@ impl AddressCacheDatabase for KvDatabase {
         Ok(Vec::new())
     }
 
+    /// Replace or remove the unfinished rescan in the [`KvDatabase`].
+    fn save_rescan_job(&self, job: Option<&RescanJob>) -> Result<()> {
+        let store = self.0.bucket::<&[u8], Vec<u8>>(Some(RESCAN_JOB))?;
+        match job {
+            Some(job) => {
+                store.set(&RESCAN_JOB.as_bytes(), &serde_json::to_vec(job)?)?;
+            }
+            None => {
+                store.remove(&RESCAN_JOB.as_bytes())?;
+            }
+        }
+        store.flush()?;
+
+        Ok(())
+    }
+
+    /// Get the unfinished rescan from the [`KvDatabase`].
+    fn get_rescan_job(&self) -> Result<Option<RescanJob>> {
+        let store = self.0.bucket::<&[u8], Vec<u8>>(Some(RESCAN_JOB))?;
+
+        match store.get(&RESCAN_JOB.as_bytes())? {
+            Some(job) => Ok(Some(serde_json::de::from_slice(&job)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Get the [`KvDatabase`]'s descriptors.
     fn get_descriptors(&self) -> Result<Vec<String>> {
         let descriptor = self.1.get(&String::from("desc"))?;
@@ -289,6 +320,32 @@ mod test {
         let script_hash = get_spk_hash(&address.script_pubkey());
         (address, script_hash)
     }
+    #[test]
+    fn test_rescan_job_is_saved_and_removed() {
+        use crate::RescanJob;
+
+        let db = get_test_db();
+        assert_eq!(db.get_rescan_job().unwrap(), None);
+
+        let job = RescanJob {
+            start: None,
+            stop: Some(900_000),
+            resume: Some(850_000),
+            range_start: Some(822_375),
+            inherited: vec![get_test_address().0.script_pubkey()],
+            followup: true,
+            horizon: Some(200),
+            failures: 1,
+        };
+        db.save_rescan_job(Some(&job)).unwrap();
+        assert_eq!(db.get_rescan_job().unwrap(), Some(job));
+        // Not taken for an address
+        assert!(db.load().unwrap().is_empty());
+
+        db.save_rescan_job(None).unwrap();
+        assert_eq!(db.get_rescan_job().unwrap(), None);
+    }
+
     #[test]
     fn test_kv_database() {
         let db = get_test_db();
